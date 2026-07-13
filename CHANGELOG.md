@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — first beta
+## 0.1.0 — 2026-07-14 — first beta
 
 Initial public release: a local, personal context store for AI coding assistants over MCP.
 
