@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "evoctx"
+version = "0.1.0.dev0"
+description = "Local personal context store for AI coding assistants, exposed over MCP — by Evo Bytes"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Evo Bytes SRL", email = "info@evobytes.ro" }]
+keywords = ["mcp", "model-context-protocol", "ai", "memory", "context", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+]
+dependencies = [
+    "mcp[cli]>=1.9,<2",
+    "platformdirs>=4",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://evobytes.ro"
+
+[project.scripts]
+evoctx = "evoctx.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/evoctx"]

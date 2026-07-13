@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+
+# Local store / personal data — never commit
+*.db
+context/
+
+# Client configs with machine-specific paths
+.mcp.json
+mcp.cmd
+
+# Design doc — private, never ship
+personal-context-layer.md
+/personal_docs/

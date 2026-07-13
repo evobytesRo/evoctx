@@ -1,0 +1,126 @@
+# Security
+
+evoctx is a local personal-context store for AI coding assistants. This document says plainly
+what it protects against, what it doesn't, and why — before an outside reviewer has to find out
+by testing it. If you're deciding whether to trust it with your notes, read this first.
+
+**One-line summary: this is policy rails for cooperative clients, not a sandbox.** Every
+mitigation below assumes the MCP client is playing by the rules of the protocol. None of it
+holds up against a client (or a process on your machine) that decides not to.
+
+## 1. Grants police the MCP protocol path, not your filesystem
+
+Grants, scopes, and redaction all gate calls made *through the MCP tool interface*. An AI
+client that also has filesystem tools — which describes most coding assistants, including the
+ones this project is built for — can simply:
+
+- read `store.db` directly with its own file-read tool, bypassing every scope and redaction rule
+- edit `grants.yaml` or `active_grant.json` to grant itself whatever it wants
+- set its own `CONTEXT_CLIENT` environment variable to match a more permissive grant's `client:` pattern
+
+**This is not a bug we plan to patch — it's a structural limit of policing an API layer when
+the same actor has a lower-level door into the same data.** The honest way to close it (partially)
+is client-side: pair evoctx with your MCP client's own permission system so the assistant's file
+tools can't read or write the store's files directly. For Claude Code, that means a
+`permissions.deny` rule covering the store directory (`evoctx doctor` shows the path) —
+`evoctx install claude-code --hooks` offers to write this for you. Other clients vary; check
+whether yours supports scoping file-tool access and apply the same idea.
+
+If your threat model includes "the AI itself is adversarial," grants don't solve it. Grants
+solve "I want different MCP clients to see different slices of my knowledge, with a record of
+who saw what" — a much narrower and more realistic problem for a personal, single-user tool.
+
+## 2. Stored notes are a persistent injection surface
+
+Every note written in a past session gets read back into a future session's context, often at
+the highest-trust moment (session start, "here's what you should know"). A note containing
+attacker-authored instructions — from a compromised session, a poisoned file swept in by
+`import-dir`, or a supply-chain issue upstream of the assistant that wrote it — gets replayed as
+trusted context indefinitely, since writes are append-only and there's no automatic expiry.
+
+We don't have a fix for this; nobody building AI memory systems does. What evoctx does instead:
+
+- **`author_client` provenance.** Every note records who wrote it — `cli` for a direct human
+  write, a client name (`claude-code`, `cursor`, ...) for an assistant write. Visible in every
+  read path (`search_context`, `get_project`, `evoctx show`). It's a label, not a sandbox: it
+  tells you where a note came from, it doesn't stop a bad one from being read back.
+- **Server instructions tell the model explicitly** that past notes are informational context
+  from prior work, not commands from the current user — reducing (not eliminating) the odds a
+  model treats a stored note's content as an instruction to follow.
+- **Deletion exists.** If a note turns out to be bad, `evoctx delete <id>` removes it — CLI-only,
+  human-only, deliberately not something an MCP tool call can do.
+
+If you write or import content you don't fully trust, treat it the way you'd treat any other
+untrusted input reaching an LLM context window — because that's exactly what it is.
+
+## 3. Redaction: what's masked, what isn't, and when
+
+Two independent layers, described in full in [README.md](README.md#redaction):
+
+- **Write-time (unconditional):** common secret shapes (API key prefixes, cloud provider
+  tokens, PEM private key blocks, `password=`-style assignments) are masked *before* they touch
+  disk, regardless of entry point or active grant. This is regex-based and best-effort — it
+  will miss secrets in an unrecognized format, a value split across fields, or one the model
+  paraphrases rather than pastes verbatim. It is not a substitute for not pasting secrets into
+  an AI assistant's context in the first place.
+- **Read-time (per-grant, optional):** a grant's custom `redactions` list masks matching text in
+  responses only — it never modifies what's stored, so a stricter grant activated later doesn't
+  retroactively protect data written under a looser one. (Write-time redaction is what actually
+  prevents that; read-time redaction is for narrowing what a *specific* less-trusted client sees.)
+
+Neither layer is encryption. Redacted text is still recoverable by anyone with direct file
+access to `store.db` for anything the write-time patterns didn't catch.
+
+## 4. The store is unencrypted at rest
+
+`store.db` is a plain SQLite file. Anyone who can read your filesystem — another local process,
+a backup system, a stolen disk — can read it, full stop. Encryption at rest is on the roadmap,
+not shipped. Two things worth doing now regardless:
+
+- **Check `evoctx doctor`'s "cloud sync" line.** If your store folder resolves under OneDrive,
+  iCloud Drive, Dropbox, or Google Drive, that unencrypted file is being silently uploaded
+  off-device by default OS/app behavior — not something evoctx does, but something it sits
+  inside of unless you relocate it. Set `CONTEXT_STORE` to a path outside any synced folder.
+- **Treat the store like any other local secrets-adjacent file** — same disk-encryption (BitLocker/
+  FileVault/LUKS) hygiene you'd apply to SSH keys or a password manager's local cache.
+
+## 5. Client identity is self-reported, not authenticated
+
+`CONTEXT_CLIENT` (an env var the user sets in their own MCP config) or the name a client sends
+in the MCP `initialize` handshake — both are strings the connecting process chooses to send.
+Nothing verifies them. Grant `client:` matching and audit-log attribution are for **organizing
+your own setup and getting a readable record**, not for authenticating who's really on the
+other end of the connection. A process willing to lie about its name defeats this instantly.
+
+## 6. The audit log is an accountability record, not tamper-proof forensics
+
+`audit_log` is append-only, enforced by SQL triggers that raise on `UPDATE`/`DELETE`. That stops
+a well-behaved MCP client from tidying up its own trail through normal use. It does **not** stop
+anyone with direct file access to `store.db` — SQLite has no ACL model, so dropping to the file
+directly bypasses the triggers entirely. Audit answers "what did cooperative clients do,"
+assuming they went through the MCP interface. It is not evidence in the forensic sense.
+
+The one deliberate, human-only exception: `evoctx audit-prune --older-than 90d` reclaims space
+by dropping and recreating the append-only triggers around a single scoped `DELETE`, then
+restoring them immediately. It is never reachable from any MCP tool or from `policy.py` — the
+append-only guarantee is about stopping a *client* from editing its own trail through the
+protocol, not about the log being physically immutable forever. `evoctx doctor` reports the
+current row count so growth stays visible instead of silent.
+
+## 7. Known limitations, not vulnerabilities
+
+- **Session cross-linking in one server process.** The MCP server tracks "the current session"
+  as a single value per running process (`_current_session_id` in `server.py`). If one MCP
+  client somehow drives two concurrent, interleaved conversations over a single server
+  connection, notes from one could get linked to the other's session. Realistic MCP usage is
+  one conversation per connection, so this is a latent edge case, not an observed problem —
+  documented so it's not a surprise later.
+- **No multi-user concept.** evoctx is built for one person, one machine (or one person's set
+  of machines via manual sync/backup of `store.db`). There's no per-user access control because
+  there's no concept of multiple users.
+
+## Reporting a concern
+
+This is a young, pre-1.0, single-maintainer project. If you find something not covered above,
+open an issue. There's no bug bounty and no formal disclosure process yet — a plain issue or
+a direct email to the address in `pyproject.toml` both work.
