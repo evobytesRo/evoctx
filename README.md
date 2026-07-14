@@ -4,7 +4,7 @@ A local, personal context store for AI coding assistants, exposed over [MCP](htt
 
 Your assistant reads project context at session start, searches past decisions mid-work, and writes notes back before ending — so the next session (in any MCP-capable client) starts oriented instead of from zero. One SQLite store on your machine, shared across every workspace and every client that connects. No cloud component.
 
-> **Status: v0.1.0, first public release.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. Still early; expect the occasional breaking change ahead of 1.0.
+> **Status: v0.1.2.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. Still early; expect the occasional breaking change ahead of 1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ---
 
@@ -34,6 +34,11 @@ Either way, this installs one command: `evoctx`.
 
 Right after install, `evoctx` only exists inside the venv — running it from a normal terminal
 needs the full path or an activated venv. To get a plain `evoctx` from anywhere:
+
+> **PowerShell users:** a quoted full path followed by arguments needs the call operator `&`,
+> or PowerShell parses it as an expression instead of running it:
+> `& "C:\path\to\evoctx.exe" install claude-code`. cmd.exe doesn't have this quirk. Easiest
+> fix is just to put `evoctx` on `PATH` (below) so you never have to type the full path.
 
 **Recommended: [pipx](https://pipx.pypa.io)** (installs the CLI into its own isolated
 environment and puts it on PATH for you, on Windows/macOS/Linux alike):
@@ -95,8 +100,12 @@ evoctx get-project demo-webapp      # overview, conventions, open questions
 cd ~/code/my-api
 evoctx init
 
-# 4. Connect your AI client and restart it
+# 4. Connect your AI client (run from the project root — claude-code is project-scoped)
 evoctx install claude-code          # or: cursor, windsurf, vscode, codex, claude-desktop
+#    Prints what to do next for that specific client — for most, restarting isn't
+#    enough on its own (VS Code needs a manual Start, Claude Desktop needs a full
+#    quit not just a window close, Windsurf has its own per-server toggle). Read
+#    the tip it prints, or see docs/clients.md for the full list.
 
 # 5. Paste the instructions snippet into the client's rules file
 #    (docs/instructions-snippet.md — this is what makes the AI actually use the store)
@@ -113,13 +122,23 @@ different one — starts oriented.
 ## Connecting a client
 
 ```
-evoctx install claude-code     # or: claude-desktop, cursor, windsurf, vscode, codex
+evoctx install claude-code     # run from the project root — see note below
 evoctx doctor                  # verify store, grants, server command, client configs
 ```
 
 `install` writes the MCP block into the client's config (existing file backed up to `.bak`,
-existing entries merged, block printed for manual paste). Manual per-client setup:
-[docs/clients.md](docs/clients.md). ChatGPT Desktop is not supported — no local stdio MCP.
+existing entries merged, block printed for manual paste), then prints what that specific client
+needs beyond a restart to actually pick it up — most of them need something. Same command works
+for `claude-desktop`, `cursor`, `windsurf`, `vscode`, `codex`. Manual per-client setup, and the
+full list of per-client gotchas: [docs/clients.md](docs/clients.md). ChatGPT Desktop is not
+supported — no local stdio MCP.
+
+**Claude Code is project-scoped, not global.** The VS Code extension reads MCP servers from a
+`.mcp.json` file in the open workspace root — not from a global user file. `evoctx install
+claude-code` writes there (current directory by default, `--dir` to target another project) and
+needs to run once per project you want it in. If you also have the standalone `claude` CLI
+installed, `evoctx install claude-code` detects it and prints a `claude mcp add --scope user`
+command for one-time global registration instead. Full explanation: [docs/clients.md](docs/clients.md).
 
 `doctor` checks package/store/schema/FTS5/grant/server-command/client-configs, plus:
 store size and note count, days since the last note or session (a configured client with no

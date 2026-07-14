@@ -112,13 +112,94 @@ def clients(home: Path) -> dict[str, Client]:
         vscode = home / ".config" / "Code" / "User" / "mcp.json"
 
     return {
-        "claude-code": Client("claude-code", home / ".claude" / "settings.json", "mcpServers", True),
+        # claude-code is NOT here — see install_claude_code(). The VS Code
+        # extension reads MCP servers from project-scoped .mcp.json, not
+        # ~/.claude/settings.json's mcpServers key (confirmed by live
+        # testing: the settings.json entry was silently never read by a
+        # fresh session; the same entry in .mcp.json connected immediately).
+        # It doesn't fit this home-directory-file model.
         "claude-desktop": Client("claude-desktop", claude_desktop, "mcpServers", False),
         "cursor": Client("cursor", home / ".cursor" / "mcp.json", "mcpServers", False),
         "windsurf": Client("windsurf", home / ".codeium" / "windsurf" / "mcp_config.json", "mcpServers", False),
         "vscode": Client("vscode", vscode, "servers", True),
         # codex is TOML, handled separately
     }
+
+
+# Per-client "config written, now what" tips — each learned the hard way,
+# from live testing, not from reading that client's source. None of these
+# are evoctx bugs; they're facts about how each client discovers/activates
+# a newly-written MCP config, undocumented by evoctx until it bit someone.
+NEXT_STEPS: dict[str, str] = {
+    "claude-desktop": (
+        "Restart means fully quit, not just close the window — on Windows, quit from the "
+        "system tray icon or the old process (and old config) keeps running, with no error. "
+        "Check %APPDATA%\\Claude\\logs\\mcp-server-evoctx.log if the tools don't show up."
+    ),
+    "cursor": (
+        "Restart Cursor, then check Settings -> MCP for evoctx listed as connected."
+    ),
+    "windsurf": (
+        "Restart Windsurf, then open the MCPs icon in Cascade's top-right menu and confirm "
+        "evoctx is enabled there — off by default counts as silently not connected. Cascade "
+        "also caps at 100 total tools across all enabled servers; trim others if evoctx's "
+        "tools don't appear."
+    ),
+    "vscode": (
+        "Writing the config isn't enough — restart VS Code, then open the Command Palette -> "
+        "'MCP: List Servers' -> evoctx -> 'Start Server'. Skipping this step shows no error; "
+        "the tools just never appear."
+    ),
+    "codex": (
+        "Codex kills any MCP server that doesn't finish starting within startup_timeout_sec "
+        "(default 10s) — unlikely to matter for a plain local install, but add "
+        "startup_timeout_sec = 30 to the [mcp_servers.evoctx] block if evoctx doesn't connect."
+    ),
+    "codex-uvx": (
+        "Codex kills any MCP server that doesn't finish starting within startup_timeout_sec "
+        "(default 10s). The first --uvx run also has to download the package, which easily "
+        "blows past that — run `uvx evoctx serve` once manually first so it's cached, or add "
+        "startup_timeout_sec = 30 to the [mcp_servers.evoctx] block."
+    ),
+}
+
+
+def claude_cli_hint(command: str, args: list[str]) -> str | None:
+    """If the standalone `claude` CLI is on PATH, suggest the command for
+    real user-scope registration (works in every project automatically).
+    Not run automatically: `claude mcp add`'s exact flags aren't something
+    this project can verify end-to-end without that CLI installed, and a
+    wrong shelled-out command is worse than a suggestion the user can check
+    themselves with `claude mcp list` afterward."""
+    if not shutil.which("claude"):
+        return None
+    quoted_args = " ".join(args)
+    return (
+        f'claude mcp add --scope user --env CONTEXT_CLIENT=claude-code '
+        f'evoctx -- "{command}" {quoted_args}'
+    )
+
+
+def install_claude_code(project_dir: Path, uvx: bool = False) -> tuple[Path, dict]:
+    """Project-scoped .mcp.json at the given directory (typically the open
+    workspace root) — the mechanism actually read by the Claude Code VS Code
+    extension. Must be re-run per project/workspace; see claude_cli_hint()
+    for the one-time global alternative when the standalone CLI is present."""
+    command, args = server_command()
+    if uvx:
+        command, args = "uvx", ["evoctx", "serve"]
+    entry = {"type": "stdio", "command": command, "args": args,
+             "env": {"CONTEXT_CLIENT": "claude-code"}}
+
+    path = project_dir / ".mcp.json"
+    config: dict = {}
+    if path.exists():
+        shutil.copy2(path, path.with_suffix(".json.bak"))
+        config = json.loads(path.read_text(encoding="utf-8") or "{}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    config.setdefault("mcpServers", {})[SERVER_NAME] = entry
+    path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    return path, entry
 
 
 def entry_for(client: Client, command: str, args: list[str], uvx: bool) -> dict:
@@ -322,7 +403,20 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
     codex_path = home / ".codex" / "config.toml"
     if codex_path.exists() and f"[mcp_servers.{SERVER_NAME}]" in codex_path.read_text(encoding="utf-8"):
         found.append("codex")
+    # claude-code is project-scoped, not under home — checked against the
+    # current directory only, since that's the one location doctor can
+    # reasonably guess without being told which workspace to look at
+    claude_code_path = Path.cwd() / ".mcp.json"
+    if claude_code_path.exists():
+        try:
+            config = json.loads(claude_code_path.read_text(encoding="utf-8") or "{}")
+            if SERVER_NAME in config.get("mcpServers", {}):
+                found.append("claude-code (this directory)")
+        except (json.JSONDecodeError, OSError):
+            pass
     checks.append(("client configs", bool(found),
-                   ", ".join(found) if found else "no client config references the server — run: evoctx install <client>"))
+                   ", ".join(found) if found else
+                   "no client config references the server here — run: evoctx install <client> "
+                   "(claude-code: run from the project root you want it in)"))
 
     return checks

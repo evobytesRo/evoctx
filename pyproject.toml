@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evoctx"
-version = "0.1.1"
+version = "0.1.2"
 description = "Local personal context store for AI coding assistants, exposed over MCP — by Evo Bytes"
 readme = "README.md"
 license = "MIT"
