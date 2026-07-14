@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 — 2026-07-14 — docs fix
+
+The 0.1.0 README committed on `main` still had the pre-release status banner ("pre-beta,
+not yet on PyPI, install from source") — since `pyproject.toml` uses README.md as the PyPI
+long_description, that stale text shipped verbatim to the published package page. No code
+changes; this release exists solely to correct that: status banner and install instructions
+now say what's actually true (`pip install evoctx` works, v0.1.0 is public).
+
 ## 0.1.0 — 2026-07-14 — first beta
 
 Initial public release: a local, personal context store for AI coding assistants over MCP.

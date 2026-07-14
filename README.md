@@ -4,22 +4,28 @@ A local, personal context store for AI coding assistants, exposed over [MCP](htt
 
 Your assistant reads project context at session start, searches past decisions mid-work, and writes notes back before ending — so the next session (in any MCP-capable client) starts oriented instead of from zero. One SQLite store on your machine, shared across every workspace and every client that connects. No cloud component.
 
-> **Status: pre-beta.** Grants, redaction, audit logging, and sessions all work today. Not yet on PyPI — install from source until the first tagged release. Expect breaking changes until then.
+> **Status: v0.1.0, first public release.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. Still early; expect the occasional breaking change ahead of 1.0.
 
 ---
 
 ## Install
 
-Requires Python 3.10+. Until the package is on PyPI, install from source:
+Requires Python 3.10+.
 
 ```
-git clone <repo-url>
+pip install evoctx
+```
+
+Installing from source (for contributing, or to track `main` ahead of a release):
+
+```
+git clone https://github.com/evobytesRo/evoctx
 cd evoctx
 python -m venv .venv
 .venv/bin/pip install -e .          # Windows: .venv\Scripts\pip.exe install -e .
 ```
 
-This installs one command into the venv: `evoctx`.
+Either way, this installs one command: `evoctx`.
 
 - `evoctx <subcommand>` — the CLI for humans. `evoctx help` shows everything.
 - `evoctx serve` — launches the MCP server (stdio). Not for humans; your AI client runs this via its MCP config, written for you by `evoctx install` below.
@@ -33,8 +39,8 @@ needs the full path or an activated venv. To get a plain `evoctx` from anywhere:
 environment and puts it on PATH for you, on Windows/macOS/Linux alike):
 
 ```
-pipx install -e .                # from this repo, for now
-pipx install evoctx               # once it's on PyPI
+pipx install evoctx               # from PyPI
+pipx install -e .                 # from a local clone instead
 ```
 
 **Alternative: [uv](https://docs.astral.sh/uv/)**, same idea:
