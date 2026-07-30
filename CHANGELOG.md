@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.3 — unreleased — forward-compatible grants, and install guidance that matches reality
+## 0.1.3 — 2026-07-30 — forward-compatible grants, install guidance that matches reality, first pyright pass, deterministic ordering
 
 **1. A future release could have locked users out of their own store.** `_parse_grant`
 raised `GrantError` on any tool name not in `ALL_TOOLS`. That parse runs inside

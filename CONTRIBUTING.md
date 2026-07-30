@@ -33,6 +33,21 @@ blobs, no proprietary format, no encryption key you'd need this project's code t
 - **Security concerns:** see [SECURITY.md](SECURITY.md) first — it may already be a documented,
   known limitation rather than something to report as new.
 
+## Releasing
+
+A PyPI version number cannot be reused, so check the repo's state — not just the diff —
+before tagging:
+
+1. `pyproject.toml` version matches the tag.
+2. `CHANGELOG.md` top heading is that version with today's date, and its summary covers the
+   whole release.
+3. `README.md` status line names that version.
+4. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean.
+5. Push `main`, wait for CI green — the tag is what publishes.
+6. `git tag -a vX.Y.Z && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
+   trusted publishing, and cuts the GitHub release.
+7. Install from PyPI into a clean venv and check `evoctx version`.
+
 ## Design principles, if you're extending this
 
 - **CLI/MCP parity.** Every MCP tool gets a CLI mirror. The store must stay human-operable, not
