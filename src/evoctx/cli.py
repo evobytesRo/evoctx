@@ -73,7 +73,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .db import Database, NoteTooLarge
+from .db import AmbiguousPrefix, Database, NoteTooLarge
 from .grants import TOOLS_WILDCARD, GrantError, GrantStore
 from .paths import store_dir
 from .policy import PolicyEngine
@@ -178,8 +178,12 @@ def cmd_start_session(args):
 
 def cmd_end_session(args):
     if args.id:
-        session = db.get_session(args.id) or next(
-            (s for s in db.recent_sessions(limit=50) if s["id"].startswith(args.id)), None
+        # scans the whole table, unlike the previous 50-session window: a
+        # unique prefix for an older session used to report "not found", and
+        # a prefix ambiguous only outside the window resolved silently
+        session = _resolve(
+            lambda: db.get_session(args.id) or db.find_session_by_prefix(args.id),
+            "evoctx recent-sessions",
         )
     else:
         session = db.latest_open_session(project=args.project)
@@ -718,8 +722,30 @@ def cmd_list(args):
     print(f"\n{len(rows)} note(s)")
 
 
+def _resolve(lookup, list_command: str) -> dict | None:
+    """Run a full-id-or-prefix lookup, exiting on an ambiguous prefix instead
+    of picking one.
+
+    `evoctx delete <prefix> --force` skips the confirmation prompt, so
+    silently choosing among candidates would delete an arbitrary note,
+    unrecoverably; closing an arbitrary session writes the summary onto the
+    wrong one. Neither is worth guessing at.
+    """
+    try:
+        return lookup()
+    except AmbiguousPrefix as e:
+        print(f"Ambiguous id: {e}")
+        print(f"Use a longer prefix, or the full id from: {list_command}")
+        sys.exit(1)
+
+
+def _resolve_note(ident: str) -> dict | None:
+    return _resolve(lambda: db.get_note(ident) or db.find_note_by_prefix(ident),
+                    "evoctx list")
+
+
 def cmd_show(args):
-    note = db.get_note(args.id) or db.find_note_by_prefix(args.id)
+    note = _resolve_note(args.id)
     if not note:
         print(f"Not found: {args.id}")
         sys.exit(1)
@@ -752,7 +778,7 @@ def cmd_dump(args):
         print()
 
     if args.note:
-        note = db.get_note(args.note) or db.find_note_by_prefix(args.note)
+        note = _resolve_note(args.note)
         if note:
             print("─" * 60)
             print(f"Title:   {note['title']}")
@@ -779,7 +805,7 @@ def cmd_delete(args):
         sys.exit(1)
 
     if args.id:
-        note = db.get_note(args.id) or db.find_note_by_prefix(args.id)
+        note = _resolve_note(args.id)
         if not note:
             print(f"Not found: {args.id}")
             sys.exit(1)

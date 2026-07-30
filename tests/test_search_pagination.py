@@ -110,10 +110,19 @@ def test_like_fallback_paging_is_ordered(db):
     """The LIKE fallback fires when the FTS query is malformed — an unbalanced
     quote is enough. It had no ORDER BY at all, and paging an unordered query
     is undefined rather than merely unstable."""
-    # the body carries the quote too: the fallback re-derives its LIKE pattern
+    # The body carries the quote too: the fallback re-derives its LIKE pattern
     # from the raw query, so the quote has to be matchable literally or the
-    # fallback runs and legitimately finds nothing, testing no ordering at all
-    ids = [db.add_note("same title", 'he said "identical here') for _ in range(6)]
+    # fallback runs and legitimately finds nothing, testing no ordering at all.
+    #
+    # It is also deliberately longer than 200 chars. That is what makes the
+    # "did the fallback actually run" assertion below discriminate: the two
+    # paths only produce different snippets once the content exceeds what each
+    # one keeps. On a short note FTS5's snippet() returns the column verbatim,
+    # identical to the fallback's substr — an earlier version of this test
+    # asserted on a short note and proved nothing.
+    body = 'he said "identical here — ' + "padding words to exceed the cutoff. " * 12
+    assert len(body) > 200
+    ids = [db.add_note("same title", body) for _ in range(6)]
 
     seen: list[str] = []
     for offset in range(0, 6, 2):
@@ -123,6 +132,14 @@ def test_like_fallback_paging_is_ordered(db):
 
     assert len(set(seen)) == 6
     assert seen == ids[::-1], "the fallback must page newest-first, not in scan order"
+
+    # Prove the fallback actually ran, so the test can't rot: if quoting is
+    # ever sanitised, MATCH succeeds and the FTS path returns the same notes
+    # in the same order, and everything above would still pass. substr(content,
+    # 1, 200) is a shape snippet() cannot produce — it caps at 32 tokens and
+    # appends an ellipsis when it truncates.
+    row = db.search('"identical', limit=1)[0]
+    assert row["snippet"] == body[:200], "FTS path ran, not the fallback"
 
 
 def test_db_recent_sessions_offset_paginates(db):

@@ -81,6 +81,21 @@ class SchemaTooNew(RuntimeError):
     """The store was created by a newer release than this code."""
 
 
+class AmbiguousPrefix(ValueError):
+    """An id prefix matches more than one record. Carries the candidates so
+    the caller can show them instead of just refusing."""
+
+    def __init__(self, prefix: str, ids: list[str], total: int | None = None):
+        self.prefix = prefix
+        self.ids = ids                      # up to 5, for display
+        self.total = len(ids) if total is None else total
+        shown = ", ".join(i[:12] for i in ids)
+        rest = f" (showing {len(ids)})" if self.total > len(ids) else ""
+        super().__init__(
+            f"'{prefix}' matches {self.total} records{rest}: {shown}"
+        )
+
+
 class NoteTooLarge(ValueError):
     """Content exceeds MAX_NOTE_BYTES. Raised before the INSERT — nothing
     partial gets written."""
@@ -194,6 +209,14 @@ class Database:
         # in policy.py pages this with LIMIT/OFFSET, and a non-total order
         # under paging can repeat or skip a row between one page and the next.
         # bm25 ties are not hypothetical — same-shape notes score identically.
+        #
+        # Don't "optimise" the tiebreaker back out when you see the plan: the
+        # rowid term does cost FTS5's rank pushdown. EXPLAIN QUERY PLAN goes
+        # from `INDEX 32:M2` (internal rank sort, early exit at LIMIT+OFFSET)
+        # to `INDEX 0:M2` + `USE TEMP B-TREE FOR ORDER BY` (sort all matches,
+        # re-run per page). That is a real cost and an accepted one — these
+        # are personal stores, and a correct page beats a fast one that can
+        # drop a note.
         fts_query = expand_query(query)
         try:
             if project:
@@ -255,11 +278,51 @@ class Database:
             "created_at": row[5], "updated_at": row[6], "author_client": row[7],
         }
 
+    # tables whose TEXT id may be addressed by prefix. Named explicitly
+    # because _id_by_prefix interpolates the table name into SQL.
+    _PREFIX_TABLES = ("notes", "sessions")
+
+    def _id_by_prefix(self, table: str, prefix: str) -> str | None:
+        """Resolve a full id from a prefix, or raise AmbiguousPrefix.
+
+        Adding an ORDER BY and taking the first row would have been the wrong
+        fix. These are truncated queries, but ordering one only makes the
+        arbitrary pick *deterministic*, not correct: the caller asked for one
+        record and there is no basis for choosing among several, so refuse —
+        the way git refuses an ambiguous rev. It matters because
+        `evoctx delete <prefix> --force` skips the confirmation prompt, and a
+        delete is not undoable.
+        """
+        if table not in self._PREFIX_TABLES:
+            raise ValueError(f"prefix lookup not supported for table {table!r}")
+        # LIKE metacharacters in a typo'd prefix would otherwise widen the
+        # match silently: 'a_c3' matches 'abc3...' as well as 'a_c3...', and a
+        # widened match that happens to hit exactly one row deletes it without
+        # ever reporting ambiguity.
+        pattern = (prefix.replace("\\", r"\\")
+                         .replace("%", r"\%")
+                         .replace("_", r"\_")) + "%"
+        rows = self.conn.execute(
+            f"SELECT id FROM {table} WHERE id LIKE ? ESCAPE '\\' ORDER BY id LIMIT 5",
+            (pattern,),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) > 1:
+            total = self.conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE id LIKE ? ESCAPE '\\'",
+                (pattern,),
+            ).fetchone()[0]
+            raise AmbiguousPrefix(prefix, [r[0] for r in rows], total)
+        return rows[0][0]
+
     def find_note_by_prefix(self, prefix: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT id FROM notes WHERE id LIKE ?", (f"{prefix}%",)
-        ).fetchone()
-        return self.get_note(row[0]) if row else None
+        note_id = self._id_by_prefix("notes", prefix)
+        return self.get_note(note_id) if note_id else None
+
+    def find_session_by_prefix(self, prefix: str) -> dict | None:
+        session_id = self._id_by_prefix("sessions", prefix)
+        return self.get_session(session_id) if session_id else None
 
     def get_project(self, name: str) -> dict | None:
         row = self.conn.execute(
@@ -340,6 +403,14 @@ class Database:
         if project:
             q += " AND project = ?"
             params.append(project)
+        # Every tiebreaker in this file assumes rowid ascends with insertion
+        # time. That survives deletes (a reused max rowid still exceeds every
+        # live row) and is planner-independent. `VACUUM` is what breaks it:
+        # these tables have TEXT primary keys, so their rowids are implicit,
+        # and VACUUM may renumber those — which would also desync notes_fts,
+        # keyed on content_rowid=rowid. Nothing here ever VACUUMs; a user
+        # running it by hand on store.db is the exposure.
+        #
         # rowid DESC is the tiebreaker, not decoration: started_at comes from
         # datetime.now(), whose resolution on Windows is coarse enough that two
         # sessions started back to back land on the identical ISO string ~3% of

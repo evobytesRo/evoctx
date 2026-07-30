@@ -4,7 +4,7 @@ import pytest
 
 from conftest import found
 
-from evoctx.db import MIGRATIONS, Database, SchemaTooNew
+from evoctx.db import MIGRATIONS, AmbiguousPrefix, Database, SchemaTooNew
 
 
 def test_add_and_get_note(db):
@@ -22,8 +22,81 @@ def test_get_note_missing_returns_none(db):
 
 def test_find_note_by_prefix(db):
     note_id = db.add_note("Prefixed", "x")
-    assert db.find_note_by_prefix(note_id[:8])["id"] == note_id
+    assert found(db.find_note_by_prefix(note_id[:8]))["id"] == note_id
     assert db.find_note_by_prefix("zzzzzzzz") is None
+
+
+def test_ambiguous_prefix_refuses_instead_of_picking_one(db):
+    """An ambiguous prefix must raise, not resolve arbitrarily.
+
+    Adding an ORDER BY would only make the arbitrary pick deterministic. The
+    caller asked for one note and there is no basis for choosing among
+    several, so refuse — `evoctx delete <prefix> --force` skips the
+    confirmation prompt, and a delete is not undoable.
+    """
+    for i in range(3):
+        db.add_note(f"note {i}", "x")
+    db.conn.execute("UPDATE notes SET id = 'dupe-' || id")
+    db.conn.commit()
+
+    with pytest.raises(AmbiguousPrefix) as exc:
+        db.find_note_by_prefix("dupe-")
+    assert len(exc.value.ids) == 3
+    assert exc.value.total == 3
+    assert "matches 3 records" in str(exc.value)
+
+    # an unambiguous prefix still resolves
+    one = db.conn.execute("SELECT id FROM notes LIMIT 1").fetchone()[0]
+    assert found(db.find_note_by_prefix(one))["id"] == one
+
+
+def test_ambiguous_prefix_reports_the_true_count_not_the_shown_five(db):
+    """Only 5 candidates are listed; the count must still be the real total,
+    or the message states an undercount as fact."""
+    for i in range(9):
+        db.add_note(f"note {i}", "x")
+    db.conn.execute("UPDATE notes SET id = 'dupe-' || id")
+    db.conn.commit()
+
+    with pytest.raises(AmbiguousPrefix) as exc:
+        db.find_note_by_prefix("dupe-")
+    assert len(exc.value.ids) == 5      # display is capped
+    assert exc.value.total == 9         # the count is not
+    assert "matches 9 records (showing 5)" in str(exc.value)
+
+
+def test_prefix_lookup_escapes_like_metacharacters(db):
+    """A typo'd '_' is a LIKE wildcard. Unescaped, 'a_c' would match 'abc...'
+    too — and a widened match that happens to hit exactly one note resolves
+    silently instead of reporting ambiguity."""
+    db.add_note("wildcard bait", "x")
+    db.conn.execute("UPDATE notes SET id = 'abc-1234'")
+    db.conn.commit()
+
+    assert found(db.find_note_by_prefix("abc"))["id"] == "abc-1234"
+    assert db.find_note_by_prefix("a_c") is None    # '_' is literal, not a wildcard
+    assert db.find_note_by_prefix("a%") is None     # so is '%'
+
+
+def test_find_session_by_prefix(db):
+    """end-session --id takes a prefix too, and now resolves it here.
+
+    Covers resolution and refusal. It does NOT cover the 50-session window
+    that cli.py used to apply — that would need 51 sessions and a CLI-level
+    test; the window is gone structurally because the code that imposed it
+    was deleted, not because this test watches for it.
+    """
+    first = db.start_session(project="a")
+    second = db.start_session(project="b")
+
+    assert found(db.find_session_by_prefix(first[:8]))["id"] == first
+    assert db.find_session_by_prefix("zzzzzzzz") is None
+
+    db.conn.execute("UPDATE sessions SET id = 'dupe-' || id")
+    db.conn.commit()
+    with pytest.raises(AmbiguousPrefix):
+        db.find_session_by_prefix("dupe-")
+    assert found(db.find_session_by_prefix("dupe-" + second))["id"] == "dupe-" + second
 
 
 def test_fts_search_finds_content(db):

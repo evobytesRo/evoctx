@@ -57,8 +57,8 @@ Most were type-level noise; two were real and are fixed above (the crash in 5, p
 recording that 186 passing tests and four adversarial review rounds all ran green over a
 latent crash that a type checker found in three seconds.
 
-**7. Every paged or truncated query now has a total ordering.** They didn't, and the
-consequences ranged from cosmetic to wrong-answer.
+**7. Queries that page or truncate now pick deterministically — or refuse.** Several
+didn't, and the consequences ranged from cosmetic to deleting the wrong note.
 
 The one with teeth: `latest_open_session()` ordered by `started_at` alone. `datetime.now()`
 resolution on Windows is coarse enough that two sessions created back to back land on the
@@ -81,6 +81,21 @@ at all, and paging an unordered query is undefined rather than merely unstable. 
 took the 5 most recent notes with no tiebreaker, so a tie decided the cut arbitrarily. The
 audit log ordered by `ts` alone while carrying an `AUTOINCREMENT` id. All now order by a
 total key.
+
+One case needed the opposite treatment. `find_note_by_prefix` resolved an id prefix with an
+unordered first-row read, so an ambiguous prefix returned an arbitrary note — and
+`evoctx delete <prefix> --force` skips the confirmation prompt, so it could delete a note
+the user never named, unrecoverably. Ordering that query would only have made the wrong
+pick *deterministic*. It now refuses and lists the candidates, the way git refuses an
+ambiguous rev.
+
+`evoctx end-session --id <prefix>` silently resolved an ambiguous prefix too — to the
+newest match inside a 50-session window — and now shares that same lookup. The window was
+its own bug: a unique prefix for anything older reported "No matching open session found"
+while the session existed, and a prefix ambiguous only outside the window never reported
+it. Both lookups now scan the whole table and escape LIKE metacharacters, since an
+unescaped `_` in a mistyped prefix is a single-character wildcard and a widened match that
+happens to hit exactly one record resolves instead of reporting ambiguity.
 
 **One visible consequence:** equally-ranked search results now come back **newest first**.
 They previously came back oldest-first, because scan order is insertion order — not by

@@ -59,6 +59,41 @@ def test_end_session_without_open_exits_nonzero(cli, monkeypatch, capsys):
         run(cli, monkeypatch, "end-session", "nothing to close")
 
 
+def test_delete_force_refuses_an_ambiguous_prefix(cli, monkeypatch, capsys):
+    """--force skips the confirmation prompt, so an ambiguous prefix must not
+    resolve to an arbitrary note — that would be an unrecoverable delete of
+    something the user never named."""
+    run(cli, monkeypatch, "add", "first", "--text", "x")
+    run(cli, monkeypatch, "add", "second", "--text", "y")
+    cli.db.conn.execute("UPDATE notes SET id = 'dupe-' || id")
+    cli.db.conn.commit()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "delete", "dupe-", "--force")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "Ambiguous id" in out
+    assert "matches 2 records" in out
+    assert len(cli.db.list_notes()) == 2, "nothing may be deleted on an ambiguous prefix"
+
+
+def test_end_session_refuses_an_ambiguous_prefix(cli, monkeypatch, capsys):
+    run(cli, monkeypatch, "start-session", "--project", "p1", "--intent", "one")
+    run(cli, monkeypatch, "start-session", "--project", "p2", "--intent", "two")
+    cli.db.conn.execute("UPDATE sessions SET id = 'dupe-' || id")
+    cli.db.conn.commit()
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "end-session", "summary", "--id", "dupe-")
+    assert exc.value.code == 1
+    sessions = cli.db.recent_sessions()
+    assert "Ambiguous id" in capsys.readouterr().out
+    assert len(sessions) == 2  # or the all() below is vacuously true
+    assert all(s["open"] for s in sessions), "neither may be closed"
+
+
 # ── grants ────────────────────────────────────────────────────────────────────
 
 def _replace_grants(tmp_path, body: str):
