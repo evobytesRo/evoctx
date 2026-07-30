@@ -57,19 +57,27 @@ Most were type-level noise; two were real and are fixed above (the crash in 5, p
 recording that 186 passing tests and four adversarial review rounds all ran green over a
 latent crash that a type checker found in three seconds.
 
-**7. `evoctx end-session` could close the wrong session.** With no `--id` it closes the
-latest open one, and `latest_open_session()` ordered by `started_at` with no tiebreaker.
-`datetime.now()` on Windows is coarse enough that two sessions started back to back land on
-the identical ISO string — measured at 3-4% of pairs — and on a tie SQLite returns rows in
-scan order, so `LIMIT 1` handed back the *older* session: wrong on 62 of 62 ties. The
-summary went onto the wrong session and the intended one stayed open. Both session queries
-now break ties by `rowid DESC`; the paged one needed it too, since an order that isn't
-total can repeat or skip a row between pages.
+**7. Session ordering was not deterministic on a `started_at` tie.**
+`latest_open_session()` and `recent_sessions()` both ordered by `started_at` alone.
+`datetime.now()` resolution on Windows is coarse enough that two sessions created back to
+back land on the identical ISO string — 3-4% of programmatically-created pairs — and on a
+tie SQLite returns rows in scan order, so `LIMIT 1` handed back the *older* session, wrong
+on 62 of 62 ties. Both queries now break the tie with `rowid DESC`.
 
-This was on the backlog as a flaky test. It was not flaky — it was a correctness bug
-sampling itself at 3%, and the test that caught it only failed when the race happened to
-fire. The replacement pins the tie deliberately, so it fails every run against the old
-query instead of one run in thirty.
+Scope, stated honestly: this needs two sessions created within the same clock tick and both
+still open, which in practice means scripted creation or a CLI racing the MCP server — not
+a human typing two commands. The MCP `end_session` tool was never exposed at all; it closes
+`_current_session_id`, held in-process. What could hit it is `evoctx end-session` without
+`--id` (closing the wrong session) and the Stop hook (naming the wrong session's intent).
+The paged query is the one where a tie matters beyond a tie: `PolicyEngine._fetch_filtered`
+pages through `recent_sessions()`, and an order that isn't total can repeat or skip a row
+between pages.
+
+Recorded because the label was doing damage: this sat on the backlog as a *flaky test*. It
+was not flaky — the ordering was simply wrong whenever the tie occurred, and the old test
+only failed when the race happened to fire, so it read as noise. The replacement pins two
+sessions to one `started_at`, so it fails every run against the old query instead of one
+run in thirty.
 
 Also documented, because both cost real debugging time: an `mcpServers` block in
 `~/.claude/settings.json` is ignored by the VS Code extension (hooks in the same file
