@@ -145,7 +145,11 @@ def query_audit(
     if since:
         q += " AND ts >= ?"
         params.append(parse_since(since))
-    q += " ORDER BY ts DESC LIMIT ?"
+    # id DESC tiebreaker: audit rows are written per tool call, in bursts, from
+    # the same coarse clock, so `ts` ties are routine — without it, which rows
+    # survive the LIMIT truncation is nondeterministic. id is AUTOINCREMENT, so
+    # the total order is free.
+    q += " ORDER BY ts DESC, id DESC LIMIT ?"
     params.append(limit)
     return [
         {

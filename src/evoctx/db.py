@@ -190,6 +190,10 @@ class Database:
         # search for that literal parenthesized text under the LIKE
         # fallback, so the fallback below deliberately re-derives `like`
         # from the original, unexpanded `query`.
+        # Every ordering below is total, and deliberately so: _fetch_filtered
+        # in policy.py pages this with LIMIT/OFFSET, and a non-total order
+        # under paging can repeat or skip a row between one page and the next.
+        # bm25 ties are not hypothetical — same-shape notes score identically.
         fts_query = expand_query(query)
         try:
             if project:
@@ -200,7 +204,7 @@ class Database:
                     FROM notes_fts
                     JOIN notes n ON n.rowid = notes_fts.rowid
                     WHERE notes_fts MATCH ? AND n.project = ?
-                    ORDER BY rank LIMIT ? OFFSET ?
+                    ORDER BY rank, n.rowid DESC LIMIT ? OFFSET ?
                 """, (fts_query, project, limit, offset)).fetchall()
             else:
                 rows = self.conn.execute("""
@@ -210,7 +214,7 @@ class Database:
                     FROM notes_fts
                     JOIN notes n ON n.rowid = notes_fts.rowid
                     WHERE notes_fts MATCH ?
-                    ORDER BY rank LIMIT ? OFFSET ?
+                    ORDER BY rank, n.rowid DESC LIMIT ? OFFSET ?
                 """, (fts_query, limit, offset)).fetchall()
         except sqlite3.OperationalError:
             like = f"%{query}%"
@@ -218,13 +222,13 @@ class Database:
                 rows = self.conn.execute("""
                     SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client
                     FROM notes WHERE (title LIKE ? OR content LIKE ?) AND project = ?
-                    LIMIT ? OFFSET ?
+                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
                 """, (like, like, project, limit, offset)).fetchall()
             else:
                 rows = self.conn.execute("""
                     SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client
                     FROM notes WHERE title LIKE ? OR content LIKE ?
-                    LIMIT ? OFFSET ?
+                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
                 """, (like, like, limit, offset)).fetchall()
 
         return [
@@ -266,7 +270,10 @@ class Database:
             return None
 
         recent = self.conn.execute(
-            "SELECT id, title, tags, created_at, author_client FROM notes WHERE project = ? ORDER BY created_at DESC LIMIT 5",
+            # rowid DESC tiebreaker: with LIMIT 5, a created_at tie otherwise
+            # decides which note makes the cut nondeterministically
+            "SELECT id, title, tags, created_at, author_client FROM notes "
+            "WHERE project = ? ORDER BY created_at DESC, rowid DESC LIMIT 5",
             (name,),
         ).fetchall()
 
@@ -290,7 +297,7 @@ class Database:
         if project:
             q += " WHERE project = ?"
             params.append(project)
-        q += " ORDER BY created_at DESC"
+        q += " ORDER BY created_at DESC, rowid DESC"
         return [
             {
                 "id": r[0], "title": r[1], "project": r[2],
@@ -370,7 +377,7 @@ class Database:
 
     def _session_dict(self, row) -> dict:
         note_rows = self.conn.execute(
-            "SELECT id, title FROM notes WHERE session_id = ? ORDER BY created_at",
+            "SELECT id, title FROM notes WHERE session_id = ? ORDER BY created_at, rowid",
             (row[0],),
         ).fetchall()
         return {
@@ -417,11 +424,22 @@ class Database:
 
     def export_all(self) -> dict:
         """Full dump for `evoctx export` — every project, every note (full
-        content), every session. The portability story made checkable."""
+        content), every session. The portability story made checkable.
+
+        Note for whoever writes the importer: sessions come out **newest
+        first** (recent_sessions' order), while `latest_open_session()` and
+        `recent_sessions()` break `started_at` ties with `rowid DESC` — i.e.
+        they assume rowid ascends with insertion time. An importer that
+        inserts sessions in this dump's order would invert that, and ties
+        would silently resolve to the *older* session again. Insert
+        oldest-first, or sort on `started_at` before inserting.
+        """
         projects = [self.get_project(name) for name in self.list_projects()]
         notes = [
             self.get_note(r[0])
-            for r in self.conn.execute("SELECT id FROM notes ORDER BY created_at").fetchall()
+            for r in self.conn.execute(
+                "SELECT id FROM notes ORDER BY created_at, rowid"
+            ).fetchall()
         ]
         sessions = self.recent_sessions(limit=1_000_000)
         return {"projects": projects, "notes": notes, "sessions": sessions}
