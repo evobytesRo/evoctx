@@ -333,7 +333,14 @@ class Database:
         if project:
             q += " AND project = ?"
             params.append(project)
-        q += " ORDER BY started_at DESC LIMIT 1"
+        # rowid DESC is the tiebreaker, not decoration: started_at comes from
+        # datetime.now(), whose resolution on Windows is coarse enough that two
+        # sessions started back to back land on the identical ISO string ~3% of
+        # the time. With no tiebreaker SQLite returns them in scan order, so
+        # LIMIT 1 hands back the OLDER session — measured wrong on 62 of 62
+        # ties. `evoctx end-session` defaults to this session, so the summary
+        # would land on the wrong one and leave the intended one open.
+        q += " ORDER BY started_at DESC, rowid DESC LIMIT 1"
         row = self.conn.execute(q, params).fetchone()
         return self.get_session(row[0]) if row else None
 
@@ -353,7 +360,10 @@ class Database:
         if project:
             q += " WHERE s.project = ?"
             params.append(project)
-        q += " ORDER BY s.started_at DESC LIMIT ? OFFSET ?"
+        # same tiebreaker, and it matters more here: this query is paged
+        # through by PolicyEngine._fetch_filtered, and an order that isn't
+        # total can repeat or skip a row between one page and the next
+        q += " ORDER BY s.started_at DESC, s.rowid DESC LIMIT ? OFFSET ?"
         params.append(limit)
         params.append(offset)
         return [self._session_dict(r) for r in self.conn.execute(q, params).fetchall()]

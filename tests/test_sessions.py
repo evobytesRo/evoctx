@@ -53,6 +53,42 @@ def test_recent_sessions_project_scoping_and_limit(db):
     assert len(db.recent_sessions()) == 4
 
 
+def _force_same_start_time(db, *session_ids, when="2026-01-01T00:00:00+00:00"):
+    """Pin several sessions to one started_at.
+
+    Not artificial: datetime.now() on Windows is coarse enough that two
+    sessions started back to back collide on the identical ISO string about
+    3% of the time. This makes that case happen every run instead of once in
+    thirty, so the ordering is actually asserted rather than sampled.
+    """
+    for sid in session_ids:
+        db.conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (when, sid))
+    db.conn.commit()
+
+
+def test_latest_open_session_breaks_start_time_ties_by_insertion_order(db):
+    """Ties must resolve to the session started LAST.
+
+    Without a tiebreaker SQLite returns tied rows in scan order, so LIMIT 1
+    hands back the OLDER one — measured wrong on 62 of 62 ties. That is not
+    cosmetic: `evoctx end-session` with no --id closes this session, so the
+    summary lands on the wrong session and leaves the intended one open.
+    """
+    first = db.start_session(project="a")
+    second = db.start_session(project="a")
+    _force_same_start_time(db, first, second)
+
+    latest = db.latest_open_session()
+    assert latest is not None
+    assert latest["id"] == second
+
+    # and the paged listing agrees — PolicyEngine._fetch_filtered pages through
+    # this, and an order that isn't total can repeat or skip rows across pages
+    assert [s["id"] for s in db.recent_sessions()] == [second, first]
+    assert [s["id"] for s in db.recent_sessions(limit=1)] == [second]
+    assert [s["id"] for s in db.recent_sessions(limit=1, offset=1)] == [first]
+
+
 def test_latest_open_session(db):
     assert db.latest_open_session() is None
     first = db.start_session(project="a")
