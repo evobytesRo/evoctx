@@ -1,9 +1,24 @@
 import importlib
 import sys
+from typing import TypeVar
 
 import pytest
 
 from evoctx.db import Database
+
+T = TypeVar("T")
+
+
+def found(value: T | None) -> T:
+    """Unwrap a store lookup the test requires to have hit.
+
+    get_note()/get_project() return Optional, and every call here fetches a
+    record the test itself just wrote — so None means the setup broke. Fail
+    on that, with a message, instead of on a TypeError from subscripting
+    None a line later.
+    """
+    assert value is not None, "expected the store to return a record, got None"
+    return value
 
 
 @pytest.fixture

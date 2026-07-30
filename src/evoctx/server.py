@@ -30,9 +30,20 @@ def _client_name(ctx: Context | None = None) -> str:
     env = os.environ.get("CONTEXT_CLIENT")
     if env:
         return env
+    if ctx is None:
+        return "unknown"
     try:
-        return ctx.session.client_params.clientInfo.name
-    except AttributeError:
+        params = ctx.session.client_params
+        # the whole chain stays inside the guard: the current SDK declares
+        # clientInfo as a required field, but attribution is not worth an
+        # exception escaping into a tool call if some client's params object
+        # doesn't look the way the SDK says it will
+        if params is None or params.clientInfo is None:
+            return "unknown"
+        return params.clientInfo.name
+    except (AttributeError, ValueError):
+        # no active request context (ValueError), or a session that never
+        # completed the initialize handshake — there is nobody to name
         return "unknown"
 
 

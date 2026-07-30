@@ -74,7 +74,7 @@ import sys
 from pathlib import Path
 
 from .db import Database, NoteTooLarge
-from .grants import GrantError, GrantStore
+from .grants import TOOLS_WILDCARD, GrantError, GrantStore
 from .paths import store_dir
 from .policy import PolicyEngine
 
@@ -209,14 +209,16 @@ def cmd_list_grants(args):
 
 def cmd_grant(args):
     if args.action == "list":
-        grant, expires_at, reason = grant_store.active_grant()
-        active_name = grant.name if grant else None
+        active, reason = grant_store.active_grant()
+        active_name = active.grant.name if active else None
         for name, g in grant_store.grants().items():
             marker = "* " if name == active_name else "  "
-            print(f"{marker}{name:<20} client={g.client:<12} tools={len(g.tools)} "
+            # effective, not raw: a grant declaring tools: ["*"] would otherwise
+            # print "tools=1", which reads as "permits one tool"
+            print(f"{marker}{name:<20} client={g.client:<12} tools={len(g.effective_tools())} "
                   f"projects={g.projects} expires={g.expires}")
-        if grant:
-            print(f"\nActive: {active_name} (expires {expires_at.isoformat()})")
+        if active:
+            print(f"\nActive: {active_name} (expires {active.expires_at.isoformat()})")
         else:
             print(f"\nNo active grant — {reason}")
         print(f"Config: {grant_store.grants_path}")
@@ -231,7 +233,10 @@ def cmd_grant(args):
             sys.exit(1)
         print(f"Name:         {g.name}")
         print(f"Client:       {g.client}")
-        print(f"Tools:        {', '.join(g.tools)}")
+        if TOOLS_WILDCARD in g.tools:
+            print(f"Tools:        * (all {len(g.effective_tools())}: {', '.join(g.effective_tools())})")
+        else:
+            print(f"Tools:        {', '.join(g.tools)}")
         print(f"Projects:     {g.projects}")
         print(f"Exclude tags: {g.exclude_tags}")
         print(f"Redactions:   {len(g.redactions)} pattern(s)")
@@ -246,8 +251,17 @@ def cmd_grant(args):
         except GrantError as e:
             print(f"Error: {e}")
             sys.exit(1)
-        _, expires_at, _ = grant_store.active_grant()
-        print(f"Activated grant '{g.name}' (expires {expires_at.isoformat()})")
+        active, reason = grant_store.active_grant()
+        if active is None:
+            # Writing active_grant.json succeeded, but the grant is already
+            # past its own expiry — `expires: "+0m"`, or an absolute timestamp
+            # in the past. Every call would be denied, so this is a failure
+            # however successful the write was; exit non-zero so a script
+            # that activates a grant can trust a 0 to mean "usable".
+            print(f"Activated grant '{g.name}', but it is not usable: {reason}")
+            print(f"Fix its 'expires' in {grant_store.grants_path}, then activate it again.")
+            sys.exit(1)
+        print(f"Activated grant '{g.name}' (expires {active.expires_at.isoformat()})")
 
     elif args.action == "deactivate":
         grant_store.deactivate()
@@ -311,6 +325,7 @@ def cmd_install(args):
         NEXT_STEPS, SERVER_NAME, claude_cli_hint, clients, install_claude_code,
         install_claude_code_hooks, install_claude_code_permissions_deny,
         install_codex, install_json_client, server_command,
+        workspace_folder_warning,
     )
 
     home = _Path.home()
@@ -325,8 +340,14 @@ def cmd_install(args):
         print(json.dumps({SERVER_NAME: entry}, indent=2))
         print()
         print("Claude Code (VS Code extension) reads MCP servers from a project-scoped")
-        print(".mcp.json, not a global user file — re-run this in every project/workspace")
-        print("root you want evoctx available in.")
+        print(".mcp.json, not a global user file — re-run this in every workspace FOLDER")
+        print("you want evoctx available in. A parent directory does not cover its children.")
+        warning = workspace_folder_warning(project_dir)
+        if warning:
+            print()
+            print(warning)
+        print()
+        print(NEXT_STEPS["claude-code"])
         command, cargs = server_command()
         hint = claude_cli_hint(command, cargs)
         if hint:
@@ -375,7 +396,10 @@ def cmd_install(args):
         print("effect (e.g. ask the assistant to read a file under the store and expect a denial).")
 
     print()
-    print("Restart the client, then verify with: evoctx doctor")
+    if args.client != "claude-code":
+        # claude-code already printed its own, more accurate step (reload the
+        # VS Code window — "restart the client" is wrong for an extension)
+        print("Restart the client, then verify with: evoctx doctor")
     print("Add the instructions snippet to the client's rules file — see docs/instructions-snippet.md")
 
 
@@ -712,6 +736,8 @@ def cmd_dump(args):
     print("=== PROJECTS ===")
     for name in db.list_projects():
         proj = db.get_project(name)
+        if proj is None:  # deleted between the listing and this fetch
+            continue
         print(f"  {name}")
         print(f"    {proj['overview'][:80]}")
         print(f"    updated: {proj['updated_at']}")
@@ -979,7 +1005,8 @@ def cmd_demo_seed(args):
 # ── argparse ──────────────────────────────────────────────────────────────────
 
 def cmd_help(args):
-    print(__doc__.strip())
+    # __doc__ is None under `python -OO`, which strips docstrings
+    print((__doc__ or "").strip())
 
 
 def cmd_version(args):
@@ -1013,8 +1040,14 @@ def main():
     # Windows consoles often default to cp1252, which can't print em-dashes
     # or box-drawing chars that legitimately appear in note content.
     if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        # reconfigure() belongs to TextIOWrapper, not to the TextIO protocol:
+        # under pytest capture, a redirect_stdout, or any replaced stream it
+        # may simply not be there. Re-encoding is a nicety — skip it rather
+        # than crash the whole CLI on a stream that can't do it.
+        for stream in (sys.stdout, sys.stderr):
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8", errors="replace")
 
     # bare `evoctx` prints the full command reference instead of an error
     if len(sys.argv) == 1:
@@ -1142,7 +1175,8 @@ def main():
                      help="claude-code only: also write SessionStart/Stop hooks into settings.json "
                           "(the one enforcement mechanism beyond convention — see README)")
     ins.add_argument("--dir", default=None,
-                     help="claude-code only: project/workspace root to write .mcp.json into "
+                     help="claude-code only: workspace FOLDER to write .mcp.json into — must be "
+                          "one of the open workspace's folders, not their parent "
                           "(default: current directory)")
 
     sub.add_parser("doctor", help="Verify store, grants, server command, client configs")

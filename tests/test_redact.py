@@ -67,6 +67,7 @@ def test_read_paths_redact(db, tmp_path):
     note_id = db.add_note("Client acme-corp", "token sk-live999 in body", project="p1")
 
     note = engine.get_note(grant, note_id)
+    assert note is not None
     assert note["title"] == "Client [CLIENT]"
     assert note["content"] == "token [KEY] in body"
 

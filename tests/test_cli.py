@@ -1,4 +1,7 @@
 """CLI smoke tests — invoke evoctx main() with argv against a temp store."""
+import os
+import time
+
 import pytest
 
 from conftest import run
@@ -54,6 +57,49 @@ def test_session_lifecycle(cli, monkeypatch, capsys):
 def test_end_session_without_open_exits_nonzero(cli, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         run(cli, monkeypatch, "end-session", "nothing to close")
+
+
+# ── grants ────────────────────────────────────────────────────────────────────
+
+def _replace_grants(tmp_path, body: str):
+    path = tmp_path / "grants.yaml"
+    path.write_text(body, encoding="utf-8")
+    # 1s mtime granularity on some filesystems would hide the change from the
+    # store's hot-reload check
+    stamp = time.time() + 2
+    os.utime(path, (stamp, stamp))
+
+
+def test_grant_activate_then_list(cli, monkeypatch, capsys):
+    run(cli, monkeypatch, "grant", "activate", "everything")
+    assert "expires" in capsys.readouterr().out
+
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    assert "* everything" in out
+    assert "Active: everything" in out
+
+
+def test_grant_activate_already_expired_explains_and_exits_nonzero(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """Writing active_grant.json is not the same as having a usable grant.
+
+    A grant whose expiry has already passed activates fine and then denies
+    every call. Before this was handled, the success line dereferenced the
+    None expiry and died with an AttributeError instead of saying so.
+    """
+    _replace_grants(
+        tmp_path,
+        'grants:\n  - name: stale\n    tools: [get_by_id]\n    expires: "+0m"\n',
+    )
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "activate", "stale")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "not usable" in out
+    assert "expired" in out
+    assert "grants.yaml" in out  # points at the file to fix
 
 
 def test_help_command(cli, monkeypatch, capsys):

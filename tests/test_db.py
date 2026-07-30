@@ -2,6 +2,8 @@ import sqlite3
 
 import pytest
 
+from conftest import found
+
 from evoctx.db import MIGRATIONS, Database, SchemaTooNew
 
 
@@ -94,7 +96,7 @@ def test_migration_001_upgrades_old_store(tmp_path):
     note_cols = [r[1] for r in db.conn.execute("PRAGMA table_info(notes)").fetchall()]
     assert "session_id" in note_cols
     # pre-existing data survives
-    assert db.get_note("n1")["title"] == "old note"
+    assert found(db.get_note("n1"))["title"] == "old note"
     assert db.conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
 
 

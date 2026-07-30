@@ -13,11 +13,14 @@ Scope rules:
   a write would be data loss.
 """
 import json
+from typing import Callable, TypeVar
 
 from .audit import AuditWriter
 from .db import Database
 from .grants import Grant, GrantStore
 from .redact import Redactor
+
+T = TypeVar("T")
 
 
 class PolicyDenied(Exception):
@@ -40,18 +43,20 @@ class PolicyEngine:
             self._redactor_grant = grant.name
         return self._redactor
 
-    def _out(self, grant: Grant, response):
-        """Everything leaving the store passes through here."""
+    def _out(self, grant: Grant, response: T) -> T:
+        """Everything leaving the store passes through here. Redaction is
+        structure-preserving, so the response type is unchanged."""
         return self.redactor(grant).redact(response)
 
     # ── gate ──────────────────────────────────────────────────────────────────
 
     def check(self, client: str, tool: str) -> Grant:
-        grant, _expires, reason = self.grants.active_grant()
-        if grant is None:
+        active, reason = self.grants.active_grant()
+        if active is None:
             raise PolicyDenied(
                 f"Denied: {reason}. Ask the user to run: evoctx grant activate everything"
             )
+        grant = active.grant
         if not grant.matches_client(client):
             raise PolicyDenied(
                 f"Denied: active grant '{grant.name}' covers client "
@@ -61,8 +66,8 @@ class PolicyEngine:
         if not grant.allows_tool(tool):
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' does not allow {tool}(). "
-                f"Allowed: {', '.join(grant.tools)}. Ask the user to activate "
-                f"a wider grant: evoctx grant activate <name>"
+                f"Allowed: {', '.join(grant.effective_tools())}. Ask the user to "
+                f"activate a wider grant: evoctx grant activate <name>"
             )
         return grant
 
@@ -92,13 +97,14 @@ class PolicyEngine:
     # (personal, single-user); this exists to bound worst case, not to be hit.
     _MAX_SCAN = 2000
 
-    def _fetch_filtered(self, fetch_page, is_visible, limit: int) -> list:
+    def _fetch_filtered(self, fetch_page: Callable[[int, int], list[dict]],
+                        is_visible: Callable[[dict], bool], limit: int) -> list[dict]:
         """Page through fetch_page(limit, offset) until `limit` visible items
         are collected or the store is exhausted — replaces a fixed-multiplier
         over-fetch, which silently under-fills results once exclusion rate is
         high enough (e.g. most notes tagged #personal under a grant that
         excludes it)."""
-        collected: list = []
+        collected: list[dict] = []
         offset = 0
         page_size = max(limit, 20)
         while len(collected) < limit and offset < self._MAX_SCAN:
@@ -154,9 +160,9 @@ class PolicyEngine:
             return self.check(client, tool)
         except PolicyDenied:
             if self.audit:
-                grant, _, _ = self.grants.active_grant()
+                active, _ = self.grants.active_grant()
                 self.audit.log(client, tool, "denied",
-                               grant_name=grant.name if grant else None)
+                               grant_name=active.grant.name if active else None)
             raise
 
     def _log(self, client: str, tool: str, action: str, grant: Grant,
@@ -188,6 +194,21 @@ class PolicyEngine:
         inbound = Redactor(grant.redactions)
         cleaned = [inbound.redact_text(t) if t else t for t in texts]
         return cleaned, inbound.hits
+
+    def _reread_session(self, session_id: str) -> dict:
+        """Re-read a session that was just written on this same connection.
+
+        Both callers declare `-> dict` and the MCP layer hands the result
+        straight to the client, so a None here has nowhere sensible to go.
+        Short of the row being deleted mid-call it cannot happen — raise
+        rather than let a None travel outward as if it were a session.
+        """
+        session = self.db.get_session(session_id)
+        if session is None:
+            raise RuntimeError(
+                f"session '{session_id}' vanished immediately after being written"
+            )
+        return session
 
     def t_list_projects(self, client: str) -> list[str]:
         grant = self._guard(client, "list_projects")
@@ -236,7 +257,7 @@ class PolicyEngine:
         self.check_write_project(grant, project)
         (intent,), hits = self._redact_inbound(grant, intent) if intent else ((intent,), 0)
         session_id = self.db.start_session(project=project, intent=intent, client=client)
-        result = self.db.get_session(session_id)
+        result = self._reread_session(session_id)
         self._log(client, "start_session", "write", grant,
                   {"project": project, "intent": intent}, [session_id], result,
                   inbound_hits=hits)
@@ -246,7 +267,7 @@ class PolicyEngine:
         grant = self._guard(client, "end_session")
         (summary,), hits = self._redact_inbound(grant, summary)
         self.db.end_session(session_id, summary)
-        result = self.db.get_session(session_id)
+        result = self._reread_session(session_id)
         self._log(client, "end_session", "write", grant, None, [session_id], result,
                   inbound_hits=hits)
         return self._out(grant, result)
@@ -262,9 +283,9 @@ class PolicyEngine:
     def t_list_grants(self, client: str) -> dict:
         result = self.describe(client)
         if self.audit:
-            grant, _, _ = self.grants.active_grant()
+            active, _ = self.grants.active_grant()
             self.audit.log(client, "list_grants", "read",
-                           grant_name=grant.name if grant else None,
+                           grant_name=active.grant.name if active else None,
                            result_count=1,
                            response_bytes=len(json.dumps(result, default=str)))
         return result
@@ -272,18 +293,19 @@ class PolicyEngine:
     # ── introspection ─────────────────────────────────────────────────────────
 
     def describe(self, client: str) -> dict:
-        grant, expires_at, reason = self.grants.active_grant()
-        if grant is None:
+        active, reason = self.grants.active_grant()
+        if active is None:
             return {"active_grant": None, "client": client, "reason": reason,
                     "hint": "evoctx grant activate <name>"}
+        grant = active.grant
         return {
             "active_grant": grant.name,
             "client": client,
             "client_glob": grant.client,
             "client_matches": grant.matches_client(client),
-            "allowed_tools": grant.tools,
+            "allowed_tools": grant.effective_tools(),
             "scope": {"projects": grant.projects, "exclude_tags": grant.exclude_tags},
             # count only — the patterns themselves describe what's being hidden
             "redactions_active": len(grant.redactions),
-            "expires_at": expires_at.isoformat(),
+            "expires_at": active.expires_at.isoformat(),
         }

@@ -12,16 +12,29 @@ instead — machine-independent.
 
 ## Claude Code
 
-**Project-scoped, not global.** The Claude Code VS Code extension reads MCP servers from a
-`.mcp.json` file at the root of the open workspace — it does **not** read
-`~/.claude/settings.json`'s `mcpServers` key, even though that key looks like it should be the
-global mechanism. (Confirmed by live testing: an entry there was never picked up by a fresh
-session; the same entry in `.mcp.json` connected immediately. A bare `~/.claude/.mcp.json` with
-no project scope was also tested and does not work — the file has to be at the actual workspace
-root.) `evoctx install claude-code` writes to the current directory by default; pass `--dir` to
-target a different project, and re-run it once per project/workspace you want evoctx in.
+**Project-scoped, not global — and scoped to workspace *folders*, not the workspace root.**
+The Claude Code VS Code extension discovers `.mcp.json` as the **union of the open workspace's
+folders**. In a single-folder window that's simply that folder. In a multi-root workspace it is
+every entry in the `.code-workspace` `folders` array — and a file in the directory that
+*contains* those folders is **not** read, even though that's where the `.code-workspace` file
+itself usually lives. To cover such a parent, add `{"path": "."}` to the `folders` array so it
+becomes a folder in its own right.
 
-`.mcp.json` in the workspace root:
+It does **not** read `~/.claude/settings.json`'s `mcpServers` key, even though that key looks
+like it should be the global mechanism. (Verified 2026-07-30: with a project `.mcp.json`
+emptied while `settings.json` still declared the server, the tools were absent from the
+session; the same block in a listed folder connected immediately. A bare `~/.claude/.mcp.json`
+was also tested and does not work. Note that **hooks** in `settings.json` *do* apply globally —
+it is only `mcpServers` that is ignored.)
+
+`evoctx install claude-code` writes to the current directory by default; pass `--dir` to target
+a different one, and re-run it once per workspace folder you want evoctx in. It warns if the
+target isn't listed by a nearby `.code-workspace`, and names the folders that would work.
+
+Writing into an already-open window does nothing until the window reloads, with no error
+shown. Reload, then confirm with `/mcp` in the Claude Code chat.
+
+`.mcp.json` in a workspace folder:
 
 ```json
 {

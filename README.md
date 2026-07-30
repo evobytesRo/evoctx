@@ -4,7 +4,7 @@ A local, personal context store for AI coding assistants, exposed over [MCP](htt
 
 Your assistant reads project context at session start, searches past decisions mid-work, and writes notes back before ending — so the next session (in any MCP-capable client) starts oriented instead of from zero. One SQLite store on your machine, shared across every workspace and every client that connects. No cloud component.
 
-> **Status: v0.1.2.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. Still early; expect the occasional breaking change ahead of 1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+> **Status: v0.1.3.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. Still early; expect the occasional breaking change ahead of 1.0. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ---
 
@@ -133,10 +133,12 @@ for `claude-desktop`, `cursor`, `windsurf`, `vscode`, `codex`. Manual per-client
 full list of per-client gotchas: [docs/clients.md](docs/clients.md). ChatGPT Desktop is not
 supported — no local stdio MCP.
 
-**Claude Code is project-scoped, not global.** The VS Code extension reads MCP servers from a
-`.mcp.json` file in the open workspace root — not from a global user file. `evoctx install
-claude-code` writes there (current directory by default, `--dir` to target another project) and
-needs to run once per project you want it in. If you also have the standalone `claude` CLI
+**Claude Code is project-scoped, not global.** The VS Code extension discovers `.mcp.json` as
+the union of the open workspace's **folders** — not from a global user file, and not from the
+directory that merely contains those folders (in a multi-root workspace, a file there is
+silently ignored; add `{"path": "."}` to the `.code-workspace` `folders` array to cover it).
+`evoctx install claude-code` writes to the current directory (`--dir` to target another), warns
+if that directory isn't a workspace folder, and needs to run once per folder you want it in. If you also have the standalone `claude` CLI
 installed, `evoctx install claude-code` detects it and prints a `claude mcp add --scope user`
 command for one-time global registration instead. Full explanation: [docs/clients.md](docs/clients.md).
 

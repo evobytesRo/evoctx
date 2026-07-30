@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evoctx"
-version = "0.1.2"
+version = "0.1.3"
 description = "Local personal context store for AI coding assistants, exposed over MCP — by Evo Bytes"
 readme = "README.md"
 license = "MIT"
@@ -39,3 +39,14 @@ evoctx = "evoctx.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/evoctx"]
+
+# Pinned so `pyright` reproduces the same result for everyone, rather than
+# depending on which interpreter and flags each person happens to pass.
+# pythonVersion is the floor from requires-python: type-checking against 3.10
+# is what stops 3.11+-only syntax reaching a supported runtime.
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.10"
+typeCheckingMode = "standard"

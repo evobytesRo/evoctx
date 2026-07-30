@@ -2,8 +2,9 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from conftest import found
 
-from evoctx.grants import DEFAULT_GRANTS_YAML, GrantError, GrantStore
+from evoctx.grants import ALL_TOOLS, DEFAULT_GRANTS_YAML, GrantError, GrantStore
 from evoctx.policy import PolicyDenied, PolicyEngine
 
 
@@ -52,10 +53,11 @@ grants:
 def test_first_run_creates_defaults_and_activates_everything(grants, tmp_path):
     assert (tmp_path / "grants.yaml").exists()
     assert (tmp_path / "active_grant.json").exists()
-    grant, expires_at, reason = grants.active_grant()
-    assert grant.name == "everything"
+    active, reason = grants.active_grant()
+    assert active is not None
+    assert active.grant.name == "everything"
     assert reason == ""
-    assert expires_at > datetime.now(timezone.utc)
+    assert active.expires_at > datetime.now(timezone.utc)
 
 
 def test_activate_unknown_grant_raises(grants):
@@ -65,8 +67,8 @@ def test_activate_unknown_grant_raises(grants):
 
 def test_deactivate_denies_everything(grants):
     grants.deactivate()
-    grant, _, reason = grants.active_grant()
-    assert grant is None
+    active, reason = grants.active_grant()
+    assert active is None
     assert "no grant is active" in reason
 
 
@@ -79,8 +81,8 @@ def test_hot_reload_on_file_change(grants, tmp_path):
 def test_expired_grant_is_no_grant(grants, tmp_path):
     write_grants(tmp_path, SCOPED.replace('expires: "+30d"', 'expires: "+0m"'))
     grants.activate("everything")
-    grant, _, reason = grants.active_grant()
-    assert grant is None
+    active, reason = grants.active_grant()
+    assert active is None
     assert "expired" in reason
 
 
@@ -88,8 +90,9 @@ def test_absolute_expiry_parses(grants, tmp_path):
     future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     write_grants(tmp_path, SCOPED.replace('"+30d"', f'"{future}"'))
     grants.activate("everything")
-    grant, expires_at, _ = grants.active_grant()
-    assert grant is not None
+    active, _ = grants.active_grant()
+    assert active is not None
+    assert active.expires_at > datetime.now(timezone.utc)
 
 
 def test_validation_rejects_missing_expires(tmp_path):
@@ -99,10 +102,55 @@ def test_validation_rejects_missing_expires(tmp_path):
         GrantStore(tmp_path).grants()
 
 
-def test_validation_rejects_unknown_tool(tmp_path):
-    write_grants(tmp_path, 'grants:\n  - name: bad\n    tools: [delete_everything]\n    expires: "+1d"\n')
-    with pytest.raises(GrantError, match="unknown tools"):
-        GrantStore(tmp_path).grants()
+def test_unknown_tool_is_tolerated_not_fatal(grants, tmp_path, capsys):
+    """A grants.yaml written by a NEWER release must not lock this build out.
+
+    _parse_grant runs inside grants() -> active_grant() -> PolicyEngine.check(),
+    so raising on an unrecognised name would fail EVERY tool call, not just the
+    unknown one. Instead: warn on stderr and DROP the name — this build cannot
+    serve that tool, so keeping it would make effective_tools() (and therefore
+    list_grants()) advertise something unservable. grants.yaml on disk is never
+    rewritten, so upgrading restores it.
+    """
+    write_grants(
+        tmp_path,
+        'grants:\n  - name: futuristic\n    tools: [search_context, code_symbol]\n    expires: "+1d"\n',
+    )
+    grant = grants.grants()["futuristic"]
+
+    assert grant.allows_tool("search_context")      # known tool still works
+    assert not grant.allows_tool("code_symbol")     # unknown one cannot be served
+    assert not grant.allows_tool("write_note")      # and nothing else leaked in
+    # pins the DROP specifically: an implementation that merely kept the name
+    # inert would satisfy the allows_tool asserts above, then advertise an
+    # unservable tool through list_grants()
+    assert grant.effective_tools() == ["search_context"]
+    assert "code_symbol" in capsys.readouterr().err
+
+
+def test_wildcard_suppresses_the_unknown_tool_warning(grants, tmp_path, capsys):
+    """A wildcard grant permits unknown names anyway, so "ignoring them" would be false."""
+    write_grants(
+        tmp_path,
+        'grants:\n  - name: open\n    tools: ["*", "code_symbol"]\n    expires: "+1d"\n',
+    )
+    grant = grants.grants()["open"]
+
+    assert grant.allows_tool("code_symbol")            # wildcard covers it
+    assert grant.effective_tools() == list(ALL_TOOLS)  # and it never surfaces
+    assert "code_symbol" not in capsys.readouterr().err
+
+
+def test_tools_wildcard_allows_everything_including_future_tools(grants, tmp_path):
+    write_grants(tmp_path, 'grants:\n  - name: open\n    tools: ["*"]\n    expires: "+1d"\n')
+    grant = grants.grants()["open"]
+
+    for tool in ALL_TOOLS:
+        assert grant.allows_tool(tool)
+    assert grant.allows_tool("a_tool_added_in_some_future_release")
+    # config keeps "*" so it never goes stale; responses expand it so
+    # list_grants() stays answerable
+    assert grant.effective_tools() == list(ALL_TOOLS)
 
 
 # ── policy engine ─────────────────────────────────────────────────────────────
@@ -163,7 +211,7 @@ def test_list_and_get_project_scoped(db, tmp_path):
     db.upsert_project("beta")
     assert engine.list_projects(grant) == ["alpha"]
     assert engine.get_project(grant, "beta") is None
-    assert engine.get_project(grant, "alpha")["name"] == "alpha"
+    assert found(engine.get_project(grant, "alpha"))["name"] == "alpha"
 
 
 def test_write_out_of_scope_fails_loudly(db, tmp_path):

@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.1.3 — unreleased — forward-compatible grants, and install guidance that matches reality
+
+**1. A future release could have locked users out of their own store.** `_parse_grant`
+raised `GrantError` on any tool name not in `ALL_TOOLS`. That parse runs inside
+`grants()` → `active_grant()` → `PolicyEngine.check()`, so the moment any newer version
+wrote a new tool name into `grants.yaml`, an older build reading that file would fail
+**every tool call** — not just the unrecognised one. The trigger was inevitable: adding a
+tool is a normal thing to do, and stores are shared across versions via rollback and
+cloud-synced home directories. 0.1.2 cannot be retro-fixed, so this only protects
+0.1.3-and-later from releases after it.
+
+Now: unknown names are reported on stderr and dropped. Dropping rather than keeping is
+deliberate — this build cannot serve those tools, so retaining them would make
+`effective_tools()`, and therefore `list_grants()`, advertise something unservable.
+`grants.yaml` on disk is never rewritten, so upgrading restores them automatically.
+
+**2. `tools: ["*"]` is now supported** — a grant that never goes stale as tools are added.
+`Grant.effective_tools()` expands it for responses so `list_grants()` and `evoctx grant
+list/show` stay concretely answerable instead of reporting `["*"]`.
+
+**Deliberately NOT the default.** 0.1.2 rejects `"*"` exactly as it rejects any unknown
+name, so shipping it as the default would create the very lockout this release removes,
+pointed backwards: a fresh 0.1.3 store reaching a 0.1.2 machine would fail every call
+there. The default stays enumerated; switch to `"*"` by hand once every machine sharing
+your store is on 0.1.3+.
+
+**3. `evoctx install claude-code` printed the wrong post-install guidance** — `NEXT_STEPS` had
+no `claude-code` key, so the most-used install path fell through to the generic
+"Restart the client" tail, which is wrong for a VS Code extension. Writing `.mcp.json` into an
+already-open VS Code window does nothing until the window reloads, and shows no error.
+
+**4. New: warning when `.mcp.json` is written where the client will never read it.**
+Claude Code discovers `.mcp.json` as the union of the **open workspace's folders**. A file
+at a repo-group root — a directory that merely *contains* the repos — is written
+successfully and then silently ignored. `evoctx install claude-code` now inspects nearby
+`.code-workspace` files and names the folders that would actually work.
+
+**5. `evoctx grant activate` crashed on an already-expired grant.** Activating a grant
+whose `expires` is already in the past (`"+0m"`, or an absolute timestamp that has passed)
+wrote `active_grant.json` successfully, then died with an `AttributeError` printing the
+expiry — because the store reports an expired grant as *no* grant. It now says the grant
+is not usable, names the reason and the file to fix, and exits non-zero, so a script that
+activates a grant can treat exit 0 as "calls will work".
+
+Underneath, `GrantStore.active_grant()` no longer returns three independent values
+`(grant, expires_at, reason)` — the grant and its expiry are one `ActiveGrant` object, so
+they can no longer be checked and dereferenced separately. That uncorrelated tuple was the
+whole cause: every code path that returned a grant also returned an expiry, but nothing
+said so, and four call sites dereferenced the expiry on the strength of the grant.
+
+**6. First pyright run on the repo — 26 errors, now 0**, with the configuration pinned in
+`pyproject.toml` so the result is reproducible rather than dependent on each person's flags.
+Most were type-level noise; two were real and are fixed above (the crash in 5, plus
+`evoctx dump` skipping instead of crashing on a project deleted mid-listing). Worth
+recording that 186 passing tests and four adversarial review rounds all ran green over a
+latent crash that a type checker found in three seconds.
+
+Also documented, because both cost real debugging time: an `mcpServers` block in
+`~/.claude/settings.json` is ignored by the VS Code extension (hooks in the same file
+*do* apply globally — only `mcpServers` is inert), and a parent directory's `.mcp.json`
+does not cover child repos.
+
 ## 0.1.2 — 2026-07-14 — critical fix: MCP server wouldn't start or connect on most setups
 
 Two independent issues, both severe enough to break the MCP connection outright.

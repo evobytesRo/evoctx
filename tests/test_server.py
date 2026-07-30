@@ -2,6 +2,8 @@
 so they are exercised directly against a temp store."""
 import asyncio
 import importlib
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -69,6 +71,54 @@ def test_list_grants_default_everything(server):
     assert desc["active_grant"] == "everything"
     assert desc["client"] == "pytest"
     assert "write_note" in desc["allowed_tools"]
+
+
+# ── client attribution ────────────────────────────────────────────────────────
+# Every other test in this file sets CONTEXT_CLIENT and so short-circuits on the
+# first line of _client_name — these are the only ones that reach the MCP
+# handshake fallback and its failure branches at all.
+
+def _fake(**kwargs) -> Any:
+    """Stand-in for the SDK objects — _client_name only walks .session,
+    .client_params, .clientInfo, .name. Typed Any so the stubs can be passed
+    where a real Context is declared."""
+    return SimpleNamespace(**kwargs)
+
+
+class _NoRequestContext:
+    """Mirrors FastMCP: Context.session raises when there is no active request."""
+
+    @property
+    def session(self):
+        raise ValueError("Context is not available outside of a request")
+
+
+def test_client_name_env_wins_over_handshake(server, monkeypatch):
+    monkeypatch.setenv("CONTEXT_CLIENT", "from-env")
+    ctx = _fake(session=_fake(client_params=_fake(clientInfo=_fake(name="cursor"))))
+    assert server._client_name(ctx) == "from-env"
+
+
+def test_client_name_falls_back_to_handshake(server, monkeypatch):
+    monkeypatch.delenv("CONTEXT_CLIENT")
+    ctx = _fake(session=_fake(client_params=_fake(clientInfo=_fake(name="cursor"))))
+    assert server._client_name(ctx) == "cursor"
+
+
+@pytest.mark.parametrize("ctx,why", [
+    (None, "no context at all — the CLI and the tests call it this way"),
+    (_NoRequestContext(), "outside a request context; the SDK raises ValueError"),
+    (_fake(), "a context with no .session — AttributeError"),
+    (_fake(session=_fake(client_params=None)), "handshake never completed"),
+    (_fake(session=_fake(client_params=_fake(clientInfo=None))), "client sent no name"),
+])
+def test_client_name_is_unknown_when_nobody_identifies_themselves(
+    server, monkeypatch, ctx, why
+):
+    """Attribution is best-effort: every one of these must degrade to
+    "unknown", never raise into the tool call that asked."""
+    monkeypatch.delenv("CONTEXT_CLIENT")
+    assert server._client_name(ctx) == "unknown", why
 
 
 def test_denied_tool_raises_actionable_error(server):

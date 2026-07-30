@@ -8,6 +8,7 @@ Config formats drift between client versions, so every write:
 """
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -131,6 +132,18 @@ def clients(home: Path) -> dict[str, Client]:
 # are evoctx bugs; they're facts about how each client discovers/activates
 # a newly-written MCP config, undocumented by evoctx until it bit someone.
 NEXT_STEPS: dict[str, str] = {
+    "claude-code": (
+        "Reload the VS Code window (Command Palette -> 'Developer: Reload Window'). Writing "
+        ".mcp.json into a window that is already open does nothing until it reloads, and no "
+        "error is shown. Then confirm with /mcp in the Claude Code chat.\n"
+        "  IMPORTANT: .mcp.json is discovered as the union of the OPEN WORKSPACE'S FOLDERS. A "
+        "file in a parent directory does NOT cover child repos unless that parent is itself a "
+        "folder in the .code-workspace. Verified 2026-07-30.\n"
+        "  Note: an mcpServers block in ~/.claude/settings.json is ignored by the VS Code "
+        "extension — only project-scoped .mcp.json registers a server. (Hooks in settings.json "
+        "DO apply globally; it is only mcpServers that is inert.)\n"
+        "  Then verify the store itself with: evoctx doctor"
+    ),
     "claude-desktop": (
         "Restart means fully quit, not just close the window — on Windows, quit from the "
         "system tray icon or the old process (and old config) keeps running, with no error. "
@@ -181,10 +194,15 @@ def claude_cli_hint(command: str, args: list[str]) -> str | None:
 
 
 def install_claude_code(project_dir: Path, uvx: bool = False) -> tuple[Path, dict]:
-    """Project-scoped .mcp.json at the given directory (typically the open
-    workspace root) — the mechanism actually read by the Claude Code VS Code
-    extension. Must be re-run per project/workspace; see claude_cli_hint()
-    for the one-time global alternative when the standalone CLI is present."""
+    """Project-scoped .mcp.json at the given directory — the mechanism actually
+    read by the Claude Code VS Code extension.
+
+    The directory must be one of the OPEN WORKSPACE'S FOLDERS, not merely the
+    directory containing them: discovery is the union of those folders, and a
+    file in a parent is silently ignored (verified 2026-07-30). Callers should
+    surface workspace_folder_warning() alongside the write. Must be re-run per
+    workspace folder; see claude_cli_hint() for the one-time global alternative
+    when the standalone CLI is present."""
     command, args = server_command()
     if uvx:
         command, args = "uvx", ["evoctx", "serve"]
@@ -200,6 +218,187 @@ def install_claude_code(project_dir: Path, uvx: bool = False) -> tuple[Path, dic
     config.setdefault("mcpServers", {})[SERVER_NAME] = entry
     path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     return path, entry
+
+
+_PATH_VALUE_RE = re.compile(r'"path"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_FOLDERS_KEY_RE = re.compile(r'"folders"\s*:\s*\[')
+
+# How far up to look for a .code-workspace before giving up. Bounded so a
+# stray workspace file elsewhere on the drive can't produce a bogus warning.
+_WORKSPACE_SEARCH_DEPTH = 3
+
+
+def _strip_jsonc_comments(text: str) -> str:
+    """Blank out // and /* */ comments that fall outside string literals.
+
+    Comments are replaced with spaces rather than removed so offsets and line
+    structure survive, and so stripping can never fuse two adjacent tokens.
+
+    Without this the scanner below reads comment text as code, which is wrong
+    in both directions and was reproduced on all three counts: a `]` inside a
+    block comment closed the folders array early; a commented-out
+    `"folders": [...]` line stole the key search from the real one; and a
+    commented-out `{"path": "legacy"}` entry was reported as a live folder.
+    A format whose whole selling point is that comments are legal has to have
+    them handled before anything else looks at the text.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    in_string = escaped = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_string = False
+            i += 1
+        elif c == '"':
+            in_string = True
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] not in "\r\n":
+                out[i] = " "
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                if text[i] not in "\r\n":
+                    out[i] = " "
+                i += 1
+            for k in range(i, min(i + 2, n)):
+                out[k] = " "
+            i += 2
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _folders_array(text: str) -> str | None:
+    """The raw text of a .code-workspace "folders" array, brackets excluded.
+
+    Scanned by hand rather than json.loads because .code-workspace is JSONC:
+    comments and trailing commas are legal, appear in real files, and make
+    json.loads raise on workspaces VS Code opens happily.
+
+    Bracket depth is tracked outside string literals only, so a folder path
+    containing [ or ] cannot unbalance the scan.
+    """
+    m = _FOLDERS_KEY_RE.search(text)
+    if not m:
+        return None
+    depth, i, in_string, escaped = 1, m.end(), False, False
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == '"':
+                in_string = False
+        elif c == '"':
+            in_string = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return text[m.end():i]
+        i += 1
+    return None  # unbalanced — treat as unreadable rather than guess
+
+
+def _workspace_folders(ws: Path) -> list[str]:
+    """The "path" values declared in a .code-workspace "folders" array.
+
+    Deliberately scoped to that array. .code-workspace files routinely carry
+    "path" keys elsewhere — terminal profiles, task options, launch configs —
+    and a whole-file regex is wrong in both directions (both reproduced
+    2026-07-30): it advertised "C:\\Program Files\\Git\\bin\\bash.exe" as a
+    folder to install into, and a stray '"path": "."' inside a tasks block
+    suppressed a warning that should have fired.
+    """
+    try:
+        # utf-8-sig so a BOM doesn't end up glued to the first token
+        text = ws.read_text(encoding="utf-8-sig")
+    except OSError:
+        return []
+    block = _folders_array(_strip_jsonc_comments(text))
+    if block is None:
+        return []
+    # JSON escapes survive into the captured value ("C:\\repos" stays doubled).
+    # Path() collapses repeated separators so resolve() still lands correctly,
+    # but unescape rather than rely on that accident.
+    return [p.replace("\\\\", "\\") for p in _PATH_VALUE_RE.findall(block)]
+
+
+def workspace_folder_warning(project_dir: Path) -> str | None:
+    """Warn when .mcp.json is being written where the client will never read it.
+
+    Claude Code discovers .mcp.json as the union of the OPEN WORKSPACE'S
+    folders. A file outside those folders — at a repo-group root, say, or in a
+    directory that merely contains them — is written successfully and then
+    silently ignored, with no error anywhere.
+
+    Verified 2026-07-30: a .mcp.json at a multi-root workspace's parent never
+    appeared in /mcp, while the same block inside a listed folder connected
+    immediately.
+
+    Returns None when there is nothing to warn about — no .code-workspace
+    found (a single-folder window reads that folder's own file), or the target
+    is listed by ANY workspace file discovered.
+
+    Every candidate file is examined, not just the first: a directory can hold
+    several .code-workspace files, and stopping at the alphabetically-first one
+    warned about setups the user's actual workspace handles fine (reproduced
+    2026-07-30). Silence wins — one false alarm on the feature whose whole job
+    is to be trusted teaches people to ignore it.
+
+    The wording is conditional on purpose. A workspace file existing on disk
+    does not prove that workspace is the one currently OPEN; the same folder
+    may be open as its own single-folder window, where its .mcp.json is read
+    normally.
+    """
+    project_dir = project_dir.resolve()
+    bases = [project_dir, *list(project_dir.parents)[:_WORKSPACE_SEARCH_DEPTH]]
+
+    candidates: list[tuple[Path, list[str]]] = []
+    for base in bases:
+        for ws in sorted(base.glob("*.code-workspace")):
+            rel_paths = _workspace_folders(ws)
+            if not rel_paths:
+                continue
+            folders = {(ws.parent / p).resolve() for p in rel_paths}
+            if project_dir in folders:
+                return None          # some workspace covers it — say nothing
+            candidates.append((ws, rel_paths))
+
+    if not candidates:
+        return None
+
+    lines = [
+        f"NOTE: {project_dir}",
+        "  is not listed as a folder in any .code-workspace found nearby:",
+        "",
+    ]
+    for ws, rel_paths in candidates:
+        lines.append(f"    {ws}")
+        lines.extend(f"        {ws.parent / p}" for p in rel_paths)
+    lines += [
+        "",
+        "  If you open one of those workspaces, Claude Code will NOT read the .mcp.json",
+        "  written here — it fails silently, the server simply never appears. Write it",
+        "  into one of the folders listed above instead, or add {\"path\": \".\"} to that",
+        "  workspace's \"folders\" array.",
+        "",
+        "  If you open this directory as its own single-folder window, ignore this —",
+        "  the file will be read normally.",
+    ]
+    return "\n".join(lines)
 
 
 def entry_for(client: Client, command: str, args: list[str], uvx: bool) -> dict:
@@ -378,9 +577,10 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
     # grants
     try:
         gs = GrantStore(store_dir)
-        grant, expires_at, reason = gs.active_grant()
-        if grant:
-            checks.append(("active grant", True, f"'{grant.name}' expires {expires_at.isoformat()}"))
+        active, reason = gs.active_grant()
+        if active:
+            checks.append(("active grant", True,
+                           f"'{active.grant.name}' expires {active.expires_at.isoformat()}"))
         else:
             checks.append(("active grant", False, f"{reason} — run: evoctx grant activate everything"))
     except GrantError as e:

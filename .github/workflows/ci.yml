@@ -26,3 +26,24 @@ jobs:
         run: |
           pip install build
           python -m build
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # the floor from requires-python, matching [tool.pyright] pythonVersion
+          python-version: "3.10"
+      # [tool.pyright] pins venv = ".venv", so CI has to have one — installing
+      # with bare `pip install -e .` would leave pyright resolving imports
+      # against a different interpreter than a local run does, which is exactly
+      # the drift the pin exists to prevent.
+      - name: Install into .venv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e .[dev]
+      # version pinned: pyright ships new checks in patch releases, and an
+      # unpinned one turns "main is green" into a function of the release date
+      - name: Pyright
+        run: npx --yes pyright@1.1.411

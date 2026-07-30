@@ -4,6 +4,8 @@ boundary visible: a note written by an AI client is labeled as such,
 not indistinguishable from a human-authored one."""
 import sqlite3
 
+from conftest import found
+
 from evoctx.db import MIGRATIONS, Database
 
 
@@ -56,7 +58,7 @@ def test_migration_003_adds_column_to_old_store(tmp_path):
     cols = [r[1] for r in db.conn.execute("PRAGMA table_info(notes)").fetchall()]
     assert "author_client" in cols
     # pre-existing notes get NULL, not a fabricated attribution
-    assert db.get_note("n1")["author_client"] is None
+    assert found(db.get_note("n1"))["author_client"] is None
     assert db.conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
 
 

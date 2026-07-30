@@ -16,6 +16,9 @@ written to disk or logs. (Client-side re-hydration of AI output is a
 post-beta feature; v1 masking is one-way.)
 """
 import re
+from typing import Any, TypeVar, cast
+
+T = TypeVar("T")
 
 
 class Redactor:
@@ -53,14 +56,26 @@ class Redactor:
             text = pattern.sub(sub, text)
         return text
 
-    def redact(self, obj):
-        """Walk dicts/lists and redact every string value. Keys untouched."""
+    def redact(self, obj: T) -> T:
+        """Walk dicts/lists and redact every string value. Keys untouched.
+
+        T -> T holds for the trees this is actually given — str, list and
+        dict, built from sqlite rows. It is *not* a general promise: a dict
+        subclass comes back a plain dict, and tuples and sets pass through
+        with their strings unredacted. Everything leaving the store goes
+        through PolicyEngine._out(), which only ever passes those three; a
+        new caller with a different shape needs this widened first, not the
+        annotation trusted. The cast is where that limit is accepted.
+        """
         if not self._rules:
             return obj
+        return cast(T, self._walk(obj))
+
+    def _walk(self, obj: Any) -> Any:
         if isinstance(obj, str):
             return self.redact_text(obj)
         if isinstance(obj, list):
-            return [self.redact(item) for item in obj]
+            return [self._walk(item) for item in obj]
         if isinstance(obj, dict):
-            return {k: self.redact(v) for k, v in obj.items()}
+            return {k: self._walk(v) for k, v in obj.items()}
         return obj

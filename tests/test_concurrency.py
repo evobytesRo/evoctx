@@ -6,6 +6,8 @@ import threading
 
 from evoctx.db import Database
 
+from conftest import found
+
 
 def test_wal_mode_active(db):
     assert db.conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -17,8 +19,8 @@ def test_two_handles_same_file_both_write(tmp_path):
     id_a = a.add_note("from A", "x")
     id_b = b.add_note("from B", "y")
     # each handle sees the other's committed write
-    assert a.get_note(id_b)["title"] == "from B"
-    assert b.get_note(id_a)["title"] == "from A"
+    assert found(a.get_note(id_b))["title"] == "from B"
+    assert found(b.get_note(id_a))["title"] == "from A"
 
 
 def test_concurrent_writes_from_threads_dont_lock(tmp_path):

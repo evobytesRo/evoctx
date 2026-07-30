@@ -25,9 +25,11 @@ blobs, no proprietary format, no encryption key you'd need this project's code t
 
 - **Bug reports / feature requests:** open an issue. Include `evoctx doctor` output — it covers
   version, schema version, store size, and client-config detection in one command.
-- **Pull requests:** run `pytest tests/ -v` before opening one; CI runs the same matrix
-  (ubuntu/macOS/Windows × Python 3.10/3.12). New MCP tools need a CLI mirror in the same PR —
-  see the parity table in [README.md](README.md#cli-evoctx).
+- **Pull requests:** run `pytest tests/ -v` and `npx --yes pyright@1.1.411` before opening one;
+  CI gates on both — the tests across ubuntu/macOS/Windows × Python 3.10/3.12, pyright once,
+  at that pinned version (settings live in `[tool.pyright]` in `pyproject.toml`; the baseline is
+  zero errors). New MCP tools need a CLI mirror in the same PR — see the parity table in
+  [README.md](README.md#cli-evoctx).
 - **Security concerns:** see [SECURITY.md](SECURITY.md) first — it may already be a documented,
   known limitation rather than something to report as new.
 
