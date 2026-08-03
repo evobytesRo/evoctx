@@ -19,6 +19,7 @@ from .audit import AuditWriter
 from .db import Database
 from .grants import Grant, GrantStore
 from .redact import Redactor
+from .resolve import NONE, resolve_workspace
 
 T = TypeVar("T")
 
@@ -80,6 +81,41 @@ class PolicyEngine:
 
     def list_projects(self, grant: Grant) -> list[str]:
         return self._out(grant, [p for p in self.db.list_projects() if grant.allows_project(p)])
+
+    def workspace(self, grant: Grant, cwd=None) -> dict:
+        """The resolved workspace, filtered to what this grant may know about.
+
+        Resolution runs against the whole store — a directory belongs to the
+        project it belongs to, and narrowing the *input* would make a scoped
+        grant resolve to some wider ancestor's project, which is worse than
+        resolving to nothing. The narrowing happens here, on the way out.
+
+        An out-of-scope resolution is reported as unresolved rather than
+        refused by name, following `get_project`'s rule: out of scope reads the
+        same as nonexistent, so a narrow grant cannot enumerate the store by
+        walking directories. The hint still says what happened, because a
+        silently empty answer would send the caller looking for a bug.
+
+        `cwd` defaults to this process, which is what the server means. It is
+        a parameter so the scoping rules below can be tested against a made-up
+        directory instead of by chdir'ing the test runner.
+        """
+        block = resolve_workspace(self.db, cwd=cwd)
+        block["nearby"] = [
+            n for n in block["nearby"] if grant.allows_project(n["project"])
+        ]
+        project = block.get("project")
+        if project is not None and not grant.allows_project(project):
+            block["project"] = None
+            block["confidence"] = NONE
+            block.pop("matched_root", None)
+            block.pop("note", None)
+            block["hint"] = (
+                f"This directory resolves to a project outside grant "
+                f"'{grant.name}' (scope: {grant.projects}), so it is reported "
+                f"as unresolved. Ask the user to activate a wider grant."
+            )
+        return block
 
     def get_project(self, grant: Grant, name: str) -> dict | None:
         if not grant.allows_project(name):
@@ -240,10 +276,26 @@ class PolicyEngine:
             )
         return session
 
-    def t_list_projects(self, client: str) -> list[str]:
+    def t_list_projects(self, client: str) -> dict:
+        """Projects plus the resolved workspace, as one envelope.
+
+        The shape change from `list[str]` is deliberate and is the cheaper of
+        the two options: adding a tool would deny it to every existing user,
+        whose grant enumerates the tools that existed when it was written,
+        whereas a response shape is not something grants gate. The cost is
+        that the old shape is baked into installed instruction snippets — see
+        the tool docstring for what a caller reading a stale one sees.
+
+        The audit line records the project names and sizes the *envelope*.
+        `result_count` collapses to 1 because the result is now one dict, and
+        that is fine — the names are in `record_ids`, so the count is still
+        recoverable, whereas response bytes measured on the inner list would
+        simply be wrong about what this client was handed.
+        """
         grant = self._guard(client, "list_projects")
-        result = self.list_projects(grant)
-        self._log(client, "list_projects", "read", grant, None, result, result)
+        projects = self.list_projects(grant)
+        result = {"projects": projects, "workspace": self.workspace(grant)}
+        self._log(client, "list_projects", "read", grant, None, projects, result)
         return result
 
     def t_get_project(self, client: str, name: str) -> dict | None:

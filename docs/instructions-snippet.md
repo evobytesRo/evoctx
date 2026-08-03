@@ -78,7 +78,13 @@ the ritual drift between clients.
 Persistent cross-session memory.
 
 MUST DO, every session:
-- **Start:** call `list_projects()` first — never guess a project name. Then
+- **Start:** call `list_projects()` first. It returns `projects` (the names) and a
+  `workspace` block naming the project this directory belongs to — **use that name, never
+  guess one.** If `workspace.project` is null, nothing matched: show the user
+  `workspace.hint` instead of inventing a name, because a note filed under a name that does
+  not exist is stranded and invisible under the real project. If `workspace.confidence` is
+  `default`, the name is the launching folder's — pass a name explicitly when the work
+  targets one of the repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and
   interrupted sessions stay visible. Then `recent_sessions(project)` — open entries were
   likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.

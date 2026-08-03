@@ -61,7 +61,12 @@ def test_end_session_without_start_returns_error(server):
 
 def test_project_roundtrip(server):
     server.db.upsert_project("p1", overview="ov")
-    assert server.list_projects(ctx=None) == ["p1"]
+    listed = server.list_projects(ctx=None)
+    assert listed["projects"] == ["p1"]
+    # the envelope always carries a workspace block, resolved or not — an
+    # assistant that has to check whether the key exists is one that will
+    # eventually skip it and guess a name instead
+    assert "workspace" in listed
     assert server.get_project("p1", ctx=None)["overview"] == "ov"
     assert server.get_project("missing", ctx=None) is None
 

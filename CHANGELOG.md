@@ -55,8 +55,76 @@ called `global`, so the sentinel would have collided with a shipped feature.
 **5. Deleting a project deletes its roots.** Left behind, they would resolve a directory to
 a project that no longer exists and make the directory un-registerable.
 
-**6. Response shapes changed — check this if you script against evoctx.** All additive, but
-worth knowing before you upgrade:
+**6. `list_projects()` now says which project the workspace is.** This is what the roots
+above were for. It returns `projects` (the names, as before) plus a `workspace` block
+resolved in three rungs: `CONTEXT_PROJECT` if a human set it, otherwise the working
+directory matched against registered roots, otherwise **nothing**.
+
+Rung 3 refuses on purpose. No name-similarity matching, no "closest project", and
+specifically no picking the only project when the store has exactly one — that is precisely
+when a wrong guess looks right. An unregistered workspace gets back the directory, a
+suggested name and the command to register it, never an answer resolution did not find.
+
+A cwd match is reported as `confidence: "default"`, not as the answer. One stdio server has
+one working directory and a workspace can span many folders, so treating the launching
+folder as the truth would file a sibling repo's work under its neighbour — the same
+confident-wrong failure rung 3 exists to prevent, one rung up. The block carries `nearby`:
+the other registered projects in this workspace, found as siblings of the directory or as
+folders declared in a `.code-workspace` near it.
+
+`CONTEXT_PROJECT` naming a project that does not exist **refuses and says so** rather than
+falling through to the directory. It was set deliberately by a human, so quietly resolving
+somewhere else would hide the typo indefinitely.
+
+**Shape change:** `list_projects()` returned a bare list of names and now returns a dict.
+The names are under `projects`. A client whose rules file still carries the 0.1.3
+instructions snippet keeps working — the tool is unchanged in name and arguments, and an
+assistant reading the response sees the names one key deeper — but reinstall the snippet
+(`evoctx install <client>` prints it) to get the part that tells it not to guess.
+
+Changing an existing tool's response was the deliberate choice over adding a new tool: a
+grant enumerates the tools that existed when it was written, so **adding** one denies it to
+every existing user until they upgrade their grant. Response shapes are not gated.
+
+**7. The Stop hook no longer nags about another workspace's session.** It called
+`latest_open_session()` unfiltered, i.e. machine-wide, so closing a window in one repo
+asked about a session belonging to a different one. It now asks about the workspace: the
+project the directory resolves to **plus the other registered repos in the same workspace**,
+because a workspace is routinely several sibling repos and the assistant is told to name
+whichever one the work targets.
+
+Note what that redefines: **sibling directories are one workspace**, so repos sharing a
+parent still nag across each other by design. What stops is a window in one project tree
+asking about work in an unrelated one. The message now names the session's project, because
+it may not be this folder's.
+
+Sessions started with **no** project still surface everywhere — that is the one most likely
+to be forgotten. And a directory that resolves to nothing falls back to every open session,
+exactly as before: the reminder narrows only where resolution actually succeeded, and is
+never turned off by a resolution that did not happen.
+
+**8. A project root must be a directory that exists.** `evoctx init` already checked;
+`add_project_root` — documented as the function every front-end goes through — did not, so
+the registration path took typos and bound them. A bound typo is not inert: resolution
+answers with it. Roots recorded for *another* machine are still taken on trust, since this
+process cannot see that filesystem and refusing them would break restoring a synced store.
+
+**9. `evoctx doctor` gains two more checks:** which project this directory resolves to, and
+which folders of the open workspace declare evoctx in a `.mcp.json`. Several folders
+declaring it is not an error and evoctx does not arbitrate it — which one the client honours
+is the client's behaviour — but believing one config is live while another is is a real way
+to lose an afternoon, so they are listed.
+
+The workspace check **fails** (and `doctor` exits non-zero) in two cases: when other
+directories on this machine are bound and this one is not — the genuinely inconsistent case
+— and whenever `CONTEXT_PROJECT` names a project that does not exist, regardless of
+bindings, since a human typed that name and every tool call in the store is unresolvable
+until it is fixed. A store with no directories bound at all otherwise passes, since that is
+every store the moment it upgrades, and stays true for anyone whose projects are topics
+rather than code.
+
+**10. Response shapes changed — check this if you script against evoctx.** Additive except
+for `list_projects()` above, but worth knowing before you upgrade:
 
 - `evoctx export --format json` gains a top-level `project_roots` key. **An export now
   describes your machine's directory layout** — absolute paths, tagged with the machine
@@ -81,9 +149,10 @@ worth knowing before you upgrade:
   every project appears in every project's scoped read, so claiming that scope now requires
   holding it (`projects: ["*"]`). Writing a note with no project at all is unaffected. If a
   client hits this, the denial names the fix: activate a wider grant.
-- `evoctx doctor` gains three checks: registered directories that are no longer present,
-  notes marked both global and project-scoped, and the pre-upgrade backups described below
-  (so you know they exist and that they are yours to delete).
+- `evoctx doctor` gains five checks: registered directories that are no longer present,
+  notes marked both global and project-scoped, the pre-upgrade backups described below (so
+  you know they exist and that they are yours to delete), the resolved workspace, and the
+  workspace folders declaring the server.
 - **A grant whose `scope.projects` is present but empty is now rejected**, in either
   spelling — `projects: []` or a bare `projects:`. It previously parsed as *every* project,
   which is a scope failing open, and it now also decides who may write a global note. If you

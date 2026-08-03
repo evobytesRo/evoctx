@@ -214,6 +214,59 @@ def test_list_and_get_project_scoped(db, tmp_path):
     assert found(engine.get_project(grant, "alpha"))["name"] == "alpha"
 
 
+def test_workspace_resolving_out_of_scope_reads_as_unresolved(db, tmp_path):
+    """Same rule as `get_project`: out of scope is indistinguishable from
+    nonexistent, or a narrow grant could enumerate the store by walking
+    directories. The hint still says what happened — a silently empty answer
+    sends the caller looking for a bug."""
+    engine = scoped_engine(db, tmp_path)
+    grant = engine.check("test-client", "list_projects")
+    beta_dir = tmp_path / "beta"
+    beta_dir.mkdir()
+    db.register_project("beta", beta_dir)
+
+    block = engine.workspace(grant, cwd=beta_dir)
+    assert block["project"] is None
+    assert block["confidence"] == "none"
+    assert "beta" not in block["hint"]
+    assert "matched_root" not in block
+
+
+def test_workspace_resolving_in_scope_is_returned(db, tmp_path):
+    engine = scoped_engine(db, tmp_path)
+    grant = engine.check("test-client", "list_projects")
+    alpha_dir = tmp_path / "alpha"
+    alpha_dir.mkdir()
+    db.register_project("alpha", alpha_dir)
+
+    assert engine.workspace(grant, cwd=alpha_dir)["project"] == "alpha"
+
+
+def test_nearby_is_filtered_to_the_grants_scope(db, tmp_path):
+    """`nearby` is a list of project names, so it leaks the same existence
+    `list_projects` is already careful about."""
+    engine = scoped_engine(db, tmp_path)
+    grant = engine.check("test-client", "list_projects")
+    alpha_dir, beta_dir = tmp_path / "alpha", tmp_path / "beta"
+    alpha_dir.mkdir(); beta_dir.mkdir()
+    db.register_project("alpha", alpha_dir)
+    db.register_project("beta", beta_dir)
+
+    block = engine.workspace(grant, cwd=alpha_dir)
+    assert block["project"] == "alpha"
+    assert [n["project"] for n in block["nearby"]] == []
+
+
+def test_t_list_projects_returns_projects_and_a_workspace(db, tmp_path):
+    engine = scoped_engine(db, tmp_path)
+    db.upsert_project("alpha")
+    db.upsert_project("beta")
+
+    result = engine.t_list_projects("test-client")
+    assert result["projects"] == ["alpha"]
+    assert result["workspace"]["project"] is None  # nothing bound in this test
+
+
 def test_write_out_of_scope_fails_loudly(db, tmp_path):
     engine = scoped_engine(db, tmp_path)
     grant = engine.grants.grants()["alpha-read"]

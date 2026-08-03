@@ -21,6 +21,19 @@ def found(value: T | None) -> T:
     return value
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_context_project(monkeypatch):
+    """Rung 1 of the resolution ladder reads CONTEXT_PROJECT from the real
+    environment.
+
+    Left alone, a developer who has it set in their shell — which is exactly
+    what the feature tells people to do — runs a different suite from CI's,
+    and the difference shows up as resolution tests failing for reasons that
+    are nowhere in the diff.
+    """
+    monkeypatch.delenv("CONTEXT_PROJECT", raising=False)
+
+
 @pytest.fixture
 def db(tmp_path):
     return Database(tmp_path)

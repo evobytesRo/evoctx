@@ -16,6 +16,7 @@ from evoctx.db import (
     Database,
     DuplicateRootBinding,
     NoSuchProject,
+    RootNotADirectory,
     RootOwnedByAnotherProject,
     normalize_root,
     this_machine,
@@ -165,6 +166,48 @@ def test_a_root_cannot_be_added_for_a_project_that_does_not_exist(db, tmp_path):
     name `get_project()` denies."""
     with pytest.raises(NoSuchProject, match="no project named"):
         db.add_project_root("never-created", tmp_path)
+    assert db.project_roots() == []
+
+
+def test_a_root_that_is_not_a_directory_is_refused(db, tmp_path):
+    """`cmd_init` checked this; the db layer, documented as the function every
+    front-end goes through, did not — so the registration tool would have
+    bound typos. A bound typo is not inert: resolution answers with it."""
+    db.upsert_project("p1")
+    with pytest.raises(RootNotADirectory, match="not a directory"):
+        db.add_project_root("p1", tmp_path / "no-such-dir")
+    assert db.project_roots() == []
+
+
+def test_a_root_that_is_a_file_is_refused(db, tmp_path):
+    """`exists()` would have passed this. A project's code lives in a
+    directory, and prefix resolution against a file matches nothing."""
+    db.upsert_project("p1")
+    f = tmp_path / "pyproject.toml"
+    f.write_text("x", encoding="utf-8")
+    with pytest.raises(RootNotADirectory):
+        db.add_project_root("p1", f)
+    assert db.project_roots() == []
+
+
+def test_another_machines_root_is_taken_on_trust(db, tmp_path):
+    """The guard must not fire for a row describing a filesystem this process
+    cannot see. A restore replaying a synced store's rows would otherwise be
+    refused wholesale, for the crime of not running on that machine."""
+    db.upsert_project("p1")
+    db.add_project_root("p1", tmp_path / "only-on-the-laptop", machine="other-box")
+
+    assert [r["machine"] for r in db.project_roots("p1")] == ["other-box"]
+
+
+def test_register_project_refuses_a_missing_directory_and_creates_nothing(db, tmp_path):
+    """The refusal must land before the project row, not after — otherwise a
+    typo'd path leaves a project created and unbound, which is exactly the
+    half-written state `register_project` is one transaction to prevent."""
+    with pytest.raises(RootNotADirectory):
+        db.register_project("newproj", tmp_path / "typo", overview="ov")
+
+    assert db.get_project("newproj") is None
     assert db.project_roots() == []
 
 

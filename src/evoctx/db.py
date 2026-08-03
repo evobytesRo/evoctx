@@ -4,6 +4,7 @@ import platform
 import sqlite3
 import sys
 import uuid
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +78,35 @@ def this_machine() -> str:
     prevent.
     """
     return platform.node() or "unknown-host"
+
+
+def require_local_directory(root: str, machine: str) -> None:
+    """Refuse a root that is not a directory — but only on the machine it
+    describes.
+
+    A binding is a claim that a project's code lives *there*. Bound to a typo
+    or a deleted folder the claim is still authoritative: the resolution
+    ladder would answer with it, and the UNIQUE index makes it stick until
+    someone unbinds it by hand. Cheaper to refuse at the bind.
+
+    Machine-scoped, and that is the whole subtlety. A store synced between
+    machines carries rows describing filesystems this process cannot see, and
+    `add_project_root(..., machine="other-box")` exists precisely so a restore
+    can replay them. Checking those would refuse every legitimate import for
+    the crime of not running on that machine. So: check this machine's rows,
+    take another machine's on trust — the only correct answer available here.
+
+    Not a race-free guarantee and not meant as one; the directory can go away
+    a millisecond later. `doctor`'s missing-roots check covers the after, this
+    covers the typo.
+    """
+    if machine != this_machine():
+        return
+    if not Path(root).is_dir():
+        raise RootNotADirectory(
+            f"not a directory: {root} — a project root must be a directory "
+            f"that exists on this machine ({this_machine()})"
+        )
 
 
 def _migration_001_sessions_reshape(conn: sqlite3.Connection) -> None:
@@ -389,6 +419,10 @@ class ConflictingNoteScope(ValueError):
 
 class NoSuchProject(ValueError):
     """A root was offered for a project that does not exist."""
+
+
+class RootNotADirectory(ValueError):
+    """A root was offered for a path that is not a directory on this machine."""
 
 
 MAX_NOTE_BYTES = 256 * 1024  # 256KB — generous for real notes, not for accidental blobs
@@ -813,6 +847,18 @@ class Database:
     def list_projects(self) -> list[str]:
         return [r[0] for r in self.conn.execute("SELECT name FROM projects ORDER BY name").fetchall()]
 
+    def project_exists(self, name: str) -> bool:
+        """Does this name exist, without paying for the record?
+
+        `get_project()` would answer it too, at the cost of the two
+        recent-notes queries and a roots lookup. Resolution asks this once per
+        call and the coming refusal path asks it on every write, so the cheap
+        form is the one to reach for when the answer is only yes-or-no.
+        """
+        return self.conn.execute(
+            "SELECT 1 FROM projects WHERE name = ?", (name,)
+        ).fetchone() is not None
+
     def list_notes(self, project: str | None = None) -> list[dict]:
         q = "SELECT id, title, project, tags, created_at, author_client, is_global FROM notes"
         params: list = []
@@ -860,12 +906,39 @@ class Database:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def latest_open_session(self, project: str | None = None) -> dict | None:
+    def latest_open_session(self, project: str | Sequence[str] | None = None,
+                            include_unassigned: bool = False) -> dict | None:
+        """The newest session nobody closed, optionally narrowed to projects.
+
+        Several names, not one, because a workspace is not one project. The
+        Stop hook asks about the workspace it fired in, and that workspace is
+        routinely several sibling repos — the assistant is explicitly told to
+        name whichever one the work targets. Narrowed to the launching folder
+        alone, the hook goes silent for a session opened under any of the
+        others, which is worse than the machine-wide nagging it replaced: a
+        wrong reminder is noise, a missing one loses the session.
+
+        `include_unassigned` is off by default, because the two callers want
+        opposite things. `evoctx end-session --project X` means that project
+        and nothing else; guessing a project-less session was meant would
+        close the wrong one, and closing is not undoable. The hook only
+        reminds, and a session started with no project is the one most likely
+        to be forgotten.
+
+        No names — empty sequence or None — means every project, which is the
+        pre-0.1.4 behaviour and the right degradation for a workspace that
+        resolves to nothing. Filtering to nothing instead would silence the
+        reminder precisely where the store knows least.
+        """
+        names = [project] if isinstance(project, str) else list(project or [])
+        names = [n for n in names if n]
         q = "SELECT id FROM sessions WHERE ended_at IS NULL"
         params: list = []
-        if project:
-            q += " AND project = ?"
-            params.append(project)
+        if names:
+            placeholders = ", ".join("?" * len(names))
+            q += (f" AND (project IN ({placeholders}) OR project IS NULL)"
+                  if include_unassigned else f" AND project IN ({placeholders})")
+            params.extend(names)
         # Every tiebreaker in this file assumes rowid ascends with insertion
         # time. That survives deletes (a reused max rowid still exceeds every
         # live row) and is planner-independent. `VACUUM` is what breaks it:
@@ -1071,19 +1144,22 @@ class Database:
         lives must never be a reason to rewrite a description someone
         curated. Returns the normalized path actually stored.
 
-        Two guards, both here rather than in a caller, because this is the
+        Three guards, all here rather than in a caller, because this is the
         function every front-end goes through — the CLI today, the MCP
         registration tool next:
 
         - **the project must exist.** A root pointing at no project is the
           same stranded-namespace bug as a note filed under an invented name,
           except worse: resolution would answer with it authoritatively.
+        - **the path must be a directory here** (`require_local_directory`),
+          unless the row deliberately describes another machine.
         - **the directory must not belong to another project on this machine.**
           Enforced by a UNIQUE index too, but caught here so the caller gets
           the owner's name instead of an IntegrityError.
         """
         root = normalize_root(require_absolute(path))
         machine = machine or this_machine()
+        require_local_directory(root, machine)
         if not self.conn.execute(
             "SELECT 1 FROM projects WHERE name = ?", (project,)
         ).fetchone():
@@ -1120,6 +1196,8 @@ class Database:
         """
         root = normalize_root(require_absolute(path))
         machine = this_machine()
+        # before the transaction opens: a refusal here has nothing to roll back
+        require_local_directory(root, machine)
         with self.conn:  # one transaction: refuse and nothing was written
             owner = self.conn.execute(
                 "SELECT project FROM project_roots WHERE root_path = ? AND machine = ?",

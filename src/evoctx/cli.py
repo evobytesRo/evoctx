@@ -81,6 +81,7 @@ from .db import (
     ConflictingNoteScope,
     Database,
     NoteTooLarge,
+    RootNotADirectory,
     RootOwnedByAnotherProject,
     normalize_root,
     this_machine,
@@ -88,6 +89,7 @@ from .db import (
 from .grants import TOOLS_WILDCARD, GrantError, GrantStore
 from .paths import store_dir
 from .policy import PolicyEngine
+from .resolve import DEFAULT, resolve_workspace
 
 STORE_DIR = store_dir()
 db = Database(STORE_DIR)
@@ -518,7 +520,44 @@ def cmd_hook(args):
         # never trap the user in a loop over one forgotten end_session call.
         if stdin_data.get("stop_hook_active"):
             return
-        session = db.latest_open_session()
+        # Scope the nag to this workspace. Unfiltered it is machine-wide, so a
+        # window in one repo nags about a session belonging to another —
+        # observed twice on 2026-07-31. `cwd` from the hook payload is
+        # preferred over this process's own: a hook subprocess's working
+        # directory is not something evoctx controls.
+        #
+        # The whole workspace, not just the folder the hook fired in. A
+        # workspace is routinely several sibling repos and the assistant is
+        # told to name whichever one the work targets, so narrowing to the
+        # launching folder alone silences the reminder for a session opened
+        # under any of the others.
+        #
+        # Narrow ONLY on a cwd match, and only then together with `nearby`.
+        #
+        # Rung 3 populates `nearby` too — candidates for a directory that
+        # matched nothing — so narrowing there would act on a resolution that
+        # did not happen and silence any session whose project has no
+        # directory at all.
+        #
+        # Rung 1 is the trap that looks safest. `CONTEXT_PROJECT` states which
+        # project *this server* serves; it is not a claim that no other project
+        # has an open session, and it describes no workspace at all, so there
+        # is nothing there to narrow with — `nearby` is empty because nothing
+        # was searched. Worse, this hook is a separate process launched from
+        # settings.json: it does not inherit the MCP config's env block, it
+        # inherits the user's shell. One user-level CONTEXT_PROJECT would
+        # otherwise make every session on every other project unreachable by
+        # the reminder, on the whole machine, permanently.
+        #
+        # Anything else means an empty list, i.e. every open session, which is
+        # the pre-0.1.4 behaviour.
+        workspace = resolve_workspace(db, cwd=stdin_data.get("cwd"))
+        resolved = workspace["project"] if workspace["confidence"] == DEFAULT else None
+        candidates = (
+            [resolved, *(n["project"] for n in workspace["nearby"])]
+            if resolved else []
+        )
+        session = db.latest_open_session(candidates, include_unassigned=True)
         if not session:
             return
         started = datetime.fromisoformat(session["started_at"])
@@ -526,8 +565,14 @@ def cmd_hook(args):
             started = started.replace(tzinfo=timezone.utc)
         age_hours = (datetime.now(timezone.utc) - started).total_seconds() / 3600
         if age_hours <= 12:
+            # The project is named because the reminder deliberately spans the
+            # workspace, and a workspace is several repos. Without it a correct
+            # nag about the repo next door is indistinguishable from a bug, and
+            # there is nothing in the line to act on.
             print(
-                f"Open session {session['id'][:8]} (intent: {session.get('intent') or '-'}) "
+                f"Open session {session['id'][:8]} "
+                f"[{session.get('project') or 'no project'}] "
+                f"(intent: {session.get('intent') or '-'}) "
                 f"has no end_session() call yet. Call end_session(summary) to close it, "
                 f"or ignore this message to stop anyway.",
                 file=sys.stderr,
@@ -675,8 +720,9 @@ def _register(*args_, **kwargs):
     """`db.register_project`, with the transactional refusal turned into a
     message.
 
-    The pre-check in `cmd_init` catches the normal case; this catches the
-    two-writer race the db layer's guard exists for, so that path ends in an
+    The pre-checks in `cmd_init` catch the normal cases; this catches the
+    races they cannot — another writer taking the directory, or the directory
+    going away — between the check and the write, so those paths end in an
     explanation rather than a traceback.
     """
     try:
@@ -684,6 +730,9 @@ def _register(*args_, **kwargs):
     except RootOwnedByAnotherProject as e:
         print(f"That directory is already registered to project '{e.owner}'.")
         print("Re-run with --relink to move it.")
+        sys.exit(1)
+    except RootNotADirectory as e:
+        print(str(e))
         sys.exit(1)
 
 

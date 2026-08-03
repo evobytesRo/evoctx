@@ -336,6 +336,32 @@ def _workspace_folders(ws: Path) -> list[str]:
     return [p.replace("\\\\", "\\") for p in _PATH_VALUE_RE.findall(block)]
 
 
+def workspace_files_near(directory: Path) -> list[tuple[Path, list[Path]]]:
+    """Every `.code-workspace` found at `directory` or up to
+    `_WORKSPACE_SEARCH_DEPTH` levels above it, with the folders each declares.
+
+    Folders come back joined but NOT resolved, because the two callers want
+    different things from them: the install warning prints them (and printing a
+    resolved path reads like the tool renamed the folder), while resolution
+    compares them (and comparing anything but a normalized path is how
+    `D:\\Projects\\x` and `d:\\Projects\\x` became two directories). Resolve at
+    the point of use, once, rather than choosing here for both.
+
+    Files declaring no folders are dropped — an unreadable or folder-less
+    workspace file tells neither caller anything. Sorted for a stable order,
+    since a directory can hold several.
+    """
+    directory = directory.resolve()
+    bases = [directory, *list(directory.parents)[:_WORKSPACE_SEARCH_DEPTH]]
+    found: list[tuple[Path, list[Path]]] = []
+    for base in bases:
+        for ws in sorted(base.glob("*.code-workspace")):
+            rel_paths = _workspace_folders(ws)
+            if rel_paths:
+                found.append((ws, [ws.parent / p for p in rel_paths]))
+    return found
+
+
 def workspace_folder_warning(project_dir: Path) -> str | None:
     """Warn when .mcp.json is being written where the client will never read it.
 
@@ -364,18 +390,12 @@ def workspace_folder_warning(project_dir: Path) -> str | None:
     normally.
     """
     project_dir = project_dir.resolve()
-    bases = [project_dir, *list(project_dir.parents)[:_WORKSPACE_SEARCH_DEPTH]]
 
-    candidates: list[tuple[Path, list[str]]] = []
-    for base in bases:
-        for ws in sorted(base.glob("*.code-workspace")):
-            rel_paths = _workspace_folders(ws)
-            if not rel_paths:
-                continue
-            folders = {(ws.parent / p).resolve() for p in rel_paths}
-            if project_dir in folders:
-                return None          # some workspace covers it — say nothing
-            candidates.append((ws, rel_paths))
+    candidates: list[tuple[Path, list[Path]]] = []
+    for ws, folders in workspace_files_near(project_dir):
+        if project_dir in {f.resolve() for f in folders}:
+            return None              # some workspace covers it — say nothing
+        candidates.append((ws, folders))
 
     if not candidates:
         return None
@@ -385,9 +405,9 @@ def workspace_folder_warning(project_dir: Path) -> str | None:
         "  is not listed as a folder in any .code-workspace found nearby:",
         "",
     ]
-    for ws, rel_paths in candidates:
+    for ws, folders in candidates:
         lines.append(f"    {ws}")
-        lines.extend(f"        {ws.parent / p}" for p in rel_paths)
+        lines.extend(f"        {f}" for f in folders)
     lines += [
         "",
         "  If you open one of those workspaces, Claude Code will NOT read the .mcp.json",
@@ -580,6 +600,107 @@ def _this_machine() -> str:
     return this_machine()
 
 
+def _check_workspace(checks: list, db, cwd: Path) -> None:
+    """What the resolution ladder answers for the directory doctor was run in.
+
+    The whole point of binding projects to directories is that an assistant
+    stops guessing — and a user has no other way to see whether it worked.
+    Reported as a check rather than a note because "this directory belongs to
+    no project" is the state that produces invented project names, and it is
+    invisible until something has already been filed under a name that does
+    not exist.
+    """
+    # imported here, not at module scope: resolve.py imports this module for
+    # the .code-workspace parsing, so a top-level import would be a cycle
+    from .resolve import DEFAULT, resolve_workspace
+
+    block = resolve_workspace(db, cwd=cwd)
+    project = block.get("project")
+    if project is None:
+        # PASS when nothing is bound here at all, FAIL when something is.
+        # `doctor` exits non-zero on any FAIL, and every store has zero roots
+        # the moment it upgrades — so failing on "unresolved" alone turns the
+        # health check red for every user on upgrade day, and permanently for
+        # anyone whose projects are topics rather than directories. A directory
+        # that resolves to nothing while other directories resolve fine is the
+        # case that is actually inconsistent, and the only one worth an exit
+        # code. The detail says the same thing either way.
+        #
+        # A refused CONTEXT_PROJECT is the exception and always fails. Nobody
+        # sets it by accident: a human typed a name and it is wrong, so every
+        # tool call in this store is unresolvable until someone fixes it. Rung
+        # 1 refuses precisely so the typo cannot hide, and `doctor` is the one
+        # command a user runs to find it — reporting green here would hide it
+        # in the last place left.
+        broken_config = block.get("source") == "CONTEXT_PROJECT"
+        bound_here = db.project_roots(machine=_this_machine())
+        checks.append(("workspace", not broken_config and not bound_here,
+                       f"{block.get('cwd') or cwd} resolves to no project — "
+                       f"{block.get('hint', '')}"))
+        return
+    source = block.get("source")
+    qualifier = ""
+    if block.get("confidence") == DEFAULT and block.get("nearby"):
+        others = ", ".join(n["project"] for n in block["nearby"][:3])
+        qualifier = (f" — a default, not a constraint; this workspace also "
+                     f"contains {others}")
+    checks.append(("workspace", True,
+                   f"resolves to '{project}' via {source}{qualifier}"))
+
+
+def _check_workspace_configs(checks: list, cwd: Path) -> None:
+    """Every folder of this workspace whose .mcp.json declares evoctx.
+
+    Claude Code discovers .mcp.json as the union of the open workspace's
+    folders, so a multi-repo workspace can easily declare the server in
+    several of them. **evoctx does not arbitrate that and should not** — which
+    file the client honours is the client's behaviour, and both outcomes are
+    already handled (one server resolves from its own cwd; several servers
+    against one store is the designed case, WAL and busy_timeout).
+
+    What is worth surfacing is the thing a user gets wrong: believing one
+    config is live while another is. So list them and say whose call it is.
+
+    Silent when no .code-workspace is found nearby — a single-folder window
+    has no ambiguity to report, and `client configs` already covers this
+    directory.
+    """
+    workspaces = workspace_files_near(cwd)
+    if not workspaces:
+        return
+
+    folders = {cwd.resolve()}
+    for _ws, declared in workspaces:
+        for f in declared:
+            try:
+                folders.add(f.resolve())
+            except OSError:
+                continue
+
+    declaring = []
+    for folder in sorted(folders):
+        path = folder / ".mcp.json"
+        try:
+            config = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except (json.JSONDecodeError, OSError):
+            continue
+        if SERVER_NAME in config.get("mcpServers", {}):
+            declaring.append(folder)
+
+    if not declaring:
+        checks.append(("workspace mcp", False,
+                       f"none of the {len(folders)} folder(s) in this workspace declare "
+                       f"evoctx in a .mcp.json — run evoctx install claude-code from one "
+                       f"of them"))
+        return
+    listed = ", ".join(str(f) for f in declaring)
+    checks.append(("workspace mcp", True,
+                   f"{len(declaring)} of {len(folders)} workspace folder(s) declare evoctx: "
+                   f"{listed}"
+                   + (" — which one the client uses is the client's call, not evoctx's"
+                      if len(declaring) > 1 else "")))
+
+
 def _check_migration_backups(checks: list, store_dir: Path) -> None:
     """Tell the user the pre-upgrade copies exist and are theirs to delete.
 
@@ -677,6 +798,13 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
                 _check_project_roots(checks, db)
             except Exception as e:
                 checks.append(("project roots", False, f"could not be checked: {e}"))
+            # wrapped for the same reason as the roots check above: both touch
+            # the filesystem, and an unreachable path must not swallow every
+            # check that follows through the outer handler
+            try:
+                _check_workspace(checks, db, Path.cwd())
+            except Exception as e:
+                checks.append(("workspace", False, f"could not be checked: {e}"))
             _check_migration_backups(checks, store_dir)
             # wrapped for the same reason: it parses stored timestamps with
             # fromisoformat, and one malformed row would otherwise surface as
@@ -732,6 +860,10 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
                 found.append("claude-code (this directory)")
         except (json.JSONDecodeError, OSError):
             pass
+    try:
+        _check_workspace_configs(checks, Path.cwd())
+    except Exception as e:
+        checks.append(("workspace mcp", False, f"could not be checked: {e}"))
     checks.append(("client configs", bool(found),
                    ", ".join(found) if found else
                    "no client config references the server here — run: evoctx install <client> "

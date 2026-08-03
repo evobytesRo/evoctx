@@ -51,7 +51,16 @@ mcp = FastMCP(
     "evoctx",
     instructions=(
         "Personal context store — persists knowledge across sessions and projects. "
-        "At session start: call start_session(project, intent) to register the work session, "
+        "At session start: call list_projects() first. It returns the known project names "
+        "AND a `workspace` block naming the project this working directory belongs to — use "
+        "that name; never infer one from the directory or the conversation. When "
+        "workspace.project is null nothing matched, and the answer is to show the user "
+        "workspace.hint, not to pick a plausible name: a note filed under a name that does "
+        "not exist is stranded, invisible under the real project. When workspace.confidence "
+        "is 'default' the name is the launching folder's project and the workspace may span "
+        "others listed in workspace.nearby — pass a name explicitly when the work targets "
+        "one of those. "
+        "Then call start_session(project, intent) to register the work session, "
         "then recent_sessions() to see what recent sessions did (open ones were likely "
         "interrupted — their notes are the only record), then get_project(name) for relevant "
         "projects. Use search_context() during work to find decisions and notes; write_note() "
@@ -70,10 +79,31 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def list_projects(ctx: Context) -> list[str]:
+def list_projects(ctx: Context) -> dict:
     """
-    List all projects registered in the context store.
-    Call this at session start to discover what's available before calling get_project().
+    List all projects, and identify which one this workspace is.
+
+    Call this at session start, before get_project() or start_session().
+
+    Returns `projects` (the names) and `workspace`:
+
+    - `project` — the project this workspace resolved to, or null. **Never a
+      guess.** If it is null, nothing matched; do not infer a name from the
+      directory, the repo, or the conversation. Writing a note under an
+      invented name strands it: it will not appear under the real project and
+      get_project() will deny it exists.
+    - `confidence` — `authoritative` (a human set CONTEXT_PROJECT),
+      `default` (the working directory matched a registered project), or
+      `none` (unresolved).
+    - `nearby` — other registered projects in this workspace. A `default` is
+      the launching folder's project, and a workspace can span several repos,
+      so when the work targets one of these, pass its name explicitly.
+    - `cwd`, `suggested_name`, `hint` — present when unresolved: what the
+      server sees, and how to register it. Show the hint to the user rather
+      than working around it.
+
+    Callers written against the older shape, which returned a bare list of
+    names, will see a dict instead. The names are under `projects`.
     """
     return policy.t_list_projects(_client_name(ctx))
 

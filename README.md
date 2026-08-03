@@ -85,6 +85,20 @@ Default folder (first match wins):
 2. `~/.context/` if a store already exists there (legacy)
 3. Per-OS user data dir — Windows: `%LOCALAPPDATA%\evoctx`, macOS: `~/Library/Application Support/evoctx`, Linux: `~/.local/share/evoctx`
 
+### `CONTEXT_PROJECT`
+
+Names the project a server serves, overriding the directory match. Set it in an MCP config's
+`env` block, not in your shell — it is per-workspace, and a shell-level value would follow you
+into every workspace on the machine.
+
+A name that does not exist is **refused**, not quietly replaced by the directory match, so a
+typo surfaces instead of hiding. Where it surfaces depends on where you set it, and the two do
+not overlap: a value in an MCP config reaches the server, so the refusal comes back in
+`list_projects()` as `workspace.hint` — ask your assistant what `list_projects()` says. A value
+in your shell reaches `evoctx doctor`, which fails on it. `doctor` cannot see an MCP config's
+`env` block; nothing reads those back, and having it pick one `.mcp.json` to trust is exactly
+the arbitration evoctx deliberately stays out of.
+
 ## First ten minutes
 
 ```bash
@@ -156,6 +170,13 @@ write) — the one enforcement mechanism in this project that goes beyond conven
 in the last 12 hours was never closed with `end_session`. It's a nudge, not a lock: ignoring the
 message and asking Claude to stop again always succeeds.
 
+`Stop` asks only about **this workspace's** sessions — the project the directory resolves to,
+plus the other registered repos in the same workspace. **Sibling directories count as one
+workspace**, so repos sharing a parent still nag across each other; what stops is a window in
+one project tree asking about work in an unrelated one. Sessions started with no project
+surface everywhere, and a directory bound to nothing falls back to asking about every open
+session, as before. The message names the session's project, since it may not be this folder's.
+
 Then tell the assistant to actually use it — add to your global instructions file (e.g. `~/.claude/CLAUDE.md`; canonical version in [docs/instructions-snippet.md](docs/instructions-snippet.md)):
 
 ```markdown
@@ -175,7 +196,7 @@ MUST DO, every session:
 |---|---|
 | `start_session(project?, intent?)` | First call of a session — registers the work session; every `write_note` after is linked to it |
 | `recent_sessions(project?, limit?)` | Right after — see what recent sessions did; open ones were likely interrupted, their notes are the only record |
-| `list_projects()` | Discover registered projects |
+| `list_projects()` | Discover registered projects, and which one this workspace is — returns `projects` plus a `workspace` block that resolves the working directory to a project, or says plainly that nothing matched |
 | `get_project(name)` | Load overview, conventions, open questions, recent notes |
 | `search_context(query, project?, limit?)` | Find relevant notes mid-work |
 | `get_by_id(id)` | Full content after a search hit |
