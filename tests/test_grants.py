@@ -270,9 +270,12 @@ def test_t_list_projects_returns_projects_and_a_workspace(db, tmp_path):
 def test_write_out_of_scope_fails_loudly(db, tmp_path):
     engine = scoped_engine(db, tmp_path)
     grant = engine.grants.grants()["alpha-read"]
-    with pytest.raises(PolicyDenied, match="NOT saved"):
-        engine.check_write_project(grant, "beta")
-    engine.check_write_project(grant, "alpha")  # no raise
+    with pytest.raises(PolicyDenied, match="NOT saved") as e:
+        engine.check_write_project(grant, "test-client", "beta")
+    # and it names a command. A scope denial used to carry none, so a model
+    # told to relay "the command from the error" relayed one it knew.
+    assert "evoctx grant activate" in str(e.value)
+    engine.check_write_project(grant, "test-client", "alpha")  # no raise
 
 
 def test_describe_hides_redaction_patterns(db, tmp_path):

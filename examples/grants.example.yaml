@@ -7,8 +7,20 @@
 #   Linux:    ~/.local/share/evoctx/grants.yaml
 #   (or ~/.context/grants.yaml on pre-1.0 installs, or $CONTEXT_STORE if set)
 #
-# Edits are hot-reloaded — no server restart. Exactly ONE grant is active at
-# a time; switch with:  evoctx grant activate <name>
+# Edits are hot-reloaded — no server restart. One grant is active machine-wide;
+# switch with:  evoctx grant activate <name>
+#
+# Since 0.1.4 a client can also have its own, which is how you give two
+# assistants different access:
+#
+#   evoctx grant activate payments-readonly --client "cursor"
+#   evoctx grant activate everything                    # everyone else
+#   evoctx grant list                                   # both, side by side
+#
+# A per-client grant wins; the machine-wide one is the fallback for clients
+# with no entry. When a per-client grant EXPIRES that client is denied — it
+# does not fall back to the wider one, because widening access at the moment a
+# restriction lapses is the opposite of what the expiry is for.
 #
 # Every grant needs `expires`. Relative values (+30d, +8h, +45m) count from
 # the moment you activate the grant, absolute values are ISO timestamps.
@@ -55,6 +67,12 @@ grants:
   # evoctx cannot tell a restriction you meant from one a release left behind.
   # So this grant will silently miss tools added by future releases — add them
   # by hand when you want them, or use "*".
+  #
+  # Activate it for that client alone, or every OTHER client is locked out:
+  #   evoctx grant activate payments-readonly --client "cursor"
+  # Activating it machine-wide (no --client) does not narrow cursor — it
+  # denies claude-code, vscode and everyone else, since they match no
+  # `client` glob here.
   - name: payments-readonly
     client: "cursor"                # only a client calling itself "cursor"
     tools: [list_projects, get_project, search_context, get_by_id, list_grants]

@@ -350,6 +350,111 @@ def test_doctor_detects_installed_client(tmp_path):
     assert ok and "cursor" in detail
 
 
+def test_doctor_says_nothing_about_per_client_grants_when_there_are_none(tmp_path):
+    """Every line the per-client feature adds is conditional on the map being
+    non-empty, including "this client has no entry". Unconditionally it would
+    fire on every fresh install, where every client legitimately runs on the
+    machine-wide default — and a check that is wrong on day one is one people
+    learn to scroll past."""
+    store = tmp_path / "store"
+    Database(store)
+    GrantStore(store)
+    install_json_client(clients(tmp_path)["cursor"])
+    names = [check for check, _, _ in doctor(store, tmp_path)]
+    assert not any("per-client" in n or "grant coverage" in n for n in names)
+
+
+def test_doctor_reports_per_client_grants_and_who_is_not_covered(tmp_path):
+    store = tmp_path / "store"
+    Database(store)
+    gs = GrantStore(store)
+    gs.activate("everything", client_key="claude-code")
+    install_json_client(clients(tmp_path)["cursor"])
+    checks = {check: (ok, detail) for check, ok, detail in doctor(store, tmp_path)}
+    ok, detail = checks["per-client grants"]
+    assert ok and "claude-code -> everything" in detail
+    # the 0.1.3-writer wipe rides on this line rather than getting a check of
+    # its own — a PASS that can never be made to go away teaches skimming
+    assert "older than 0.1.4" in detail
+    ok, detail = checks["client grant coverage"]
+    assert ok and "cursor" in detail          # informational: fallback is correct
+
+
+def test_doctor_fails_on_an_expired_per_client_grant(tmp_path):
+    """Those clients are denied and do not fall back, so nothing else in the
+    product would ever say so — the client simply starts failing."""
+    store = tmp_path / "store"
+    Database(store)
+    gs = GrantStore(store)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: lapsed\n    client: "*"\n    tools: ["*"]\n'
+        '    expires: "+0m"\n', encoding="utf-8")
+    gs._grants_mtime = -1.0
+    gs.activate("lapsed", client_key="cursor*")
+    checks = {check: (ok, detail) for check, ok, detail in doctor(store, tmp_path)}
+    ok, detail = checks["per-client grants"]
+    assert ok is False
+    assert "do NOT fall back" in detail
+
+
+def test_doctor_fails_when_an_installed_client_matches_two_equal_keys(tmp_path):
+    """Resolution refuses rather than picking by file order, so every call
+    from that client is denied. doctor passing here would be a health check
+    blessing a state the product itself refuses to serve.
+
+    Decidable only because it is asked about a concrete installed client:
+    whether `curso*` and `*ursor` can both match *something* is the glob
+    intersection nothing here computes."""
+    store = tmp_path / "store"
+    Database(store)
+    gs = GrantStore(store)
+    gs.activate("everything", client_key="curso*")
+    gs.activate("everything", client_key="*ursor")
+    install_json_client(clients(tmp_path)["cursor"])
+    checks = {check: (ok, detail) for check, ok, detail in doctor(store, tmp_path)}
+    ok, detail = checks["per-client grant resolution"]
+    assert ok is False
+    assert "curso*" in detail and "*ursor" in detail
+
+
+def test_doctor_fails_when_a_glob_key_points_at_a_grant_that_excludes_the_client(tmp_path):
+    """The residual `activate --client` cannot check: two globs, no cheap
+    intersection. Against a real client name it is a lookup — and the entry
+    otherwise reads healthy everywhere, while every call is denied."""
+    store = tmp_path / "store"
+    Database(store)
+    gs = GrantStore(store)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: cursor-only\n    client: "cursor*"\n'
+        '    tools: ["*"]\n    expires: "+8h"\n', encoding="utf-8")
+    gs._grants_mtime = -1.0
+    gs.activate("cursor-only", client_key="curs*")     # also matches nothing else
+    install_json_client(clients(tmp_path)["vscode"])
+    gs.activate("cursor-only", client_key="vscod*")    # ...but this one denies vscode
+    checks = {check: (ok, detail) for check, ok, detail in doctor(store, tmp_path)}
+    ok, detail = checks["per-client grant resolution"]
+    assert ok is False
+    assert "vscode" in detail and "cursor*" in detail
+
+
+def test_doctor_reports_one_line_per_cause_not_two(tmp_path):
+    """An expired entry covering an installed client is one fault. Reporting
+    it as both a broken entry and a denied client is how a health check
+    teaches people to skim it."""
+    store = tmp_path / "store"
+    Database(store)
+    gs = GrantStore(store)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: lapsed\n    client: "*"\n    tools: ["*"]\n'
+        '    expires: "+0m"\n', encoding="utf-8")
+    gs._grants_mtime = -1.0
+    gs.activate("lapsed", client_key="cursor*")
+    install_json_client(clients(tmp_path)["cursor"])
+    checks = {check: ok for check, ok, _ in doctor(store, tmp_path)}
+    assert checks["per-client grants"] is False
+    assert "per-client grant resolution" not in checks
+
+
 def test_doctor_flags_missing_grant(tmp_path):
     store = tmp_path / "store"
     Database(store)

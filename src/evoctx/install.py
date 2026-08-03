@@ -793,6 +793,152 @@ def _check_workspace_configs(checks: list, cwd: Path) -> None:
                       if len(declaring) > 1 else "")))
 
 
+def installed_clients(home: Path, include_cwd: bool = True) -> list[tuple[str, str]]:
+    """Clients whose config references this server, as (name, display).
+
+    `name` is the name of the client whose config file this is — the same
+    string `install` writes into it as `CONTEXT_CLIENT`, and therefore what
+    grants and audit entries are normally matched against. Inferred from
+    which config was found rather than read back out of it — a limitation,
+    not a safeguard: if someone edits `CONTEXT_CLIENT`, that edited value is
+    what the client actually reports, and every grant check built on this
+    list then answers about a name nobody sends.
+    `display` may add where it was found, which matters for claude-code and
+    is noise everywhere else.
+
+    `include_cwd` covers claude-code, which is project-scoped: its config
+    lives in the workspace, so the only one discoverable is the current
+    directory's. Right for `doctor`, which is explicitly a here-and-now
+    diagnostic — and wrong for a store-mutating command, whose exit code must
+    not depend on which directory the shell happened to be in.
+    """
+    found: list[tuple[str, str]] = []
+    for name, client in clients(home).items():
+        if client.config_path.exists():
+            try:
+                config = json.loads(client.config_path.read_text(encoding="utf-8") or "{}")
+                if SERVER_NAME in config.get(client.key, {}):
+                    found.append((name, name))
+            except (json.JSONDecodeError, OSError):
+                pass
+    codex_path = home / ".codex" / "config.toml"
+    if codex_path.exists():
+        # Inside the try like every other config read. It was outside, so a
+        # non-UTF-8 config.toml raised out of discovery — which since this
+        # release also runs from `grant activate --client`, a command that
+        # mutates the store.
+        try:
+            if f"[mcp_servers.{SERVER_NAME}]" in codex_path.read_text(encoding="utf-8"):
+                found.append(("codex", "codex"))
+        except (OSError, UnicodeDecodeError):
+            pass
+    # claude-code is project-scoped, not under home — checked against the
+    # current directory only, since that's the one location doctor can
+    # reasonably guess without being told which workspace to look at
+    claude_code_path = Path.cwd() / ".mcp.json"
+    if include_cwd and claude_code_path.exists():
+        try:
+            config = json.loads(claude_code_path.read_text(encoding="utf-8") or "{}")
+            if SERVER_NAME in config.get("mcpServers", {}):
+                found.append(("claude-code", "claude-code (this directory)"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return found
+
+
+def _check_client_grants(checks: list, gs, installed: list[str]) -> None:
+    """Report the per-client grants, and any installed client left out of them.
+
+    **Everything here is conditional on the map being non-empty**, including
+    the "no entry for this client" line. Unconditionally it would fire on
+    every fresh install, where every client legitimately runs on the
+    machine-wide default — and a check that is wrong on day one is a check
+    people learn to scroll past.
+
+    Falling back to the machine-wide grant is correct, not a fault, so a
+    client without an entry never fails the run. An entry that cannot serve
+    does fail, and so does an installed client that resolution refuses —
+    those clients are denied outright, and the only other symptom is that the
+    assistant quietly stops working.
+    """
+    from .grants import match_client_key
+
+    entries = gs.client_entries()
+    if not entries:
+        return
+
+    broken, broken_keys = [], set()
+    for key in sorted(entries):
+        usable, detail = gs.entry_usable(key)
+        if not usable:
+            broken.append(f"{key}: {detail}")
+            broken_keys.add(key)
+    # The older-build wipe rides on this line rather than getting its own.
+    # A separate check would be a PASS that can never be made to go away, and
+    # a permanently-green warning is how people learn to skim the section —
+    # which is the section the real failures below print into. **On both
+    # branches**: attaching it only to the healthy one dropped the warning
+    # exactly when a store also had a lapsed entry, which is precisely the
+    # store someone is about to run `grant activate` against.
+    wipe = (" — note: an evoctx older than 0.1.4 running `grant activate` on this "
+            "store erases these silently; upgrade every machine sharing it")
+    if broken:
+        # No fallback by design: a per-client grant that lapses denies its
+        # clients rather than promoting them to the machine-wide one. That is
+        # the safe direction and an invisible one — the client just starts
+        # failing — so it is the one thing here that goes red.
+        checks.append(("per-client grants", False,
+                       f"{len(broken)} unusable, so those clients are denied and do "
+                       f"NOT fall back ({'; '.join(broken)}) — run: evoctx grant "
+                       f"activate <name> --client \"<key>\"" + wipe))
+    else:
+        checks.append(("per-client grants", True,
+                       ", ".join(f"{k} -> {entries[k].get('name') or '(none)'}"
+                                 for k in sorted(entries)) + wipe))
+
+    # Resolution run for real, against the concrete names of the clients that
+    # are actually installed. That is what makes the undecidable questions
+    # decidable: whether two globs can both match *something* is expensive,
+    # whether they both match `claude-code` is a lookup. This catches an
+    # ambiguous pair, a key pointed at a grant whose own `client` glob
+    # excludes the client, and anything else resolution refuses — none of
+    # which any other surface would mention, because the symptom is a client
+    # that simply stops working.
+    uncovered, resolved = [], []
+    for name in sorted(set(installed)):
+        key, tied = match_client_key(entries, name)
+        if key is None and not tied:
+            uncovered.append(name)
+        elif key not in broken_keys:  # already named above; one cause, one line
+            resolved.append(name)
+    # Through the same helper `grant activate --client` uses for its exit
+    # code, so the health check and the write path cannot disagree about who
+    # can call.
+    denied = gs.denied_clients(resolved)
+    if denied:
+        # The command per client comes from `recovery_command`, never from
+        # text written here. This line used to say "remove ... a key named
+        # above", which for a coverage mismatch drops that client to the
+        # machine-wide grant — the widening `recovery_command` had already
+        # been fixed not to emit, surviving in a surface that built its own
+        # string. That is the same defect three review rounds in a row; one
+        # producer is the structural answer to it.
+        #
+        # No pointer to `grant list` either: it prints the entries, and an
+        # ambiguous pair looks perfectly healthy there, two rows with expiry
+        # dates.
+        checks.append(("per-client grant resolution", False,
+                       f"{len(denied)} installed client(s) denied every call — "
+                       + "; ".join(f"{n}: {why} (run: {gs.recovery_command(n)})"
+                                   for n, why in denied)))
+    if uncovered:
+        verb = "uses" if len(uncovered) == 1 else "use"
+        checks.append(("client grant coverage", True,
+                       f"{', '.join(uncovered)} {verb} the machine-wide grant (no "
+                       f"per-client entry) — give one its own with: evoctx grant "
+                       f"activate <grant> --client \"<client>\""))
+
+
 def _check_migration_backups(checks: list, store_dir: Path) -> None:
     """Tell the user the pre-upgrade copies exist and are theirs to delete.
 
@@ -926,6 +1072,12 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
 
     _check_cloud_sync(checks, store_dir)
 
+    # Which clients reference the server. Discovered here rather than at the
+    # "client configs" line below because the per-client grant check needs the
+    # same list — asking "is this installed client covered by a grant" from a
+    # second, separately-written discovery is how the two answers drift apart.
+    installed = installed_clients(home)
+
     # grants
     try:
         gs = GrantStore(store_dir)
@@ -934,7 +1086,11 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
             checks.append(("active grant", True,
                            f"'{active.grant.name}' expires {active.expires_at.isoformat()}"))
         else:
-            checks.append(("active grant", False, f"{reason} — run: evoctx grant activate everything"))
+            # `reason` is factual and carries no command, so this is the only
+            # place the recovery is added — and it comes from the store, so
+            # `doctor` cannot drift from what a denial tells the assistant.
+            checks.append(("active grant", False,
+                           f"{reason} — run: {gs.recovery_command()}"))
         # A grant that listed every tool of an earlier release goes silently
         # short when a release adds one; the client discovers it as a denial
         # mid-task, and this finds it first. Only that case — `missing_tools`
@@ -950,6 +1106,7 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
         else:
             checks.append(("grant tools", True,
                            "every grant covers the tools this build ships"))
+        _check_client_grants(checks, gs, [name for name, _ in installed])
     except GrantError as e:
         checks.append(("grants.yaml", False, str(e)))
 
@@ -957,30 +1114,7 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
     command, args = server_command()
     checks.append(("server command", Path(command).exists(), f"{command} {' '.join(args)}".strip()))
 
-    # which clients reference the server
-    found = []
-    for name, client in clients(home).items():
-        if client.config_path.exists():
-            try:
-                config = json.loads(client.config_path.read_text(encoding="utf-8") or "{}")
-                if SERVER_NAME in config.get(client.key, {}):
-                    found.append(name)
-            except (json.JSONDecodeError, OSError):
-                pass
-    codex_path = home / ".codex" / "config.toml"
-    if codex_path.exists() and f"[mcp_servers.{SERVER_NAME}]" in codex_path.read_text(encoding="utf-8"):
-        found.append("codex")
-    # claude-code is project-scoped, not under home — checked against the
-    # current directory only, since that's the one location doctor can
-    # reasonably guess without being told which workspace to look at
-    claude_code_path = Path.cwd() / ".mcp.json"
-    if claude_code_path.exists():
-        try:
-            config = json.loads(claude_code_path.read_text(encoding="utf-8") or "{}")
-            if SERVER_NAME in config.get("mcpServers", {}):
-                found.append("claude-code (this directory)")
-        except (json.JSONDecodeError, OSError):
-            pass
+    found = [display for _, display in installed]
     try:
         _check_workspace_configs(checks, Path.cwd())
     except Exception as e:

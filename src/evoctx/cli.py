@@ -20,10 +20,20 @@ Mirrors of the MCP tools — everything the AI can do, you can do:
 
 Grant management (human-only):
 
-  evoctx grant list                                           All grants defined in grants.yaml
+  evoctx grant list                                           All grants defined in grants.yaml,
+                                                              plus any per-client grants
   evoctx grant show NAME                                      One grant in detail
-  evoctx grant activate NAME                                  Make NAME the active grant
-  evoctx grant deactivate                                     No active grant — every call denied
+  evoctx grant activate NAME                                  Make NAME the machine-wide active grant
+  evoctx grant activate NAME --client "cursor*"               Give clients matching that glob their own
+                                                              grant. Takes precedence over the machine-wide
+                                                              one; a client with no entry falls back to it.
+                                                              When it expires those clients are DENIED —
+                                                              a narrow grant never falls back to a wider one.
+  evoctx grant deactivate --client "cursor*"                  Remove one per-client grant. Takes the key
+                                                              exactly as written, case included — everything
+                                                              else here ignores case, but this one deletes
+  evoctx grant deactivate                                     Kill switch: clears the machine-wide grant AND
+                                                              every per-client grant — every call denied
 
 Audit (human-only — deliberately not an MCP tool):
 
@@ -82,6 +92,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
 
 from .db import (
     AmbiguousPrefix,
@@ -94,7 +105,7 @@ from .db import (
     normalize_root,
     this_machine,
 )
-from .grants import TOOLS_WILDCARD, GrantError, GrantStore
+from .grants import TOOLS_WILDCARD, GrantError, GrantStore, client_key_is_concrete
 from .paths import store_dir
 from .policy import PolicyEngine
 from .resolve import DEFAULT, resolve_workspace
@@ -300,6 +311,33 @@ def cmd_list_grants(args):
 
 
 def cmd_grant(args):
+    from fnmatch import fnmatchcase
+
+    from .install import installed_clients
+
+    if args.action != "deactivate":
+        # **Never in front of `deactivate`.** That is the kill switch, it has
+        # never needed `grants.yaml` to parse, and gating it here meant one
+        # bad line in that file left the emergency control unreachable while
+        # `active_grant.json` still declared full access. The only way out
+        # would have been hand-editing YAML under pressure.
+        #
+        # For the rest: this file is hand-edited and these are the commands
+        # someone runs *because* something is wrong with it, so a traceback
+        # answers the question with a stack.
+        try:
+            grant_store.grants()
+        except GrantError as e:
+            print(f"Error in {grant_store.grants_path}: {e}")
+            sys.exit(1)
+
+    if args.client is not None and args.action not in ("activate", "deactivate"):
+        # argparse hangs --client on the whole `grant` subcommand, so
+        # `grant upgrade --client cursor` parsed fine and silently ignored it
+        # — and it reads exactly like "upgrade this client's grant".
+        print(f"--client applies to activate and deactivate, not '{args.action}'.")
+        sys.exit(1)
+
     if args.action == "list":
         active, reason = grant_store.active_grant()
         active_name = active.grant.name if active else None
@@ -312,7 +350,33 @@ def cmd_grant(args):
         if active:
             print(f"\nActive: {active_name} (expires {active.expires_at.isoformat()})")
         else:
-            print(f"\nNo active grant — {reason}")
+            print(f"\nNo active grant — {reason}\nRun: {grant_store.recovery_command()}")
+        entries = grant_store.client_entries()
+        if entries:
+            # The scalar above is only the fallback once entries exist, so
+            # printing it alone would misstate what most clients actually get.
+            # Each entry is judged on its own clock: an expired one denies its
+            # clients outright and never falls back, which is the state a user
+            # most needs to see here.
+            print("\nPer-client grants (these take precedence; a client with no "
+                  "entry uses the active grant above):")
+            for key in sorted(entries):
+                usable, detail = grant_store.entry_usable(key)
+                name = entries[key].get("name") or "(none)"
+                mark = "expires" if usable else "UNUSABLE:"
+                print(f"  {key:<20} -> {name:<20} {mark} {detail}")
+            # An entry can read perfectly healthy here and still deny every
+            # call — a glob key pointed at a grant whose own `client` glob
+            # excludes it, or two keys that tie for some client. Neither is
+            # visible per row, because both are properties of a *client*, not
+            # of an entry. So resolve the ones this machine has: this is the
+            # surface a user checks first and it was green on a config that
+            # denied their assistant while `doctor` failed it.
+            denied = grant_store.denied_clients(
+                name for name, _ in installed_clients(Path.home()))
+            for name, why in denied:
+                print(f"  ! {name} is denied every call: {why}")
+                print(f"    run: {grant_store.recovery_command(name)}")
         print(f"Config: {grant_store.grants_path}")
 
     elif args.action == "show":
@@ -363,28 +427,184 @@ def cmd_grant(args):
 
     elif args.action == "activate":
         if not args.name:
-            print("Usage: evoctx grant activate NAME")
+            print("Usage: evoctx grant activate NAME [--client GLOB]")
             sys.exit(1)
+        # Every failure below happens *after* the write — the checks ask what
+        # this store resolves to, which is only answerable once the entry is
+        # in it. So the write is undone on the way out: a non-zero exit that
+        # left a grant applied inverts what a script reads from the exit code,
+        # and one of these paths had already handed every tool to clients the
+        # message did not mention.
+        before = grant_store.active_state_snapshot()
+
+        def fail(*lines) -> NoReturn:
+            grant_store.restore_active(before)
+            for line in lines:
+                print(line)
+            print("Nothing was changed.")
+            sys.exit(1)
+
         try:
-            g = grant_store.activate(args.name)
+            g = grant_store.activate(args.name, client_key=args.client)
         except GrantError as e:
             print(f"Error: {e}")
             sys.exit(1)
-        active, reason = grant_store.active_grant()
-        if active is None:
-            # Writing active_grant.json succeeded, but the grant is already
-            # past its own expiry — `expires: "+0m"`, or an absolute timestamp
-            # in the past. Every call would be denied, so this is a failure
-            # however successful the write was; exit non-zero so a script
-            # that activates a grant can trust a 0 to mean "usable".
-            print(f"Activated grant '{g.name}', but it is not usable: {reason}")
-            print(f"Fix its 'expires' in {grant_store.grants_path}, then activate it again.")
-            sys.exit(1)
-        print(f"Activated grant '{g.name}' (expires {active.expires_at.isoformat()})")
+
+        if args.client is None:
+            active, reason = grant_store.active_grant()
+            if active is None:
+                # Writing active_grant.json succeeded, but the grant is already
+                # past its own expiry — `expires: "+0m"`, or an absolute timestamp
+                # in the past. Every call would be denied, so this is a failure
+                # however successful the write was; exit non-zero so a script
+                # that activates a grant can trust a 0 to mean "usable".
+                fail(f"Grant '{g.name}' is not usable: {reason}",
+                     f"Fix its 'expires' in {grant_store.grants_path}, then "
+                     f"activate it again.")
+            print(f"Activated grant '{g.name}' (expires {active.expires_at.isoformat()})")
+            if grant_store.client_entries():
+                # The scalar is the fallback for clients with no entry, so
+                # "activated" without this reads as machine-wide when it is
+                # not. Naming the entries is the difference between a user
+                # who knows cursor did not change and one who finds out later.
+                keys = ", ".join(sorted(grant_store.client_entries()))
+                print(f"Per-client grants are unchanged and still take precedence: {keys}")
+            return
+
+        # --client: the same "exit 0 means usable" contract, judged against
+        # this entry's own clock rather than the scalar's. Reusing the
+        # machine-wide check here would report success for an activation that
+        # denies every call from the client it was written for.
+        usable, detail = grant_store.entry_usable(args.client)
+        if not usable:
+            fail(f"The grant for client key '{args.client}' -> '{g.name}' would "
+                 f"not be usable: {detail}",
+                 f"Fix its 'expires' in {grant_store.grants_path}, then "
+                 f"activate it again.")
+
+        # Announced only once nothing below can still call `fail()`. It used
+        # to print here, above four gates, so a failing run said "now use
+        # grant X" and "Nothing was changed." on one screen.
+        succeeded = (f"Clients matching '{args.client}' now use grant '{g.name}' "
+                     f"(expires {detail})")
+
+        if (not client_key_is_concrete(args.client) and not g.covers_all_clients()
+                and args.client.casefold() != g.client.casefold()):
+            # The coverage guard inside `activate` only runs for a concrete
+            # key: two globs cannot be compared without a glob intersection
+            # engine. Say so rather than let exit 0 imply a check that did not
+            # happen — a key like `claude*` pointed at a grant scoped
+            # `client: "cursor*"` resolves fine and then denies every call.
+            print(f"Note: grant '{g.name}' itself only covers clients matching "
+                  f"'{g.client}'. Any client matching '{args.client}' but not "
+                  f"'{g.client}' will be denied — two globs cannot be compared "
+                  f"in advance, so this one is on you to check.")
+
+        # Resolved for real, against the concrete names of the clients this
+        # machine has — which is what makes the exit code mean something for a
+        # glob key: whether two globs can both match some hypothetical name is
+        # undecidable here, but whether *these* clients can call is a lookup.
+        # It catches an ambiguous pair, a grant that excludes them, and an
+        # expiry, without needing a separate detector for each.
+        #
+        # **Only the clients this key is about.** Reporting every denied
+        # client made an unrelated pre-existing denial — a pulled kill switch,
+        # a lapsed machine-wide grant — fail an activation that was entirely
+        # correct, and this command's exit code is documented as meaning "what
+        # you wrote is usable". And discovery excludes the current directory,
+        # or the same command against the same store would exit differently
+        # depending on which folder the shell was in.
+        covered = [name for name, _ in installed_clients(Path.home(), include_cwd=False)
+                   if fnmatchcase(name.casefold(), args.client.casefold())]
+        denied = grant_store.denied_clients(covered)
+        if denied:
+            fail(f"These clients matching '{args.client}' would still be denied "
+                 f"every call:",
+                 *(f"  {name}: {why}" for name, why in denied))
+
+        blocking, warning = grant_store.shadowing_keys(args.client)
+        broken = [(k, why) for k, why, usable in blocking if not usable]
+        blocking = [(k, why) for k, why, usable in blocking if usable]
+        if broken:
+            # An exact key that cannot serve leaves its client denied, and the
+            # entry just written cannot reach them — a state `doctor` fails,
+            # so exiting 0 here would have the two disagreeing. No command
+            # named: removing the key drops that client to the machine-wide
+            # grant, and only the user knows whether renewing it or pointing
+            # it elsewhere is what they meant.
+            fail("These clients have their own key, and it cannot serve them:",
+                 *(f"  {key}: {why}" for key, why in broken),
+                 "Fix or remove each before narrowing the family: evoctx grant list")
+
+        print(succeeded)
+        if blocking:
+            # An exact key beats a glob for the client it names, so what was
+            # just written does not apply to those clients. **Not a failure**:
+            # a per-client override beside a family-wide default is the
+            # precedence rule this feature documents and ships, so failing it
+            # would make a supported configuration unreachable — every retry
+            # exiting 1 forever, with the only escape being to delete the
+            # override the user deliberately wrote.
+            #
+            # Loud, though, and with a command that brings each of them into
+            # line **without widening anyone**: apply the same grant to their
+            # own key. Telling the user to remove the key instead drops that
+            # client to the machine-wide grant, which is exactly the widening
+            # this release keeps having to take back out of its own advice.
+            print(f"Note: '{args.client}' does NOT apply to these clients — a key "
+                  f"naming them exactly wins:")
+            for key, why in blocking:
+                print(f"  {key}: {why}")
+            # A placeholder, not `{g.name}`. Naming the grant just written
+            # reads as the obvious completion, and completing it is a widening
+            # whenever that grant is broader than the override — which is the
+            # normal case, since the asymmetry is why the override exists. The
+            # comment here used to claim this command widened nobody; it was
+            # true only in the direction the test happened to exercise.
+            print("To change what one of them gets, give it its own entry with the "
+                  "grant you want: evoctx grant activate <name> --client \"<key>\"")
+        if warning:
+            # Best-effort and deliberately over-approximate: whether one glob
+            # can outrank another for some client is undecidable here without
+            # writing a glob intersection engine, so this warns on any
+            # unusable key at least as specific and accepts the false
+            # positives. The check above is the sound half.
+            print("Warning: these keys are at least as specific, cannot serve, and may "
+                  "take precedence for clients you have not installed here:")
+            for key, why in warning:
+                print(f"  {key}: {why}")
 
     elif args.action == "deactivate":
+        # `is None`, not truthiness. `--client ""` is a request to remove one
+        # entry; falling through to the kill switch on it would clear the
+        # machine-wide grant and every other entry, which is not a smaller
+        # version of what was asked. (`activate` refuses to create an empty
+        # key at all, so the only path here is a hand-edited file.)
+        if args.client is not None:
+            try:
+                grant_store.deactivate(client_key=args.client)
+            except GrantError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+            print(f"Removed the per-client grant for key '{args.client}'.")
+            for name in sorted(grant_store.client_entries()):
+                # "they fall back to the machine-wide grant" is only true when
+                # nothing else covers them, and saying it unconditionally
+                # misdescribes exactly the setup this feature encourages.
+                print(f"  still set: {name}")
+            return
+        had = len(grant_store.client_entries())
         grant_store.deactivate()
         print("Deactivated. Every MCP call is now denied until a grant is activated.")
+        if had:
+            # Said out loud because it is the destructive half. Preserving the
+            # map here would leave every client with an entry fully active
+            # after the kill switch was pulled, so the switch clears it — and
+            # a user who expected otherwise needs to know before they go
+            # looking for entries that are gone.
+            print(f"This also cleared {had} per-client grant(s) — the kill switch "
+                  f"leaves nothing active. Re-add with: evoctx grant activate NAME "
+                  f"--client \"<glob>\"")
 
 
 def cmd_audit(args):
@@ -1612,6 +1832,14 @@ def main():
     gr.add_argument("name", nargs="?", default=None)
     gr.add_argument("--dry-run", action="store_true",
                     help="upgrade only: show what would be added, write nothing")
+    gr.add_argument("--client", default=None, metavar="GLOB",
+                    help="activate: apply this grant to clients matching GLOB "
+                         "instead of setting the machine-wide default. The result "
+                         "is checked against the clients installed for this user; "
+                         "claude-code is workspace-scoped, so run `evoctx doctor` "
+                         "inside its workspace to check that one. "
+                         "deactivate: remove one such entry, naming its key exactly "
+                         "as written, case included")
 
     # install / doctor
     ins = sub.add_parser("install", help="Write MCP config for a client")

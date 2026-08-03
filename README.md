@@ -78,7 +78,7 @@ One folder holds it all — run `evoctx doctor` and read the "store dir" line:
 |---|---|
 | `store.db` | The store: notes, projects, sessions, audit log (SQLite) |
 | `grants.yaml` | What connected AI clients may do — hand-edited, hot-reloaded |
-| `active_grant.json` | Which grant is currently active (written by `evoctx grant activate`) |
+| `active_grant.json` | Which grant is active — machine-wide, plus any [per-client](#a-different-grant-per-client) ones (written by `evoctx grant activate`) |
 
 Default folder (first match wins):
 1. `CONTEXT_STORE` env var, if set
@@ -257,7 +257,8 @@ you have to trust.
 ## Grants — what a client may do
 
 Every tool call passes a policy gate. Grants live in `grants.yaml` in your store folder
-(hand-edited, hot-reloaded — no restart needed); exactly one is active at a time.
+(hand-edited, hot-reloaded — no restart needed); one is active machine-wide, and since 0.1.4
+[a client can have its own](#a-different-grant-per-client).
 
 First run auto-creates an `everything` grant (all tools, all projects, 30-day expiry) and
 activates it, so nothing is broken out of the box. When it expires, calls fail with a message
@@ -299,6 +300,57 @@ A denied call returns an error naming the exact command to fix it — `evoctx gr
 for a grant that is too narrow, `evoctx grant upgrade` for one written before the tool
 existed — so the AI can relay it to you. Scope-blocked notes read as nonexistent (no existence leak);
 out-of-scope **writes** fail loudly instead — silent write loss is worse.
+
+### A different grant per client
+
+The point of installing several assistants is often to give them different access — read-only
+for one, full write for another. Since **0.1.4** each client can have its own grant:
+
+```
+evoctx grant activate read-only --client "cursor*"    # cursor gets this one
+evoctx grant activate everything                      # everyone else gets this one
+evoctx grant list                                     # both, side by side
+evoctx grant deactivate --client "cursor*"            # cursor falls back to the default
+```
+
+The client name is what the client reports about itself — `install` writes it into each
+config as `CONTEXT_CLIENT`, and `evoctx doctor` lists which ones are installed. The
+`--client` argument is a glob matched against it, and matching is case-insensitive: `Cursor`
+and `cursor` mean the same key, so `activate` refuses to create the second, and if both end
+up in the file by hand the call is denied rather than resolved by guessing which you meant.
+
+Four rules worth knowing before you rely on it:
+
+- **A per-client grant wins.** The machine-wide grant is the fallback for clients that have
+  no entry of their own.
+- **When one expires, that client is denied — it does not fall back.** Falling back would
+  silently promote a client from its lapsed narrow grant to the wider machine-wide one, at
+  exactly the moment the restriction was supposed to take effect.
+- **`evoctx grant deactivate` with no `--client` clears everything**, per-client entries
+  included. It is the kill switch; leaving entries active would defeat it.
+- **Which grant applies is decided per client, not per file order.** An exact key beats a
+  glob; between globs the more specific one wins; two equally specific keys are ambiguous
+  and the call is denied rather than resolved by guesswork.
+
+`evoctx grant list` and `evoctx doctor` both report the entries, which installed clients are
+running on the fallback, and any client that is denied — including one caught by that
+ambiguity. They answer for the clients you actually have installed, since whether two globs
+can both match *something* is not a question with a cheap answer; whether they both match
+`claude-code` is. claude-code's config is workspace-scoped, so run `doctor` inside the
+workspace you want checked.
+
+`grant activate --client` exits non-zero when what you asked for would not work — an expired
+grant, or a client the key names that would still be denied — and **puts the store back the
+way it was**, so a non-zero exit never leaves a grant applied. What it does *not* fail on is
+an exact key winning over a broader glob you just wrote: that is the documented precedence
+rule, so it says which clients kept their own entry and how to bring them in line. No message
+here ever suggests deleting an entry to fix a denial — removing one hands its client back to
+the wider machine-wide grant, which is the opposite of what a narrow entry was for.
+
+⚠️ **One-way door across versions.** An evoctx older than 0.1.4 running `grant activate` on
+this store rewrites `active_grant.json` and **silently erases every per-client entry** — it
+does not know they exist. Nothing on this side can detect it after the fact. If you sync
+your store between machines, upgrade all of them.
 
 ## Redaction
 
@@ -370,8 +422,9 @@ client's own permission system), in **[SECURITY.md](SECURITY.md)**.
   placeholder, by design for now.
 - **No defense against prompt injection via stored notes** — see [SECURITY.md §2](SECURITY.md).
   This isn't solved by any AI memory system today, evoctx included.
-- **Single active grant at a time** — no union semantics across multiple simultaneously active
-  grants.
+- **One grant per client, with no union semantics.** Since 0.1.4 each client can have its own
+  grant, but only one applies at a time — there is no combining several into a wider set of
+  permissions, and two equally specific per-client keys are refused rather than merged.
 
 None of these are silent limitations — if one of them matters for your use case, it's listed
 here on purpose, not something you're expected to discover by hitting it.

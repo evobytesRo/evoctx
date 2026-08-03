@@ -17,7 +17,13 @@ from typing import Callable, TypeVar
 
 from .audit import AuditWriter
 from .db import Database, RootNotADirectory, RootOwnedByAnotherProject
-from .grants import ALL_TOOLS, Grant, GrantStore, predates_current_tools
+from .grants import (
+    ALL_TOOLS,
+    Grant,
+    GrantStore,
+    match_client_key,
+    predates_current_tools,
+)
 from .redact import Redactor
 from .resolve import NONE, current_directory, resolve_workspace
 
@@ -62,17 +68,37 @@ class PolicyEngine:
     # ── gate ──────────────────────────────────────────────────────────────────
 
     def check(self, client: str, tool: str) -> Grant:
-        active, reason = self.grants.active_grant()
+        # The client is passed, not omitted: a client with its own entry in
+        # `active_grant.json` resolves to that grant, and only a client with
+        # no entry falls back to the machine-wide default. The recovery
+        # command likewise belongs to whichever of those answered — a fixed
+        # `grant activate everything` here would send a per-client denial
+        # after the scalar, which changes nothing for the denied client.
+        active, reason = self.grants.active_grant(client)
         if active is None:
             raise PolicyDenied(
-                f"Denied: {reason}. Ask the user to run: evoctx grant activate everything"
+                f"Denied: {reason}. Ask the user to run: "
+                f"{self.grants.recovery_command(client)}"
             )
         grant = active.grant
         if not grant.matches_client(client):
+            # Reachable two ways now. The machine-wide grant may simply be
+            # client-scoped elsewhere — or a hand-written `clients` entry may
+            # point a key at a grant whose own `client:` glob does not cover
+            # the client that matched the key. `activate --client` refuses
+            # that when the key is a concrete name, but a glob key cannot be
+            # checked up front, so it lands here and has to name the key.
+            where = (f"the grant for client key '{active.client_key}'"
+                     if active.client_key else "active grant")
             raise PolicyDenied(
-                f"Denied: active grant '{grant.name}' covers client "
-                f"'{grant.client}', not '{client}'. Ask the user to activate "
-                f"a matching grant: evoctx grant activate <name>"
+                f"Denied: {where}, '{grant.name}', covers client "
+                f"'{grant.client}', not '{client}'. Ask the user to run: "
+                # The same source as every other channel. Hand-building one
+                # here produced `activate <name> --client "claude*"` beside a
+                # `hint` of `deactivate --client "claude*"` — two commands for
+                # one state, and the one this branch invented rewrites the
+                # entry that excludes the client with itself.
+                f"{self.grants.recovery_command(client)}"
             )
         if not grant.allows_tool(tool):
             # Two different problems, two different fixes. A grant can lack a
@@ -87,11 +113,18 @@ class PolicyEngine:
             # exist; telling the second to run `grant upgrade` sends them to a
             # command that will not touch their grant.
             outdated = tool in ALL_TOOLS and predates_current_tools(grant.tools)
+            # `grant upgrade` edits grants.yaml, so it is per-grant and needs
+            # no client scope. Widening does: without `--client "<key>"` a
+            # narrowed client is sent to a machine-wide activate that updates
+            # the scalar it does not resolve through, leaving it denied. This
+            # branch fires on every write the narrowed client attempts — the
+            # scenario per-client grants exist for — and was the last one
+            # still carrying the pre-feature string.
             fix = ("run: evoctx grant upgrade — this grant predates "
                    f"{tool}() and lists only the tools that existed when it "
                    "was written"
                    if outdated else
-                   "activate a wider grant: evoctx grant activate <name>")
+                   f"activate a wider grant: {self.grants.widen_command(client)}")
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' does not allow {tool}(). "
                 f"Allowed: {', '.join(grant.effective_tools())}. Ask the user to "
@@ -258,12 +291,21 @@ class PolicyEngine:
 
     # ── scoped writes ─────────────────────────────────────────────────────────
 
-    def check_write_project(self, grant: Grant, project: str | None,
+    def check_write_project(self, grant: Grant, client: str, project: str | None,
                             thing: str = "note") -> None:
+        # `client` is required, not defaulted, for the same reason `tool=` is
+        # on `resolve_write_project`: the recovery command has to name the
+        # per-client key, and a default here would be load-bearing for
+        # whichever caller forgot to pass it. A scope denial used to carry no
+        # command at all, so an assistant told to relay "the command from the
+        # error" relayed one it knew — a machine-wide `grant activate`, which
+        # updates the scalar a narrowed client does not resolve through.
         if not grant.allows_project(project):
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' does not cover project "
-                f"'{project}' (scope: {grant.projects}). The {thing} was NOT saved."
+                f"'{project}' (scope: {grant.projects}). The {thing} was NOT saved. "
+                f"Ask the user to activate a wider grant: "
+                f"{self.grants.widen_command(client)}"
             )
 
     def resolve_write_project(self, grant: Grant, project: str | None,
@@ -369,7 +411,7 @@ class PolicyEngine:
             + (f" {hint}" if hint else "")
         )
 
-    def check_write_global(self, grant: Grant, is_global: bool) -> None:
+    def check_write_global(self, grant: Grant, client: str, is_global: bool) -> None:
         """A scoped grant may not write a note that spans every project.
 
         `check_write_project` cannot catch this: a global note carries
@@ -398,8 +440,8 @@ class PolicyEngine:
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' is scoped to {grant.projects}, and a "
                 f"global note appears under every project. Write it without "
-                f"is_global, or ask the user to activate a wider grant. "
-                f"The note was NOT saved."
+                f"is_global, or ask the user to activate a wider grant: "
+                f"{self.grants.widen_command(client)}. The note was NOT saved."
             )
 
     # ── audited tool entry points (what the server calls) ────────────────────
@@ -412,7 +454,10 @@ class PolicyEngine:
             return self.check(client, tool)
         except PolicyDenied:
             if self.audit:
-                active, _ = self.grants.active_grant()
+                # Not display: this records which grant refused. Resolved for
+                # this client, or a per-client denial goes into the log under
+                # the machine default's name — a record of the wrong grant.
+                active, _ = self.grants.active_grant(client)
                 self.audit.log(client, tool, "denied",
                                grant_name=active.grant.name if active else None)
             raise
@@ -514,7 +559,7 @@ class PolicyEngine:
             return {"error": "A project name is required. Use the "
                              "`suggested_name` from list_projects(), or ask "
                              "the user what to call it."}
-        self.check_write_project(grant, name)
+        self.check_write_project(grant, client, name)
         cwd = current_directory()
         if cwd is None:
             return {"error": "This server has no readable working directory, "
@@ -567,7 +612,7 @@ class PolicyEngine:
                      project: str | None, tags: list[str] | None,
                      session_id: str | None, is_global: bool = False) -> str:
         grant = self._guard(client, "write_note")
-        self.check_write_global(grant, is_global)
+        self.check_write_global(grant, client, is_global)
         # resolution BEFORE the scope check, so a defaulted project is scoped
         # like any other: `allows_project(None)` is always True, so checking
         # first would wave through a null that then resolves to a project this
@@ -576,7 +621,7 @@ class PolicyEngine:
         # an error.
         project = self.resolve_write_project(grant, project, is_global,
                                              tool="write_note")
-        self.check_write_project(grant, project)
+        self.check_write_project(grant, client, project)
         (title, content), hits = self._redact_inbound(grant, title, content)
         note_id = self.db.add_note(title, content, project=project, tags=tags,
                                    session_id=session_id, author_client=client,
@@ -594,7 +639,7 @@ class PolicyEngine:
         grant = self._guard(client, "start_session")
         project = self.resolve_write_project(grant, project, is_global=False,
                                              tool="start_session")
-        self.check_write_project(grant, project, thing="session")
+        self.check_write_project(grant, client, project, thing="session")
         (intent,), hits = self._redact_inbound(grant, intent) if intent else ((intent,), 0)
         session_id = self.db.start_session(project=project, intent=intent, client=client)
         result = self._reread_session(session_id)
@@ -652,9 +697,12 @@ class PolicyEngine:
     def t_list_grants(self, client: str) -> dict:
         result = self.describe(client)
         if self.audit:
-            active, _ = self.grants.active_grant()
+            # The name `describe` answered with, not the one resolution found:
+            # when the resolved grant excludes this client, the response says
+            # no access, and logging that grant's name would leave the record
+            # and the response disagreeing about the same call.
             self.audit.log(client, "list_grants", "read",
-                           grant_name=active.grant.name if active else None,
+                           grant_name=result.get("active_grant"),
                            result_count=1,
                            response_bytes=len(json.dumps(result, default=str)))
         return result
@@ -662,14 +710,51 @@ class PolicyEngine:
     # ── introspection ─────────────────────────────────────────────────────────
 
     def describe(self, client: str) -> dict:
-        active, reason = self.grants.active_grant()
+        """What this client may actually do — resolved for *this* client.
+
+        `list_grants()` exists to answer "may I call X?", so answering it from
+        the machine-wide default while the caller's real calls resolve against
+        a narrower per-client entry would be the one wrong answer this tool
+        cannot afford. `client_key` is reported so the answer says which grant
+        it came from.
+
+        For the same reason it reports **no access** when the resolved grant's
+        own `client` glob excludes this client. That grant denies every call,
+        so listing its tools answers the question backwards — and the
+        per-client map makes the case ordinary: a glob key can be pointed at a
+        narrower grant, and no check up front can compare two globs.
+        """
+        active, reason = self.grants.active_grant(client)
+        if active is not None and not active.grant.matches_client(client):
+            reason = (f"grant '{active.grant.name}' covers client "
+                      f"'{active.grant.client}', not '{client}'")
+            active = None
         if active is None:
-            return {"active_grant": None, "client": client, "reason": reason,
-                    "hint": "evoctx grant activate <name>"}
+            # The hint has to be the same command the reason names. A generic
+            # `grant activate <name>` here, beside a reason saying the entry
+            # for key 'cursor*' expired, sends the user to update the
+            # machine-wide scalar — which changes nothing for the client that
+            # was denied, and looks like the fix failed.
+            # `client_key` on this branch too: a caller reading it to work out
+            # *which* entry answered needs it most on the denial it is calling
+            # to diagnose, and a key present in one branch and absent in the
+            # other is a KeyError waiting in exactly that path.
+            key, tied = match_client_key(self.grants.client_entries(), client)
+            answer = {"active_grant": None, "client": client, "client_key": key,
+                      "reason": reason,
+                      "hint": self.grants.recovery_command(client)}
+            if tied:
+                # `client_key` is null on a tie, which is exactly what "the
+                # machine-wide default answered" looks like — the opposite
+                # situation. Naming the tied keys is the only way a caller can
+                # tell the two apart from the response alone.
+                answer["ambiguous_keys"] = tied
+            return answer
         grant = active.grant
         return {
             "active_grant": grant.name,
             "client": client,
+            "client_key": active.client_key,
             "client_glob": grant.client,
             "client_matches": grant.matches_client(client),
             "allowed_tools": grant.effective_tools(),

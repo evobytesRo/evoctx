@@ -137,6 +137,374 @@ def test_grant_activate_already_expired_explains_and_exits_nonzero(
     assert "grants.yaml" in out  # points at the file to fix
 
 
+@pytest.fixture
+def no_clients_installed(monkeypatch):
+    """`grant activate --client` resolves every installed client to decide its
+    exit code, and discovery reads the real home plus `cwd/.mcp.json`. Without
+    pinning it, whether this suite passes depends on which assistants the
+    developer happens to have installed."""
+    import evoctx.install
+    monkeypatch.setattr(evoctx.install, "installed_clients",
+                        lambda home, include_cwd=True: [])
+
+
+def installed(monkeypatch, *names):
+    import evoctx.install
+    monkeypatch.setattr(evoctx.install, "installed_clients",
+                        lambda home, include_cwd=True: [(n, n) for n in names])
+
+
+TWO_GRANTS = """\
+grants:
+  - name: everything
+    client: "*"
+    tools: ["*"]
+    expires: "+30d"
+  - name: read-only
+    client: "cursor*"
+    tools: [list_projects, get_by_id]
+    expires: "+8h"
+  - name: lapsed
+    client: "*"
+    tools: ["*"]
+    expires: "+0m"
+"""
+
+
+def test_grant_activate_per_client_then_list(cli, monkeypatch, no_clients_installed, capsys, tmp_path):
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    assert "Clients matching 'cursor*'" in capsys.readouterr().out
+
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    assert "Per-client grants" in out
+    assert "cursor*" in out and "read-only" in out
+
+
+def test_machine_wide_activate_says_the_map_still_wins(cli, monkeypatch, no_clients_installed, capsys, tmp_path):
+    """"Activated" on its own reads as machine-wide when it is not — the
+    entries take precedence, and a user who does not know that goes looking
+    for the change they just made."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "activate", "everything")
+    out = capsys.readouterr().out
+    assert "Per-client grants are unchanged" in out
+    assert "cursor*" in out
+
+
+def test_per_client_activate_of_an_expired_grant_exits_nonzero(
+    cli, monkeypatch, no_clients_installed, capsys, tmp_path
+):
+    """The same "exit 0 means usable" contract as the machine-wide path, but
+    judged against this entry's own clock. Checking the scalar here would
+    report success for an activation that denies every call from the client
+    it was written for."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "everything")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "activate", "lapsed", "--client", "vscode")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "would not be usable" in out and "expired" in out
+    # and the failed activation left nothing behind: every check here runs
+    # after the write, so a non-zero exit that kept it would mean an exit
+    # code of 1 alongside an applied grant
+    assert "Nothing was changed." in out
+    run(cli, monkeypatch, "grant", "list")
+    assert "Per-client grants" not in capsys.readouterr().out
+
+
+def test_an_exact_key_shadowing_a_new_glob_is_reported_not_failed(
+    cli, monkeypatch, no_clients_installed, capsys, tmp_path
+):
+    """Writing a usable entry is not the same as making the client usable:
+    an exact key still wins for the client it names, so what was just written
+    does not reach it.
+
+    Reported, not failed — an exact override beside a family glob is the
+    precedence rule this feature documents, so failing it would make a
+    supported configuration permanently unreachable. And the way out never
+    widens: apply the same grant to the exact key.
+    """
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "everything", "--client", "cursor")
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    out = capsys.readouterr().out
+    assert "does NOT apply to these clients" in out
+    # the exact key, not a substring of it: "cursor" is inside "cursor*", so
+    # `"cursor" in out` passes even when the message names the wrong one
+    named = [line.split(":")[0].strip() for line in out.splitlines()
+             if line.startswith("  ")]
+    assert named == ["cursor"]
+    assert "deactivate" not in out          # removal here would widen 'cursor'
+    # a placeholder, not the grant just written: naming it reads as the
+    # obvious completion, and completing it widens whenever that grant is
+    # broader than the override — the normal case, since the asymmetry is
+    # why the override exists
+    assert 'evoctx grant activate <name> --client "<key>"' in out
+
+
+def test_kill_switch_reports_what_it_cleared(cli, monkeypatch, no_clients_installed, capsys, tmp_path):
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "deactivate")
+    out = capsys.readouterr().out
+    assert "Every MCP call is now denied" in out
+    assert "cleared 1 per-client grant" in out
+
+
+def test_deactivate_unknown_client_key_exits_nonzero(
+    cli, monkeypatch, capsys, tmp_path
+):
+    _replace_grants(tmp_path, TWO_GRANTS)
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "deactivate", "--client", "nosuch")
+    assert exc.value.code == 1
+    assert "no per-client grant under key" in capsys.readouterr().out
+
+
+def test_deactivate_with_an_empty_client_key_is_not_the_kill_switch(
+    cli, monkeypatch, no_clients_installed, capsys, tmp_path
+):
+    """`--client ""` asks to remove one entry. Branching on truthiness sent it
+    to the kill switch instead, clearing the machine-wide grant and every
+    other entry — not a smaller version of what was asked."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "deactivate", "--client", "")
+    assert exc.value.code == 1
+    run(cli, monkeypatch, "grant", "list")
+    assert "cursor*" in capsys.readouterr().out
+
+
+def test_activate_with_an_empty_client_key_is_refused(cli, monkeypatch, capsys, tmp_path):
+    _replace_grants(tmp_path, TWO_GRANTS)
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "activate", "everything", "--client", "")
+    assert exc.value.code == 1
+    assert "empty key" in capsys.readouterr().out
+
+
+def test_glob_key_says_which_check_it_could_not_run(cli, monkeypatch, no_clients_installed, capsys, tmp_path):
+    """`read-only` carries `client: "cursor*"`, so pointing key `claude*` at
+    it produces an entry that resolves and then denies every claude call.
+    Two globs cannot be compared in advance — exit 0 must not imply a check
+    that did not happen."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "claude*")
+    out = capsys.readouterr().out
+    assert "only covers clients matching 'cursor*'" in out
+
+
+def test_activation_that_leaves_an_installed_client_denied_exits_nonzero(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """The sound half of the check the glob note above could not run. Whether
+    two globs can both match *something* is undecidable here; whether the
+    clients on this machine can call is a lookup — and `read-only` carries
+    `client: "cursor*"`, so key `claude*` denies claude-code outright."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    installed(monkeypatch, "claude-code")
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "claude*")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "would still be denied every call" in out
+    assert "claude-code" in out
+    assert "Nothing was changed." in out
+    run(cli, monkeypatch, "grant", "list")
+    assert "Per-client grants" not in capsys.readouterr().out
+
+
+def test_activation_that_creates_an_ambiguity_exits_nonzero(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """Two usable, equally specific globs deny every client they both match.
+    That was silent: `shadowing_keys` skips usable keys, so the *expired*
+    equally-specific case warned while the *usable* one — a guaranteed denial
+    — said nothing. Caught here by resolving a real client name."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    installed(monkeypatch, "claude-code")
+    run(cli, monkeypatch, "grant", "activate", "everything", "--client", "claude*")
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "activate", "everything", "--client", "*e-code")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "equally specific" in out
+    assert "claude*" in out and "*e-code" in out
+
+
+def test_a_bad_grants_file_explains_instead_of_tracebacking(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """`grant list` is what someone runs *because* something is wrong with
+    grants.yaml. A timezone-less absolute `expires` parses, then raises
+    `TypeError: can't compare offset-naive and offset-aware` from wherever it
+    is next compared — since this release that includes `doctor` and this
+    command. Refused at parse, reported here."""
+    _replace_grants(tmp_path, TWO_GRANTS.replace('"+30d"', '"2027-01-01T00:00:00"'))
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "list")
+    assert exc.value.code == 1
+    out = capsys.readouterr().out
+    assert "has no timezone" in out
+    assert "grants.yaml" in out
+
+
+def test_the_kill_switch_works_with_an_unparseable_grants_file(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """`deactivate` has never needed `grants.yaml` to parse, and gating it on
+    that left one bad line making the emergency control unreachable while
+    `active_grant.json` still declared full access — recoverable only by
+    hand-editing YAML under pressure."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "everything")
+    _replace_grants(tmp_path, TWO_GRANTS.replace('"+30d"', '"2027-01-01T00:00:00"'))
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "deactivate")
+    assert "Every MCP call is now denied" in capsys.readouterr().out
+
+
+def test_the_kill_switch_does_not_recommend_the_broadest_grant(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """`_default_grant_name` fell back to `everything` whenever the recorded
+    name was null — which is exactly what `deactivate` writes. So pulling the
+    switch on a narrow grant made `grant list` and `doctor` both answer "run:
+    evoctx grant activate everything": the store's broadest grant, named, as
+    the repair for a deliberate lockdown."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only")
+    run(cli, monkeypatch, "grant", "deactivate")
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    assert "Run: evoctx grant activate <name>" in out
+    assert "activate everything" not in out
+
+
+def test_client_flag_is_refused_on_actions_that_ignore_it(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """argparse hangs --client on the whole `grant` subcommand, so
+    `grant upgrade --client cursor` parsed fine and silently did nothing with
+    it — while reading exactly like "upgrade this client's grant"."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "grant", "upgrade", "--client", "cursor*")
+    assert exc.value.code == 1
+    assert "--client applies to activate and deactivate" in capsys.readouterr().out
+
+
+def test_grant_list_shows_a_client_that_is_denied(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """An entry can read healthy row-by-row and still deny every call — a glob
+    key pointed at a grant whose own `client` glob excludes it. That is a
+    property of a client, not of an entry, so no row can show it. `grant list`
+    was green on a config `doctor` failed, and it is the surface people check
+    first."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    installed(monkeypatch, "claude-code")
+    with pytest.raises(SystemExit):
+        run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "claude*")
+    capsys.readouterr()
+    # write it anyway, the way a hand-edit would
+    run(cli, monkeypatch, "grant", "activate", "everything", "--client", "claude*")
+    capsys.readouterr()
+    _replace_grants(tmp_path, TWO_GRANTS.replace(
+        '  - name: everything\n    client: "*"', '  - name: everything\n    client: "cursor*"'))
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    assert "claude-code is denied every call" in out
+    assert "run: evoctx grant activate" in out
+
+
+def test_a_pre_existing_unrelated_denial_does_not_fail_the_activation(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """The gate reports the clients this key is about, not every denied one.
+    Judging all of them made a pulled kill switch or a lapsed machine-wide
+    grant fail an activation that was entirely correct — and this command's
+    exit code is documented as meaning "what you wrote is usable"."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    installed(monkeypatch, "vscode")
+    run(cli, monkeypatch, "grant", "deactivate")          # vscode now denied
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor*")
+    out = capsys.readouterr().out
+    assert "now use grant 'read-only'" in out
+    assert "denied" not in out
+
+
+def test_the_printed_recovery_is_executed_and_fixes_the_state(
+    cli, monkeypatch, no_clients_installed, capsys, tmp_path
+):
+    """Through the CLI, not the store API. Three rounds of review found the
+    critical defect in a remediation *string*, and every one of them produced
+    a correct-looking string — so the assertion has to be the state after
+    running it, at the layer that prints it."""
+    import json
+    import shlex
+    from datetime import datetime, timedelta, timezone
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only")
+    capsys.readouterr()
+    # backdate past its +8h, which is how a grant lapses in practice —
+    # a `+0m` grant is unrenewable and would test the wrong thing
+    path = tmp_path / "active_grant.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["activated_at"] = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    command = [ln for ln in out.splitlines() if ln.startswith("Run: ")][0][5:]
+    assert "<" not in command, f"not runnable as printed: {command}"
+
+    run(cli, monkeypatch, *shlex.split(command)[1:])
+    capsys.readouterr()
+    run(cli, monkeypatch, "grant", "list")
+    assert "No active grant" not in capsys.readouterr().out
+
+
+def test_a_grant_name_that_is_not_text_explains_instead_of_tracebacking(
+    cli, monkeypatch, capsys, tmp_path
+):
+    """The parse guard proves the file is a JSON object and nothing about the
+    values in it. `grants().get(["everything"])` raised `TypeError:
+    unhashable type` out of every tool call — and out of `grant list` and
+    `doctor`, the two commands someone runs to find out what is wrong."""
+    import json
+    (tmp_path / "active_grant.json").write_text(
+        json.dumps({"name": ["everything"], "activated_at": "2026-01-01T00:00:00+00:00"}),
+        encoding="utf-8")
+    run(cli, monkeypatch, "grant", "list")
+    out = capsys.readouterr().out
+    assert "not text" in out
+    run(cli, monkeypatch, "grant", "activate", "everything")     # and repairs
+    assert "Activated" in capsys.readouterr().out
+
+
+def test_a_concrete_key_that_is_covered_says_nothing_extra(cli, monkeypatch, no_clients_installed, capsys, tmp_path):
+    """The note above is for the case that cannot be checked. Printing it
+    when the guard *did* run would train people to ignore it."""
+    _replace_grants(tmp_path, TWO_GRANTS)
+    run(cli, monkeypatch, "grant", "activate", "read-only", "--client", "cursor-1")
+    out = capsys.readouterr().out
+    assert "only covers clients matching" not in out
+
+
 def test_help_command(cli, monkeypatch, capsys):
     run(cli, monkeypatch, "help")
     out = capsys.readouterr().out

@@ -278,7 +278,91 @@ project and no global flag, which a scoped grant can no longer read. Migration 0
 else in the product would tell you which ones went quiet. They are intact — the default grant
 reads them, and so does the CLI.
 
-**19. Response shapes changed — check this if you script against evoctx.** Additive except
+**19. Each client can have its own grant.** Installing several assistants is usually about
+giving them *different* access — read-only for one, full write for another — and that was
+impossible. One grant was active machine-wide, and grants carry a `client` glob, so a
+client-scoped grant did not scope that client: it **denied every other one**. With the
+default `client: "*"` grant this never bit, which is why it went unnoticed; it bit the
+moment anyone did the natural thing and wrote a narrow grant per assistant.
+
+```
+evoctx grant activate read-only --client "cursor*"
+evoctx grant activate everything                    # everyone else
+evoctx grant deactivate --client "cursor*"          # cursor falls back to the default
+```
+
+`active_grant.json` gains a `clients` map, additively. **The scalar `name` and
+`activated_at` keys are always present**, so an older build reading this file still parses
+it — 0.1.3 subscripts `activated_at` directly, and a file without that key fails every call
+with a `KeyError`. Present, not necessarily non-null: if you deactivate and then set only
+per-client grants, an older build correctly reads "no grant is active" and denies calls,
+because from its point of view that is exactly what the file says. It is a downgrade path
+that degrades honestly, not one that keeps working.
+
+Four rules, each of which had a wrong answer available:
+
+- **A per-client grant takes precedence; the machine-wide one is the fallback** for clients
+  with no entry.
+- **An expired entry denies that client and does not fall back.** This is the one place
+  fallback would be dangerous: a `read-only` grant for cursor with an 8-hour expiry would,
+  on falling back, silently promote cursor to the machine-wide `everything` at the exact
+  moment its restriction was supposed to take effect. Narrowing fails closed.
+- **Which entry applies is decided per client, at lookup, not per file order.** `claude*`,
+  `claude-c*` and `*-code` all match `claude-code`, and JSON preserves insertion order, so
+  "most specific" would otherwise have meant "whichever the file listed first". Exact key
+  wins; then the most literal characters; a tie is **ambiguous and denied**, naming both
+  keys, the way an ambiguous note-id prefix is refused rather than resolved by guesswork.
+- **Matching is case-insensitive on every platform**, both tiers. `fnmatch` casefolds via
+  `os.path.normcase` on Windows and not on Linux, so a synced store would otherwise resolve
+  differently on each machine. `Grant.matches_client` casefolds too, in the same change:
+  fixing only the map would have moved the divergence one check down rather than removing it.
+
+  **This widens `client:` matching on Linux**, where a grant scoped `client: "cursor"`
+  previously refused a client calling itself `Cursor` and now accepts it. Called out because
+  it is the one loosening in this release. It costs nothing an attacker did not already have
+  — client names are self-reported and unverified ([SECURITY.md §5](SECURITY.md)), so a
+  process willing to send `Cursor` was equally willing to send `cursor` — while the
+  alternative was a grant that behaves differently on two machines sharing one store.
+  Removal is the exception: `grant deactivate --client` takes the key exactly as written,
+  case included, because that one deletes.
+
+  **`scope.projects` went the other way, and this narrows on Windows.** It was on the same
+  platform-divergent `fnmatch`, so a grant scoped to `Payments` also matched a project called
+  `payments` on Windows and did not on Linux. A project name is a store key rather than a
+  self-reported string — the store holds those as two projects, and `list_projects()` returns
+  the exact spelling — so folding there let a scope reach a project the grant does not name.
+  It is now case-sensitive everywhere. If a `grants.yaml` of yours relies on the Windows
+  behaviour, fix the casing in `scope.projects` to match the project names.
+
+**`evoctx grant deactivate` with no `--client` still clears everything, per-client entries
+included.** It is the kill switch — it says every call is now denied — and preserving the
+map there would leave every client with an entry fully active after you pulled it. With
+`--client` it takes the key **exactly as written, case included**: everything else here
+folds case, but this one deletes, and a case typo silently removing a real access rule can
+promote the client it belonged to.
+
+**No message this feature prints ever tells you to remove an entry in order to fix a
+denial.** Removing one hands its client back to the machine-wide grant, which is normally
+the wider one — so the remedy for a misconfigured narrowing would be to undo the narrowing,
+and an assistant relaying the command verbatim would be asking for the access it was just
+refused. Where the fix is a removal only you can choose between, the command carries a
+`<placeholder>` and the reason names what you need in order to choose. A test asserts the
+property directly: run every remediation this feature can print, from the state that printed
+it, and no client ends up with a tool it did not have.
+
+**`grant activate --client` restores the store on any non-zero exit.** Every check it makes
+asks what the store resolves to, which is only answerable once the entry is written — so it
+writes, checks, and rolls back if the answer is bad. Exit 0 still means "this is applied and
+usable"; exit non-zero now means nothing changed.
+
+⚠️ **An evoctx older than 0.1.4 running `grant activate` on this store silently erases every
+per-client entry.** Its `activate` writes a fresh two-key file and does not know the map
+exists. There is no error, nothing in the audit log, and 0.1.4 cannot detect it afterwards —
+what it reads is a perfectly valid 0.1.3-shaped file. This cannot be fixed from this side.
+0.1.4's own `activate` merge-preserves the map, `doctor` warns whenever entries exist, and
+if you sync a store between machines, upgrade all of them.
+
+**20. Response shapes changed — check this if you script against evoctx.** Additive except
 for `list_projects()` above, but worth knowing before you upgrade:
 
 - `evoctx export --format json` gains a top-level `project_roots` key. **An export now
@@ -304,10 +388,18 @@ for `list_projects()` above, but worth knowing before you upgrade:
   every project appears in every project's scoped read, so claiming that scope now requires
   holding it (`projects: ["*"]`). Writing a note with no project at all is unaffected. If a
   client hits this, the denial names the fix: activate a wider grant.
+- `list_grants()` gains `client_key` — which per-client entry answered, or null for the
+  machine-wide grant. It now resolves **for the calling client**: answering "may I call X?"
+  from the machine default while that client's real calls run against a narrower entry
+  would be the one wrong answer this tool cannot afford.
 - `evoctx doctor` gains five checks: registered directories that are no longer present,
   notes marked both global and project-scoped, the pre-upgrade backups described below (so
   you know they exist and that they are yours to delete), the resolved workspace, and the
-  workspace folders declaring the server.
+  workspace folders declaring the server. More appear **only once a per-client grant
+  exists**: the entries and their expiry, any installed client that resolution denies,
+  which installed clients are running on the machine-wide fallback, and the older-build
+  wipe warning. Unconditionally they would fire on every fresh install, where every client
+  legitimately runs on the default.
 - **A grant whose `scope.projects` is present but empty is now rejected**, in either
   spelling — `projects: []` or a bare `projects:`. It previously parsed as *every* project,
   which is a scope failing open, and it now also decides who may write a global note. If you

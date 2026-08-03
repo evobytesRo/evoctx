@@ -102,6 +102,33 @@ provenance matters read the author, not the review stamp.** This compounds §2 �
 carrying an approval stamp is trusted more by later sessions, which is exactly the
 amplification §2 warns about.
 
+**Per-client grants inherit this exactly, as of 0.1.4.** A client can now be given its own
+grant (`evoctx grant activate read-only --client "cursor*"`), which makes the self-reported
+name load-bearing for *authorization*, not only for attribution: a process that reports a
+name matching a wider key gets the wider grant. That is not a new hole — one grant covering
+every client was never any stronger — but it is a sharper one, because the setup invites you
+to treat "cursor is read-only" as enforced. It isn't. It is enforced against a cooperative
+client that reports itself honestly, which is what every mitigation in this document assumes.
+
+Two properties of that resolution are deliberate and worth knowing: an expired per-client
+grant **denies** rather than falling back to the machine-wide one (falling back would widen
+access at the moment a restriction lapsed), and a client matching two equally specific keys
+is **denied** rather than resolved by the order they appear in the file. Both fail closed,
+including for keys that differ only in case — `Cursor` and `cursor` are one key, so a file
+holding both resolves to a refusal instead of to whichever was written first. Removal takes
+a key exactly as spelled for the same reason: a `deactivate` that matched case-insensitively
+would delete whichever of that pair came first in the file, and if the survivor were the
+wider of the two, the remediation would be the widening. The
+`deactivate` kill switch clears per-client entries along with the machine-wide grant, so
+pulling it leaves nothing active.
+
+What this does **not** do is verify that a per-client grant is one the client can actually
+use. A key whose grant carries a narrower `client` glob of its own is caught when the key
+is a concrete name; when both are globs it is not, because deciding whether two globs
+overlap is a different problem from deciding whether one matches a given name. That failure
+denies rather than widens — but it is a denial you may not expect, so `evoctx doctor`
+reports any installed client that cannot make a call.
+
 **Project-less rows are scoped, as of 0.1.4.** A note or session with no project is readable
 only by a grant that covers every project. Previously `allows_project(None)` passed
 unconditionally, so anything project-less crossed every scope boundary. A note explicitly marked
