@@ -54,6 +54,48 @@ def test_both_instruction_channels_offer_registration(server):
         )
 
 
+def test_no_channel_offers_is_global_to_start_session(server):
+    """`start_session` has no `is_global`. An assistant obeying advice to set
+    one gets a schema error.
+
+    This file has now been the stale channel three times — `instructions=` is
+    automatic and reaches every client, and it is read *before* any runtime
+    message, so getting it wrong steers the very first call. The runtime
+    refusals were parameterised per tool while this block kept one fused
+    remedy list naming both tools.
+
+    Checks proximity rather than mere presence: `is_global` is legitimate here
+    for `write_note`, so the defect is it appearing in the same sentence as
+    `start_session`.
+    """
+    import re
+    from pathlib import Path
+
+    snippet = (Path(__file__).parent.parent / "docs" / "instructions-snippet.md"
+               ).read_text(encoding="utf-8")
+    delivered = server.mcp.instructions or ""
+
+    for channel, text in (("instructions=", delivered), ("snippet", snippet)):
+        for sentence in re.split(r"(?<=[.!?])\s+", text):
+            if "start_session" in sentence and "write_note" not in sentence:
+                assert "is_global" not in sentence, (
+                    f"{channel} offers is_global as a remedy in a sentence about "
+                    f"start_session, which has no such parameter: {sentence!r}"
+                )
+
+        # The proximity rule alone would not have caught the original defect,
+        # which named BOTH tools and ended in one fused remedy list — so assert
+        # the fact positively, **anchored to start_session**. An unanchored
+        # substring passes on any sentence phrased "...with no is_global set...",
+        # anywhere in a 2 kB block, and fails on correct rewordings like
+        # "start_session does not have is_global". The anchor is what makes it
+        # about the claim rather than about the wording.
+        assert re.search(r"start_session[^.]{0,200}no\s+`?is_global`?", text), (
+            f"{channel} must state, near start_session, that it has no "
+            f"is_global — otherwise a fused remedy list reads as offering it"
+        )
+
+
 def test_every_registered_tool_is_grantable(server):
     """The two lists must not drift. A tool registered with FastMCP but absent
     from `ALL_TOOLS` is denied to everyone, permanently and silently: a
@@ -67,6 +109,7 @@ def test_every_registered_tool_is_grantable(server):
 
 
 def test_write_then_search_then_get(server):
+    server.db.upsert_project("p1")
     note_id = server.write_note("Test note", "searchable body", ctx=None, project="p1", tags=["#t"])
     hits = server.search_context("searchable", ctx=None)
     assert hits[0]["id"] == note_id
@@ -75,6 +118,7 @@ def test_write_then_search_then_get(server):
 
 
 def test_session_lifecycle_threads_notes(server):
+    server.db.upsert_project("p1")
     started = server.start_session(ctx=None, project="p1", intent="test run")
     assert started["open"] is True
     assert started["client"] == "pytest"
@@ -85,7 +129,7 @@ def test_session_lifecycle_threads_notes(server):
     assert [n["title"] for n in ended["notes"]] == ["mid-session note"]
 
     # after ending, notes are no longer attached to any session
-    server.write_note("post-session note", "y", ctx=None)
+    server.write_note("post-session note", "y", ctx=None, project="p1")
     sessions = server.recent_sessions(ctx=None)
     assert len(sessions) == 1
     assert [n["title"] for n in sessions[0]["notes"]] == ["mid-session note"]

@@ -18,7 +18,8 @@ def entries(db, **kw):
 
 
 def test_reads_and_writes_logged(engine, db):
-    note_id = engine.t_write_note("clientA", "Title", "content", None, None, None)
+    db.upsert_project("p1")
+    note_id = engine.t_write_note("clientA", "Title", "content", "p1", None, None)
     engine.t_search_context("clientA", "content", None, 10)
     engine.t_get_by_id("clientA", note_id)
     engine.t_list_projects("clientA")
@@ -55,7 +56,8 @@ def test_denied_calls_logged(engine, db):
 
 
 def test_session_tools_logged(engine, db):
-    s = engine.t_start_session("clientA", None, "intent line")
+    db.upsert_project("p1")
+    s = engine.t_start_session("clientA", "p1", "intent line")
     engine.t_end_session("clientA", s["id"], "done")
     log = entries(db, action="write")
     assert [e["tool"] for e in log] == ["end_session", "start_session"]

@@ -24,6 +24,16 @@ from .resolve import NONE, current_directory, resolve_workspace
 T = TypeVar("T")
 
 
+def _tail(text: str) -> str:
+    """A hint, trimmed, for use at the END of a message and nowhere else.
+
+    It routinely ends in the command the user is meant to copy — `evoctx init
+    --name myrepo` — so anything spliced after it becomes part of the argument
+    by eye. Terminating it was the first attempt and made `myrepo.` look like
+    the name. Putting it last is the fix that has no such edge."""
+    return (text or "").strip()
+
+
 class PolicyDenied(Exception):
     """Tool call not covered by the active grant. Message is user-actionable."""
 
@@ -219,12 +229,116 @@ class PolicyEngine:
 
     # ── scoped writes ─────────────────────────────────────────────────────────
 
-    def check_write_project(self, grant: Grant, project: str | None) -> None:
+    def check_write_project(self, grant: Grant, project: str | None,
+                            thing: str = "note") -> None:
         if not grant.allows_project(project):
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' does not cover project "
-                f"'{project}' (scope: {grant.projects}). The note was NOT saved."
+                f"'{project}' (scope: {grant.projects}). The {thing} was NOT saved."
             )
+
+    def resolve_write_project(self, grant: Grant, project: str | None,
+                              is_global: bool, tool: str) -> str | None:
+        """The project a write lands under — refusing rather than guessing.
+
+        Cases, in order:
+
+        - **Global AND a named project is refused.** They are mutually
+          exclusive: "this spans every project" and "this belongs to that one"
+          are contradictory claims. Returning None for a global write without
+          checking would *silently drop* the name the caller gave and publish
+          the note into every project's scoped read — a widening nobody asked
+          for. `db.add_note` raises `ConflictingNoteScope` on the same
+          combination, but it never sees it once the project has been nulled
+          here, so this check cannot be delegated downward.
+        - **A name that does not exist is refused.** Until resolution existed
+          this would have been a trap: the caller had no way to learn the right
+          name, so refusing would have converted stranded notes into failed
+          writes. Now `list_projects()` answers it, so an invented name is a
+          mistake with a fix, and the refusal names the workspace project and
+          the names this grant can see.
+        - **A null project takes the resolved workspace**, when one resolved.
+          Otherwise `recent_sessions(project=…)` keeps missing sessions that
+          plainly belong to a project, and notes stay unattributable.
+        - **A null project with nothing resolved is refused.** Leaving it NULL
+          is what conflates "the user asked for a general note" with "nobody
+          set a project", which is the defect this release exists to remove.
+
+        `tool` shapes the advice, because the two callers do not have the same
+        parameters: `start_session` has no `is_global`, and telling a session
+        to "mark the note global" is both incoherent and unactionable — the
+        assistant obeying it gets a schema error.
+
+        Returns the project to write under. Raises `PolicyDenied` rather than
+        returning None-and-hoping, because a refused write must be loud —
+        silently filing a note nowhere is the data loss this guards.
+        """
+        # Blank is unset, not a name. `db.add_note` tests truthiness while this
+        # tested `is not None`, so a client serialising an unset optional as ""
+        # got a denial quoting `project=''` — which reads as a bug report about
+        # itself — where before phase 4 it wrote a global note. Normalising here
+        # keeps the two guards agreeing and stops '   ' being echoed as a name.
+        if project is not None and not project.strip():
+            project = None
+        global_is_an_option = tool == "write_note"
+        thing = "note" if global_is_an_option else "session"
+        or_global = (" or set is_global if it deliberately spans every project"
+                     if global_is_an_option else "")
+
+        if is_global:
+            if project is not None:
+                raise PolicyDenied(
+                    f"Denied: is_global and project='{project}' are mutually "
+                    f"exclusive — global means the note belongs to no single "
+                    f"project and appears under every one. Nothing was saved. "
+                    f"Send the project, or send is_global, not both."
+                )
+            return None
+
+        # Scoped to what this grant may see. `db.list_projects()` would
+        # enumerate the whole store to a caller narrowed away from most of it,
+        # which is the existence leak `workspace()` and `get_project` are both
+        # careful to avoid — and it would be a NEW leak, since before this the
+        # out-of-scope case only ever echoed the name the caller already had.
+        if project is not None:
+            if not self.db.project_exists(project):
+                known = ", ".join(self.list_projects(grant)) or "none yet"
+                block = self.workspace(grant)
+                here = block.get("project")
+                # "register this workspace" only when it is not registered —
+                # otherwise it is dead advice contradicted by the sentence
+                # right after it, which names the project this workspace IS.
+                register = "" if here else ", register this workspace"
+                where = _tail(f"This workspace is '{here}'." if here
+                              else block.get("hint", ""))
+                raise PolicyDenied(
+                    f"Denied: no project named '{project}'. Known projects: "
+                    f"{known}. No {thing} was created — use an existing name"
+                    f"{register}{or_global}."
+                    + (f" {where}" if where else "")
+                )
+            return project
+
+        block = self.workspace(grant)
+        resolved = block.get("project")
+        if resolved:
+            return resolved
+        # The hint carries WHY nothing resolved, and the two reasons need
+        # different fixes: an unregistered directory wants registering, while a
+        # directory whose project is outside this grant wants a wider grant.
+        # `workspace()` has already written the right one — and deliberately
+        # without naming an out-of-scope project, since out of scope reads as
+        # nonexistent. Re-deriving it here would either duplicate that logic or
+        # leak the name it exists to withhold.
+        hint = _tail(block.get("hint") or "")
+        raise PolicyDenied(
+            f"Denied: no project was given and this workspace resolves to "
+            f"none, so there is nowhere to file this {thing}. Nothing was "
+            f"saved. Name a project from list_projects(){or_global}. There is "
+            f"no project-less {thing} any more: a record filed under nothing "
+            f"is one nobody finds again, which is what this release removed."
+            + (f" {hint}" if hint else "")
+        )
 
     def check_write_global(self, grant: Grant, is_global: bool) -> None:
         """A scoped grant may not write a note that spans every project.
@@ -237,16 +351,17 @@ class PolicyEngine:
         (`get_project`, `search_context(project=…)`), which is precisely what
         the scope exists to prevent.
 
-        Writing project-less notes stays allowed; only claiming global scope
-        requires holding global scope.
+        Only claiming global scope requires holding it. Writing a note with
+        no project at all used to be the other way past this; since 0.1.4 step
+        4 `resolve_write_project` refuses that too, so a scoped grant has no
+        remaining route to content every other grant can read.
 
-        What this does NOT close, so nobody reads it as more than it is: a
-        scoped grant can still write a note with no project and no global
-        flag, and `allows_project(None)` means every other grant sees it on an
-        unscoped `search_context()` or `get_by_id()`. Content can still cross
-        scopes that way — that is the existing grant model, unchanged. This
-        refuses only the *claim* of global scope, which is what pulls a note
-        into every project's scoped read.
+        Scope of this check, so nobody reads it as more than it is: it refuses
+        the *claim* of global scope, which is what pulls a note into every
+        project's scoped read. Notes written before 0.1.4 with no project are
+        untouched and still visible to every grant on an unscoped
+        `search_context()` or `get_by_id()` — that is the existing grant model,
+        and nothing here narrows it retroactively.
         """
         if is_global and not grant.allows_all_projects():
             raise PolicyDenied(
@@ -421,8 +536,16 @@ class PolicyEngine:
                      project: str | None, tags: list[str] | None,
                      session_id: str | None, is_global: bool = False) -> str:
         grant = self._guard(client, "write_note")
-        self.check_write_project(grant, project)
         self.check_write_global(grant, is_global)
+        # resolution BEFORE the scope check, so a defaulted project is scoped
+        # like any other: `allows_project(None)` is always True, so checking
+        # first would wave through a null that then resolves to a project this
+        # grant does not cover. A scope-denied default must fail loudly rather
+        # than fall back to NULL, which would file the note nowhere to dodge
+        # an error.
+        project = self.resolve_write_project(grant, project, is_global,
+                                             tool="write_note")
+        self.check_write_project(grant, project)
         (title, content), hits = self._redact_inbound(grant, title, content)
         note_id = self.db.add_note(title, content, project=project, tags=tags,
                                    session_id=session_id, author_client=client,
@@ -438,7 +561,9 @@ class PolicyEngine:
 
     def t_start_session(self, client: str, project: str | None, intent: str | None) -> dict:
         grant = self._guard(client, "start_session")
-        self.check_write_project(grant, project)
+        project = self.resolve_write_project(grant, project, is_global=False,
+                                             tool="start_session")
+        self.check_write_project(grant, project, thing="session")
         (intent,), hits = self._redact_inbound(grant, intent) if intent else ((intent,), 0)
         session_id = self.db.start_session(project=project, intent=intent, client=client)
         result = self._reread_session(session_id)

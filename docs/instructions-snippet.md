@@ -82,8 +82,8 @@ MUST DO, every session:
   `workspace` block naming the project this directory belongs to — **use that name, never
   guess one.** If `workspace.project` is null, nothing matched: show the user
   `workspace.hint` and offer to register this workspace — **never invent a name**, because a
-  note filed under a name that does not exist is stranded and invisible under the real
-  project. If they agree, call `register_project(name, overview, ...)`: read the workspace
+  name that does not exist is refused and nothing is saved, so guessing costs you the call.
+  If they agree, call `register_project(name, overview, ...)`: read the workspace
   first (README, manifests, entry points), since a description paraphrased from the directory
   name reads as knowledge to every later session. The server binds its own directory — there
   is no path argument, and `workspace.suggested_name` is the name to propose. If
@@ -91,12 +91,17 @@ MUST DO, every session:
   `default`, the name is the launching folder's — pass a name explicitly when the work
   targets one of the repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and
-  interrupted sessions stay visible. Then `recent_sessions(project)` — open entries were
+  interrupted sessions stay visible. It follows the same project rule as `write_note()`: an
+  unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
+  you must name a project or register the workspace — `start_session` has **no `is_global`**,
+  since a session happens somewhere. Then `recent_sessions(project)` — open entries were
   likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
 - **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
   an approach that contradicts a stored decision without surfacing the conflict.
 - **As you go:** `write_note()` for non-obvious decisions/gotchas immediately, don't batch to
-  the end (notes are auto-linked to the session).
+  the end (notes are auto-linked to the session). A project name that doesn't exist is
+  **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
+  if nothing resolves, name one, register the workspace, or set `is_global`.
 - **End:** call `end_session(summary)` — what was built, decided, and left open.
 - If a call is denied, call `list_grants()` and relay the `evoctx` command from the error to
   the user.

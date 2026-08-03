@@ -194,13 +194,13 @@ MUST DO, every session:
 
 | Tool | When the assistant uses it |
 |---|---|
-| `start_session(project?, intent?)` | First call of a session — registers the work session; every `write_note` after is linked to it |
+| `start_session(project?, intent?)` | First call of a session — registers the work session; every `write_note` after is linked to it. Same project rule as `write_note` |
 | `recent_sessions(project?, limit?)` | Right after — see what recent sessions did; open ones were likely interrupted, their notes are the only record |
 | `list_projects()` | Discover registered projects, and which one this workspace is — returns `projects` plus a `workspace` block that resolves the working directory to a project, or says plainly that nothing matched |
 | `get_project(name)` | Load overview, conventions, open questions, recent notes |
 | `search_context(query, project?, limit?)` | Find relevant notes mid-work |
 | `get_by_id(id)` | Full content after a search hit |
-| `write_note(title, content, project?, tags?)` | Record decisions and observations as you go |
+| `write_note(title, content, project?, tags?)` | Record decisions and observations as you go. An unknown project name is refused and nothing is saved; an unset one takes the workspace's own |
 | `end_session(summary)` | Last call — closes the session with what was built/decided/open |
 | `register_project(name, overview, ...)` | Register this workspace as a project. No path argument — the server binds its own working directory; the assistant supplies only the description |
 | `list_grants()` | What the active grant allows — so "do you have access to X?" gets an honest answer |

@@ -53,6 +53,35 @@ before tagging:
    trusted publishing, and cuts the GitHub release.
 8. Install from PyPI into a clean venv and check `evoctx version`.
 
+## Change the prose in the same commit as the code
+
+Every behaviour change lands with its documentation, in one commit. Not as a follow-up, not
+"once it settles". A claim and the thing it describes living in different places, with only one
+edited, is the single most common defect this project produces — 0.1.4's phase 3 took ten review
+rounds, and **every behavioural bug was found in the first three; the other seven were sentences
+describing behaviour the code no longer had.**
+
+Sweep by **audience**, not by file. One file often serves several, and marking it "done" after
+the first is how the rest survive:
+
+| | Audience | Where |
+|---|---|---|
+| a | Human reading docs | `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, `docs/`, `examples/` |
+| b | Human reading CLI output | argparse `help=` **and** the long `evoctx help` block — separate code paths |
+| c | Model reading tool schemas | every tool docstring, **including its `Returns:` contract** |
+| d | Model reading server instructions | `FastMCP(instructions=...)` — automatic, reaches every client |
+| e | Model reading pasted config | `docs/instructions-snippet.md` |
+| f | Model reading tool **output** | `hint`, `note`, `{"error": ...}`, `PolicyDenied` text |
+
+(f) is the one that gets missed, and it is the most authoritative thing the model sees: it
+answers the question just asked, where (d) is background. It does not exist until a tool is
+called, so no amount of reading source or docs surfaces it — **verify it by executing the call.**
+
+Where two channels must agree, pin them with a test rather than intending to remember:
+`test_both_instruction_channels_offer_registration` and
+`test_prior_tool_sets_covers_the_previous_release` both exist because a comment could not
+enforce what it asserted.
+
 ## Design principles, if you're extending this
 
 - **CLI/MCP parity.** Every MCP tool gets a CLI mirror. The store must stay human-operable, not

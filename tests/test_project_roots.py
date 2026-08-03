@@ -982,11 +982,16 @@ def test_a_scoped_grant_cannot_write_a_global_note(db, tmp_path):
         engine.t_write_note("c", "t", "x", None, None, None, is_global=True)
     assert db.list_notes() == [], "nothing may be written on a denial"
 
-    # a project-less note is still fine — only claiming global scope is not
-    engine.t_write_note("c", "plain", "x", None, None, None)
+    # A project-less note is no longer a way through either: since 0.1.4 step 4
+    # a write with no project and no global flag is refused when nothing
+    # resolves, because filing it nowhere is the silence-conflated-with-intent
+    # defect this release removes. Scoped to `alpha`, writing under that name
+    # is the path that remains open.
+    db.upsert_project("alpha")
+    engine.t_write_note("c", "plain", "x", "alpha", None, None)
     assert len(db.list_notes()) == 1
 
-    # and a grant that holds every project may write one
+    # and a grant that holds every project may write a global one
     engine.grants.activate("wide")
     engine.t_write_note("c", "spans all", "x", None, None, None, is_global=True)
     assert len(db.list_notes()) == 2

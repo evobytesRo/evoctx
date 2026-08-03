@@ -175,7 +175,33 @@ one omitting it would deny the tool on every fresh install. The 0.1.2 exposure i
 either way, so it decides nothing — and a fresh store has no deliberately-narrow grant to
 respect. Existing files are untouched; `grant upgrade` is opt-in.
 
-**13. Response shapes changed — check this if you script against evoctx.** Additive except
+**13. A project name that does not exist is now refused, not filed.** `write_note()` and
+`start_session()` reject an unknown non-empty project name and save nothing, naming the
+workspace's own project and the known names in the refusal.
+
+This is the backstop the rest of the release was building toward, and it could not have shipped
+earlier: before resolution existed, an assistant had no way to *learn* the right name, so
+refusing would have converted stranded notes into failed writes. Now `list_projects()` answers
+the question, so an invented name is a mistake with a fix.
+
+**An unset project takes the workspace's own.** Otherwise `recent_sessions(project=…)` keeps
+missing sessions that plainly belong to a project. If nothing resolves, that is refused too —
+the two honest options are naming a project or marking the note global. Leaving it NULL is what
+conflated *"the user asked for a general note"* with *"nobody set a project"*, which is the
+defect items 4 and 6 exist to remove; this closes the last path that still produced it.
+
+Resolution happens **before** the scope check, deliberately: `allows_project(None)` is always
+True, so checking first would wave through a null that then resolves to a project the grant does
+not cover. A scope-denied default fails loudly rather than falling back to NULL, which would
+file the note nowhere to dodge an error.
+
+**What this breaks:** an MCP client that wrote notes with no project, or under a name it made
+up, now gets a denial instead of a silent success. That is the point — those notes were
+invisible under the real project — but it is a behaviour change, not an addition. The CLI is
+unaffected: `evoctx add --project whatever` still writes whatever you tell it, because grants
+and this refusal govern the MCP path, not your own filesystem.
+
+**14. Response shapes changed — check this if you script against evoctx.** Additive except
 for `list_projects()` above, but worth knowing before you upgrade:
 
 - `evoctx export --format json` gains a top-level `project_roots` key. **An export now

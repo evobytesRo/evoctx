@@ -66,5 +66,6 @@ def test_policy_write_note_tags_client(db, tmp_path):
     from evoctx.grants import GrantStore
     from evoctx.policy import PolicyEngine
     engine = PolicyEngine(db, GrantStore(tmp_path))
-    note_id = engine.t_write_note("claude-code", "t", "x", None, None, None)
+    db.upsert_project("p1")
+    note_id = engine.t_write_note("claude-code", "t", "x", "p1", None, None)
     assert db.get_note(note_id)["author_client"] == "claude-code"

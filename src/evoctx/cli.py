@@ -10,6 +10,10 @@ Mirrors of the MCP tools — everything the AI can do, you can do:
   evoctx write-note "Title" --project NAME --tags "#decision" Same as MCP write_note() (alias: add)
                             [--global]                        Note spans every project (not the same as no project)
   evoctx start-session [--project NAME] [--intent "..."]      Same as MCP start_session()
+
+  (One deliberate difference: the MCP tools refuse a project name that does not
+  exist; these write what you tell them. Grants and that refusal govern what a
+  connected AI may do, not what you may do with your own store.)
   evoctx end-session "summary" [--id ID]                      Same as MCP end_session() (default: latest open)
   evoctx recent-sessions [--project NAME] [--limit N]         Same as MCP recent_sessions()
   evoctx list-grants [--client NAME]                          Same as MCP list_grants()
