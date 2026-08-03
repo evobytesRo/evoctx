@@ -37,11 +37,23 @@ def test_delete_notes_by_tag(db):
 
 
 def test_delete_project_keeps_notes_by_default(db):
+    """"Kept, unlinked" — and since 0.1.4 that is literally what happens.
+
+    The notes used to keep pointing at the deleted name, which is a phantom by
+    the definition this release uses: `doctor` would report a state the product
+    itself created and blessed, permanently, with remediation advice that did
+    not apply. Sessions were never cleared at all.
+    """
     db.upsert_project("p1")
-    db.add_note("a", "x", project="p1")
+    note_id = db.add_note("a", "x", project="p1")
+    session_id = db.start_session(project="p1")
     assert db.delete_project("p1") is True
     assert db.get_project("p1") is None
-    assert len(db.list_notes(project="p1")) == 1  # note survives, just unlinked from a project record
+
+    assert db.get_note(note_id) is not None, "the note survives"
+    assert db.get_note(note_id)["project"] is None, "and is genuinely unlinked"
+    assert db.get_session(session_id)["project"] is None
+    assert db.phantom_projects() == {}, "nothing is left pointing at a dead name"
 
 
 def test_delete_project_with_notes_cascades(db):

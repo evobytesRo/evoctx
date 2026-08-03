@@ -102,6 +102,12 @@ provenance matters read the author, not the review stamp.** This compounds §2 �
 carrying an approval stamp is trusted more by later sessions, which is exactly the
 amplification §2 warns about.
 
+**Project-less rows are scoped, as of 0.1.4.** A note or session with no project is readable
+only by a grant that covers every project. Previously `allows_project(None)` passed
+unconditionally, so anything project-less crossed every scope boundary. A note explicitly marked
+**global** is different and still reaches scoped grants — it claims to apply to every project,
+including theirs.
+
 ## 6. The audit log is an accountability record, not tamper-proof forensics
 
 `audit_log` is append-only, enforced by SQL triggers that raise on `UPDATE`/`DELETE`. That stops

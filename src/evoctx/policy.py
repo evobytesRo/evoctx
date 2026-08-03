@@ -101,8 +101,35 @@ class PolicyEngine:
 
     # ── scoped reads ──────────────────────────────────────────────────────────
 
+    def _project_readable(self, grant: Grant, project: str | None,
+                          is_global: bool = False) -> bool:
+        """Whether a row's project puts it inside this grant's scope.
+
+        `allows_project(None)` is True unconditionally, which made every
+        project-less row readable by every scoped grant. That was a tolerable
+        edge while such rows were only legacy notes from before 0.1.4 — and
+        `check_write_global`'s docstring said so out loud. It stopped being an
+        edge when `delete-project` began producing them in bulk: deleting one
+        project made its notes and session intents readable by a grant scoped
+        to a different one, which is precisely the widening that same check
+        refuses on the write side.
+
+        The distinction the release already draws is the one that fixes it. A
+        **global** note says "this applies to every project", so it applies to
+        the scoped grant's project too and stays visible. A **project-less**
+        note says nothing about where it belongs, so it may only be read by a
+        grant that covers everything. Silence is not consent to cross a scope
+        boundary — the same reasoning as refusing a project-less write.
+        """
+        if project is not None:
+            return grant.allows_project(project)
+        if is_global:
+            return True
+        return grant.allows_all_projects()
+
     def _note_visible(self, grant: Grant, note: dict) -> bool:
-        if not grant.allows_project(note.get("project")):
+        if not self._project_readable(grant, note.get("project"),
+                                      bool(note.get("is_global"))):
             return False
         return not any(t in grant.exclude_tags for t in note.get("tags", []))
 
@@ -222,7 +249,9 @@ class PolicyEngine:
             return []
         result = self._fetch_filtered(
             lambda n, o: self.db.recent_sessions(project=project, limit=n, offset=o),
-            lambda s: grant.allows_project(s.get("project")),
+            # sessions carry no global flag — a project-less one belongs
+            # nowhere, so only a grant covering everything may read it
+            lambda s: self._project_readable(grant, s.get("project")),
             limit,
         )
         return self._out(grant, result)
@@ -345,11 +374,12 @@ class PolicyEngine:
 
         `check_write_project` cannot catch this: a global note carries
         `project=None`, and `allows_project(None)` returns True by design, so
-        that project-less notes stay visible to scoped grants. That is the
-        right rule for reads — but it means a grant scoped to one project
-        could write content that lands in *every* project's scoped read
-        (`get_project`, `search_context(project=…)`), which is precisely what
-        the scope exists to prevent.
+        the project column alone cannot tell a scoped write from a global one.
+        A grant scoped to one project could otherwise write content that lands
+        in *every* project's scoped read (`get_project`,
+        `search_context(project=…)`), which is precisely what the scope exists
+        to prevent — and unlike a project-less note, a global one genuinely
+        does reach scoped grants, by design (`_project_readable`).
 
         Only claiming global scope requires holding it. Writing a note with
         no project at all used to be the other way past this; since 0.1.4 step
@@ -358,10 +388,11 @@ class PolicyEngine:
 
         Scope of this check, so nobody reads it as more than it is: it refuses
         the *claim* of global scope, which is what pulls a note into every
-        project's scoped read. Notes written before 0.1.4 with no project are
-        untouched and still visible to every grant on an unscoped
-        `search_context()` or `get_by_id()` — that is the existing grant model,
-        and nothing here narrows it retroactively.
+        project's scoped read. The other half — a note with no project at all —
+        is handled on the read side by `_project_readable`, which since 0.1.4
+        withholds project-less rows from any grant that does not cover every
+        project. That narrowing applies retroactively to notes written before
+        0.1.4; see CHANGELOG item 16 and SECURITY.md §5.
         """
         if is_global and not grant.allows_all_projects():
             raise PolicyDenied(
@@ -574,6 +605,35 @@ class PolicyEngine:
 
     def t_end_session(self, client: str, session_id: str, summary: str) -> dict:
         grant = self._guard(client, "end_session")
+        # Scope the session before touching it. This path had no check at
+        # all, while `recent_sessions` refused to list the same session —
+        # `get_note` closes exactly that asymmetry for notes, and denies by
+        # returning nothing rather than explaining, so a caller cannot tell
+        # "out of scope" from "no such id".
+        #
+        # Reachable window, stated precisely because the obvious reading
+        # overstates it: the MCP tool takes no session id, it uses the one
+        # `start_session` recorded, and that call is already scope-checked. So
+        # this fires when a session opened under a wider grant is still open
+        # when a narrower grant is activated — not for a caller naming another
+        # project's session, which the tool surface does not allow.
+        existing = self.db.get_session(session_id)
+        if existing is None or not self._project_readable(
+                grant, existing.get("project")):
+            # Audited even though it is denied: `t_get_by_id` logs its blocked
+            # reads for the same reason, and SECURITY.md calls the audit log
+            # the accountability record. An attempt to close and read a
+            # session outside scope is exactly what it should hold. No ids in
+            # the record — that would put in the log what the denial withholds
+            # from the caller.
+            # "denied", not "write" — `_guard` established that vocabulary for
+            # a refused attempt, and `evoctx audit --action denied` is the
+            # query a user runs to ask what a client tried and could not do.
+            # Logging it as a write makes it indistinguishable at a glance
+            # from a successful close in the one record SECURITY.md calls the
+            # accountability record.
+            self._log(client, "end_session", "denied", grant, None, [], None)
+            return {"error": "No session with that id is open for this client."}
         (summary,), hits = self._redact_inbound(grant, summary)
         self.db.end_session(session_id, summary)
         result = self._reread_session(session_id)

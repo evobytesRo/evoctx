@@ -157,6 +157,9 @@ installed, `evoctx install claude-code` detects it and prints a `claude mcp add 
 command for one-time global registration instead. Full explanation: [docs/clients.md](docs/clients.md).
 
 `doctor` checks package/store/schema/FTS5/grant/server-command/client-configs, plus:
+notes or sessions filed under a name that is not a project (they are invisible under the real
+one — `evoctx project-merge` moves them), which projects have no directory on this machine,
+how many notes a scoped grant can no longer read,
 store size and note count, days since the last note or session (a configured client with no
 recent activity usually means the instructions snippet isn't actually being followed), and
 whether the store folder sits inside OneDrive/iCloud/Dropbox/Google Drive — those sync an
@@ -217,6 +220,7 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 |---|---|
 | `list_projects()` | `evoctx list-projects` |
 | `register_project(...)` | `evoctx init [--name NAME]` |
+| *(none — human-only)* | `evoctx project-merge WRONG RIGHT` — move notes **and** sessions off an invented project name |
 | `get_project(name)` | `evoctx get-project NAME` |
 | `search_context(...)` | `evoctx search-context QUERY [--project NAME] [--limit N]` (alias: `search`) |
 | `get_by_id(id)` | `evoctx get-by-id ID` — ID prefix is enough (alias: `show`) |

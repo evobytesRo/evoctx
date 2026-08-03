@@ -1322,6 +1322,147 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
+    def merge_project(self, wrong: str, right: str) -> dict:
+        """Reattach everything filed under `wrong` to `right`, then drop it.
+
+        The remediation half of this release. Refusing invented names stops new
+        phantoms; it does nothing for the notes and sessions already filed
+        under one, which are invisible under the real project and reachable
+        only by searching for the invented name — if you happen to know it.
+
+        **Notes and sessions move together, and there is no flag to split
+        them.** A session records what a stretch of work was for and its notes
+        record what came out of it; moving one without the other leaves a
+        session whose notes are elsewhere, which is a worse state than the one
+        being fixed and cannot be undone by running this again. A flag for it
+        would be a tool for stranding sessions.
+
+        `wrong` need not exist as a project row — that is the normal case. A
+        phantom is a *name on notes* that was never registered, so requiring it
+        to exist would refuse exactly the situation this exists for. `right`
+        must exist, because merging into a second invented name just moves the
+        problem.
+
+        Roots are not moved. A phantom has none (nothing can bind a root to a
+        project that does not exist), and if `wrong` is a real project being
+        folded into another, its directories are a claim about where code
+        lives that the user should re-make deliberately with `init`, not have
+        silently transferred.
+        """
+        if wrong == right:
+            raise ValueError("a project cannot be merged into itself")
+        if not self.project_exists(right):
+            raise NoSuchProject(
+                f"no project named '{right}' — merge into a project that "
+                f"exists, or create it first"
+            )
+        with self.conn:
+            notes = self.conn.execute(
+                "UPDATE notes SET project = ? WHERE project = ?", (right, wrong)
+            ).rowcount
+            sessions = self.conn.execute(
+                "UPDATE sessions SET project = ? WHERE project = ?", (right, wrong)
+            ).rowcount
+            # Only if it was a real project. A phantom has no row to delete and
+            # no roots; `delete_project` here would be a no-op with a
+            # misleading name.
+            self.conn.execute("DELETE FROM project_roots WHERE project = ?", (wrong,))
+            removed = self.conn.execute(
+                "DELETE FROM projects WHERE name = ?", (wrong,)
+            ).rowcount > 0
+        return {"notes": notes, "sessions": sessions, "project_removed": removed}
+
+    def count_for_project(self, name: str) -> dict:
+        """How many notes and sessions carry this exact project name.
+
+        A count, not a fetch. `list_notes(project=…)` loads and json-decodes
+        every note plus every global one so a caller can filter them back out,
+        and `recent_sessions` fires one query per session to attach its notes —
+        N+1 to produce a number. This runs before an irreversible action, which
+        is the one place a wrong or capped count matters most.
+        """
+        notes = self.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE project = ?", (name,)).fetchone()[0]
+        sessions = self.conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE project = ?", (name,)).fetchone()[0]
+        return {"notes": notes, "sessions": sessions}
+
+    def phantom_projects(self) -> dict[str, dict]:
+        """Names that notes or sessions are filed under, with no project row.
+
+        The damage already done, countable. Deliberately covers sessions as
+        well as notes: `start_session` accepted an invented name for just as
+        long as `write_note` did, and a session missed by the count is one the
+        merge would silently leave behind.
+
+        `by_client` counts the ones an **assistant** filed — the residue of the
+        bug step 4 fixed. The rest were written by a human through the CLI
+        under a name they chose, which this release explicitly keeps working:
+        grants and the refusal govern the MCP path, not what you may do with
+        your own store. Both are reported; only `by_client` is a fault, because
+        only it is something the user did not choose. A NULL `author_client`
+        predates the column, so it is counted as not-assistant — an unknown
+        origin is not evidence of one — and `sessions.client` defaults to
+        `'unknown'`, which gets the same treatment for the same reason.
+        """
+        rows = self.conn.execute("""
+            SELECT name, SUM(notes), SUM(sessions), SUM(by_client) FROM (
+                SELECT project AS name, COUNT(*) AS notes, 0 AS sessions,
+                       SUM(CASE WHEN author_client IS NOT NULL
+                                 AND author_client != 'cli'
+                                THEN 1 ELSE 0 END) AS by_client
+                  FROM notes
+                 WHERE project IS NOT NULL
+                   AND project NOT IN (
+                       SELECT name FROM projects WHERE name IS NOT NULL)
+                 GROUP BY project
+                UNION ALL
+                SELECT project AS name, 0 AS notes, COUNT(*) AS sessions,
+                       SUM(CASE WHEN client NOT IN ('cli', 'unknown')
+                                THEN 1 ELSE 0 END) AS by_client
+                  FROM sessions
+                 WHERE project IS NOT NULL
+                   AND project NOT IN (
+                       SELECT name FROM projects WHERE name IS NOT NULL)
+                 GROUP BY project
+            ) GROUP BY name ORDER BY name
+        """).fetchall()
+        return {r[0]: {"notes": r[1], "sessions": r[2], "by_client": r[3]}
+                for r in rows}
+
+    def unscoped_notes(self) -> int:
+        """Notes with no project and no global flag.
+
+        Since 0.1.4 these are readable only by a grant covering every project
+        (`_project_readable`). Migration 005 adds `is_global` with DEFAULT 0
+        and does not backfill, so every note written before it is in this set,
+        and there is no command that marks an existing note global. Without a
+        count, nothing in the product would ever tell a user which of their
+        notes stopped reaching a scoped client — which is the same shape as
+        the phantom problem this release exists to fix.
+        """
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM notes WHERE project IS NULL AND is_global = 0"
+        ).fetchone()[0]
+
+    def projects_without_roots(self, machine: str | None = None) -> list[str]:
+        """Projects with no directory bound on this machine.
+
+        Not a fault on its own — a topic-only project never has one, and every
+        project predates roots on upgrade day. It is reported so a user can see
+        which projects resolution will never match, not so they can be nagged.
+        """
+        machine = machine or this_machine()
+        # Templates are `projects` rows prefixed with `_` by design and can
+        # never hold a directory, so telling the user to run `init` in one is
+        # advice that cannot be followed.
+        return [r[0] for r in self.conn.execute(
+            r"SELECT name FROM projects WHERE name NOT LIKE '\_%' ESCAPE '\' "
+            "AND name NOT IN "
+            "(SELECT project FROM project_roots WHERE machine = ?) ORDER BY name",
+            (machine,),
+        ).fetchall()]
+
     def delete_project(self, name: str, with_notes: bool = False) -> bool:
         # One transaction across all three deletes. Previously the notes
         # delete committed on its own, so a crash before the rest left the
@@ -1340,6 +1481,21 @@ class Database:
                 deleted_notes = self.conn.execute(
                     "DELETE FROM notes WHERE project = ?", (name,)
                 ).rowcount
+            else:
+                # Actually unlink them. The CLI has always promised "kept,
+                # unlinked" and the notes kept pointing at the deleted name
+                # instead — which is a phantom by the definition this release
+                # uses, so `doctor` would report a state the product created
+                # and blessed, permanently, with remediation advice that does
+                # not apply.
+                self.conn.execute(
+                    "UPDATE notes SET project = NULL WHERE project = ?", (name,))
+            # Sessions are unconditional: `--with-notes` deletes notes, never
+            # sessions, so branching this left every session an assistant ever
+            # opened under the name pointing at a project that no longer
+            # exists — the same phantom, reached through the other branch.
+            self.conn.execute(
+                "UPDATE sessions SET project = NULL WHERE project = ?", (name,))
             self.conn.execute("DELETE FROM project_roots WHERE project = ?", (name,))
             cur = self.conn.execute("DELETE FROM projects WHERE name = ?", (name,))
         return cur.rowcount > 0 or deleted_notes > 0

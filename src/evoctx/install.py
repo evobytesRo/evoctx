@@ -600,6 +600,98 @@ def _this_machine() -> str:
     return this_machine()
 
 
+def _check_phantom_projects(checks: list, db) -> None:
+    """Notes and sessions filed under a name that is not a project.
+
+    Since 0.1.4 step 4 this cannot happen through the MCP path any more — but
+    refusing new ones does nothing for the ones already there, and they are
+    the reason the refusal exists. A phantom is invisible under the real
+    project and findable only by searching for the invented name, which the
+    user has no reason to know. Nothing else in the product would ever
+    mention them.
+
+    **Only an assistant's are a fault.** `doctor` exits non-zero on any FAIL,
+    so failing on every phantom would turn the health check red for two states
+    this product creates and documents as correct: a name a human typed into
+    `evoctx add --project`, which the release explicitly keeps working, and —
+    before this was fixed — notes left by `delete-project`. Failing a correct
+    configuration is the mistake `_check_projects_without_roots` was written to
+    avoid; this check must not re-commit it.
+
+    So: assistant-written phantoms FAIL, because they are the residue of the
+    bug step 4 fixed and nobody chose them. Human-written ones are reported at
+    PASS — visible, with the same remedy, but not an error, because a name you
+    typed yourself is a decision rather than a defect.
+    """
+    phantoms = db.phantom_projects()
+    if not phantoms:
+        checks.append(("phantom projects", True,
+                       "every note and session is filed under a real project"))
+        return
+    listed = "; ".join(
+        f"{name} ({v['notes']} note(s), {v['sessions']} session(s))"
+        for name, v in list(phantoms.items())[:3]
+    )
+    more = f" and {len(phantoms) - 3} more" if len(phantoms) > 3 else ""
+    first = next(iter(phantoms))
+    by_client = sum(v["by_client"] for v in phantoms.values())
+    origin = (f"{by_client} of them written by a connected assistant, which is "
+              f"the case this release closed"
+              if by_client else
+              "all written from the CLI, so this is a choice rather than a fault")
+    checks.append(("phantom projects", not by_client,
+                   f"{len(phantoms)} name(s) are used by notes or sessions but are "
+                   f"not projects: {listed}{more} — {origin}. These are invisible "
+                   f"under the real project; move them with: evoctx project-merge "
+                   f"\"{first}\" <real-project>"))
+
+
+def _check_projects_without_roots(checks: list, db) -> None:
+    """Projects resolution can never match here.
+
+    PASS either way, deliberately. A topic-only project legitimately has no
+    directory, and on upgrade day every project has none — failing would make
+    the health check red for a correct configuration, which is the mistake the
+    workspace check already had to correct once.
+    """
+    unbound = db.projects_without_roots()
+    # templates are excluded from `unbound` and must be excluded here too, or a
+    # store of only templates reports "all N have a directory" about rows that
+    # can never have one
+    total = len([p for p in db.list_projects() if not p.startswith("_")])
+    if not total:
+        return          # a fresh store has nothing to report either way
+    if not unbound:
+        checks.append(("project roots bound", True,
+                       f"all {total} project(s) have a directory on this machine"))
+        return
+    listed = ", ".join(unbound[:5]) + (f" and {len(unbound) - 5} more"
+                                       if len(unbound) > 5 else "")
+    checks.append(("project roots bound", True,
+                   f"{len(unbound)} of {total} project(s) {'has' if len(unbound) == 1 else 'have'} "
+                   f"no directory here, so "
+                   f"this workspace will never resolve to them: {listed}. Fine for "
+                   f"topic-only projects; otherwise run evoctx init in each one"))
+
+
+def _check_unscoped_notes(checks: list, db) -> None:
+    """Notes a scoped grant can no longer read.
+
+    PASS always: this is information, not a fault. The notes are intact and a
+    grant with `projects: ["*"]` — the shipped default — still reads them. But
+    0.1.4 narrowed project-less rows out of scoped grants, and nothing else
+    would ever tell a user which notes that affected.
+    """
+    count = db.unscoped_notes()
+    if not count:
+        return
+    checks.append(("unscoped notes", True,
+                   f"{count} note(s) have no project and are not marked global, so "
+                   f"only a grant covering every project can read them (0.1.4 "
+                   f"narrowed this; see CHANGELOG item 16). They are intact — the "
+                   f"default grant reads them, as does the CLI"))
+
+
 def _check_workspace(checks: list, db, cwd: Path) -> None:
     """What the resolution ladder answers for the directory doctor was run in.
 
@@ -805,6 +897,20 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
                 _check_workspace(checks, db, Path.cwd())
             except Exception as e:
                 checks.append(("workspace", False, f"could not be checked: {e}"))
+            # each wrapped separately: one failing check must not swallow the
+            # ones after it through the outer handler
+            try:
+                _check_phantom_projects(checks, db)
+            except Exception as e:
+                checks.append(("phantom projects", False, f"could not be checked: {e}"))
+            try:
+                _check_projects_without_roots(checks, db)
+            except Exception as e:
+                checks.append(("project roots bound", False, f"could not be checked: {e}"))
+            try:
+                _check_unscoped_notes(checks, db)
+            except Exception as e:
+                checks.append(("unscoped notes", False, f"could not be checked: {e}"))
             _check_migration_backups(checks, store_dir)
             # wrapped for the same reason: it parses stored timestamps with
             # fromisoformat, and one malformed row would otherwise surface as

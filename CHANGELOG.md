@@ -201,7 +201,84 @@ invisible under the real project — but it is a behaviour change, not an additi
 unaffected: `evoctx add --project whatever` still writes whatever you tell it, because grants
 and this refusal govern the MCP path, not your own filesystem.
 
-**14. Response shapes changed — check this if you script against evoctx.** Additive except
+**14. `evoctx project-merge WRONG RIGHT` — for the phantoms you already have.** Refusing
+invented names stops new ones; it does nothing for the notes and sessions already filed under
+one, which are invisible under the real project and findable only by searching for a name you
+have no reason to know.
+
+**Notes and sessions move together and there is no flag to split them.** A session records what
+a stretch of work was for; its notes record what came out of it. Moving one without the other
+leaves a session whose notes are elsewhere — a worse state than the one being fixed, and not
+undoable by running the command again.
+
+`WRONG` need not be a real project; that is the normal case, since a phantom is a name on notes
+that was never registered. `RIGHT` must exist, because merging into a second invented name only
+moves the problem. Directory bindings are **not** transferred — re-make that claim deliberately
+with `evoctx init` if you want it. Human-only, no MCP tool, like every other bulk rewrite here.
+
+**15. `evoctx delete-project` now actually unlinks what it keeps.** It has always printed
+*"kept, unlinked"* when run without `--with-notes`, and the notes kept pointing at the deleted
+name — so they became exactly the phantom item 14 is about, produced by the product itself.
+Sessions were never cleared in **either** mode: `--with-notes` deletes notes and has never
+touched sessions. Notes are now unlinked (or deleted, with the flag) and **sessions are always
+unlinked**.
+
+**Unlinking is not recoverable, and there is no `rename-project`** — so delete-and-recreate is
+how people rename one, and the association used to survive that by accident. It no longer does.
+The prompt says so before asking, and points at `evoctx project-merge` as the way to move
+records instead of orphaning them.
+
+**16. Project-less notes and sessions are no longer readable by a narrowly-scoped grant.**
+`Grant.allows_project(None)` returns True unconditionally, so anything with no project was
+visible to every grant regardless of scope. That was a tolerable edge while such rows were only
+legacy notes from before 0.1.4 — and `check_write_global` said so out loud. Item 15 would have
+turned it into a routine one: deleting a project would have made its note bodies and session
+intents readable by a grant scoped to a *different* project.
+
+The distinction this release already draws is the one that fixes it. A **global** note says "this
+applies to every project", so it applies to the scoped grant's project too and stays visible. A
+**project-less** note says nothing about where it belongs, so only a grant covering everything
+may read it. Silence is not consent to cross a scope boundary — the same reasoning that refuses
+a project-less write.
+
+**If you use a scoped grant**, notes written with no project before 0.1.4 will stop appearing in
+its results. They are not gone: a grant with `projects: ["*"]` still reads them, and
+`evoctx search` is unaffected because grants govern the MCP path, not your own CLI.
+
+**17. `end_session()` is now scoped like every other session read.** It had no scope check at
+all, while `recent_sessions()` refused to list the very same session. It now denies the way
+`get_by_id` does — returning nothing rather than explaining, so out-of-scope is
+indistinguishable from no-such-id — and a denial leaves the session open and closable rather
+than clearing the server's slot.
+
+**The reachable window is narrower than it sounds**, and worth stating rather than implying an
+attack the tool does not offer: `end_session()` takes no session id, it closes the one
+`start_session()` recorded, and that call is already scope-checked. So this fires when a session
+opened under a wider grant is still open when a narrower grant is activated — not for a caller
+naming someone else's session. Pre-existing, but item 16 is what made the asymmetry matter.
+
+**18. `evoctx doctor` gains three checks, with deliberately different severities.**
+
+**Phantom projects** reports every name that notes or sessions are filed under but which is not
+a project, and names the command to fix it — nothing else in the product would ever mention this
+data exists. It **fails only when an assistant wrote them**, which is the case item 13 closed.
+Names *you* typed through the CLI are reported without failing, because `evoctx add --project
+whatever` is documented as still working and `doctor`'s exit code should not go red for a
+decision you made. A note whose author is unknown (written before 0.1.0) counts as not-assistant:
+an unknown origin is not evidence of one.
+
+**Project roots bound** never fails. It reports which projects have no directory on this machine,
+so you can see what resolution will never match. A topic-only project legitimately has none, on
+upgrade day every project does, and templates are excluded entirely since they can never hold
+one.
+
+**Unscoped notes** never fails either, and exists because of item 16: it counts notes with no
+project and no global flag, which a scoped grant can no longer read. Migration 005 adds
+`is_global` without backfilling, so every note written before 0.1.4 is in that set and nothing
+else in the product would tell you which ones went quiet. They are intact — the default grant
+reads them, and so does the CLI.
+
+**19. Response shapes changed — check this if you script against evoctx.** Additive except
 for `list_projects()` above, but worth knowing before you upgrade:
 
 - `evoctx export --format json` gains a top-level `project_roots` key. **An export now

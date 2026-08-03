@@ -46,6 +46,8 @@ Store management (human-only unless noted):
               [--rescrape] [--relink] [--yes]                 Replace description / move dir / skip prompt
                                                               (MCP: register_project)
   evoctx unbind [--dir PATH] [--project NAME]                 Remove a directory binding (project stays)
+  evoctx project-merge WRONG RIGHT [--force]                  Move notes AND sessions off a wrong/invented
+                                                              project name. Human-only, no MCP tool.
   evoctx new-project NAME --overview "..."                    Register project manually
   evoctx new-template NAME --overview "..."                   Create a reusable template
   evoctx templates                                            List available templates
@@ -85,6 +87,7 @@ from .db import (
     AmbiguousPrefix,
     ConflictingNoteScope,
     Database,
+    NoSuchProject,
     NoteTooLarge,
     RootNotADirectory,
     RootOwnedByAnotherProject,
@@ -247,10 +250,15 @@ def _print_session(s: dict):
 
 
 def cmd_start_session(args):
-    import os
+    # 'cli' hardcoded, not read from CONTEXT_CLIENT — `upsert_project` makes
+    # the same choice at db.py's `_insert_project_row` and says why: a leaked
+    # env var must not make a human's own action look like an assistant's.
+    # That was cosmetic for attribution; since `doctor` grades an
+    # assistant-written phantom as a fault, it now decides an exit code. The
+    # MCP path sets the client directly in server.py, so reading the env var
+    # here buys nothing that path does not already cover.
     session_id = db.start_session(
-        project=args.project, intent=args.intent,
-        client=os.environ.get("CONTEXT_CLIENT", "cli"),
+        project=args.project, intent=args.intent, client="cli",
     )
     print(f"Started session: {session_id}")
     print(f"Close with: evoctx end-session \"summary\" --id {session_id[:8]}")
@@ -1068,6 +1076,66 @@ def _confirm(prompt: str, force: bool) -> bool:
     return input().strip().lower() == "y"
 
 
+def cmd_project_merge(args):
+    """Reattach everything filed under a wrong name to the right one.
+
+    Human-only, like every other bulk rewrite here. An assistant that filed
+    notes under an invented name is not the thing to trust with deciding which
+    name was invented — and `doctor` is where a human finds out.
+    """
+    # Validate BEFORE announcing anything. Printing "'keeper' is a real project
+    # and will be removed" and then failing tells the user their live project
+    # is about to die, for an operation that cannot run.
+    if args.wrong == args.right:
+        print("Error: a project cannot be merged into itself")
+        sys.exit(1)
+    if not db.project_exists(args.right):
+        print(f"Error: no project named '{args.right}' — merge into a project "
+              f"that exists, or create it first with: evoctx new-project {args.right}")
+        sys.exit(1)
+
+    counts = db.phantom_projects().get(args.wrong)
+    proj = db.get_project(args.wrong)
+    if counts:
+        print(f"{counts['notes']} note(s) and {counts['sessions']} session(s) are "
+              f"filed under '{args.wrong}', which is not a project. "
+              f"Moving them to '{args.right}'.")
+    elif proj:
+        # Enumerate the collateral before asking, the way `delete-project`
+        # does. This command is the more destructive of the two and was the
+        # one saying least: a real project's description is deleted, not
+        # merged, and `merge` does not mean that anywhere else.
+        counted = db.count_for_project(args.wrong)
+        print(f"'{args.wrong}' is a real project. Moving its {counted['notes']} "
+              f"note(s) and {counted['sessions']} session(s) to '{args.right}', "
+              f"then removing it.")
+        if proj.get("overview") or proj.get("conventions") or proj.get("open_questions"):
+            print(f"Its overview, conventions and open questions are DELETED, not "
+                  f"merged into '{args.right}'. Copy anything worth keeping first: "
+                  f"evoctx get-project {args.wrong}")
+        if proj["roots"]:
+            print(f"Its {len(proj['roots'])} directory binding(s) are dropped rather "
+                  f"than transferred — re-bind deliberately with evoctx init if you "
+                  f"want them on '{args.right}'.")
+    else:
+        print(f"Nothing is filed under '{args.wrong}', and it is not a project.")
+        print("Run: evoctx doctor   (it lists names that notes are filed under)")
+        return
+
+    if not _confirm("This cannot be undone by re-running it. Proceed? [y/N]", args.force):
+        print("Cancelled.")
+        return
+    try:
+        moved = db.merge_project(args.wrong, args.right)
+    except (NoSuchProject, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    print(f"Moved {moved['notes']} note(s) and {moved['sessions']} session(s) "
+          f"to '{args.right}'.")
+    if moved["project_removed"]:
+        print(f"Removed project '{args.wrong}'.")
+
+
 def cmd_delete(args):
     selectors = [s for s in (args.id, args.project, args.tag) if s]
     if len(selectors) != 1:
@@ -1121,12 +1189,34 @@ def cmd_delete_project(args):
         sys.exit(1)
     # notes actually scoped to this project, not what `list --project` shows:
     # that now includes global notes, which are not this project's to delete
-    note_count = len([n for n in db.list_notes(project=args.name)
-                      if n["project"] == args.name])
+    counted = db.count_for_project(args.name)
+    note_count, session_count = counted["notes"], counted["sessions"]
     what = f"project '{args.name}'" + (f" and its {note_count} note(s)" if args.with_notes else "")
-    if note_count and not args.with_notes:
-        print(f"Note: {note_count} note(s) reference this project and will be kept, unlinked "
-              f"(re-run with --with-notes to delete them too).")
+
+    # Wording is branched because the two branches do different things to the
+    # notes. "unlinked too" has no antecedent when the notes are being
+    # deleted, and pointing at `project-merge` there offers to move exactly
+    # what the user just asked to destroy.
+    if args.with_notes:
+        if session_count:
+            print(f"{session_count} session(s) recorded under this project are unlinked "
+                  f"(sessions are never deleted). Recreating this name will NOT "
+                  f"reattach them.")
+    else:
+        if note_count:
+            print(f"Note: {note_count} note(s) reference this project and will be kept, "
+                  f"unlinked (re-run with --with-notes to delete them too).")
+        if session_count:
+            print(f"{session_count} session(s) recorded under this project are unlinked "
+                  f"too (they are never deleted).")
+        if note_count or session_count:
+            # There is no `rename-project`, so delete-and-recreate is how
+            # people rename one. The link used to survive that by accident;
+            # now it does not, and saying so before the prompt is the
+            # difference between a choice and a surprise.
+            print("Unlinking is not recoverable: recreating a project with this name "
+                  "will NOT reattach them. To move them instead, cancel and run: "
+                  f"evoctx project-merge {args.name} <other-project>")
     root_count = len(proj["roots"])
     if root_count:
         # Roots go unconditionally — say so before asking, since the notes
@@ -1451,6 +1541,13 @@ def main():
                    help="Skip the --relink confirmation prompt")
 
     # unbind
+    pm = sub.add_parser("project-merge",
+                        help="Move notes AND sessions from a wrong/invented project "
+                             "name onto the right one. Human-only, no MCP equivalent.")
+    pm.add_argument("wrong", help="The name they were filed under (need not be a real project)")
+    pm.add_argument("right", help="The project to move them to (must exist)")
+    pm.add_argument("--force", action="store_true", help="Skip the confirmation")
+
     ub = sub.add_parser("unbind", help="Remove a directory binding from a project")
     ub.add_argument("--dir", default=None, help="Directory to unbind (default: cwd)")
     ub.add_argument("--project", default=None, help="Project to unbind it from (default: whichever owns it)")
@@ -1582,6 +1679,7 @@ def main():
         "write-note": cmd_add,
         "add": cmd_add,
         "unbind": cmd_unbind,
+        "project-merge": cmd_project_merge,
         "start-session": cmd_start_session,
         "end-session": cmd_end_session,
         "recent-sessions": cmd_recent_sessions,

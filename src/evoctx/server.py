@@ -256,7 +256,11 @@ def end_session(summary: str, ctx: Context) -> dict:
         summary: Markdown summary of the session's outcome
 
     Returns:
-        The closed session, or an error hint if no session was started
+        The closed session, or an error hint — if no session was started, or
+        if the active grant no longer covers the one that was. **Do not answer
+        an error by calling start_session()**: the session is still open and
+        still yours to close, and starting another replaces it, stranding the
+        first with no summary
     """
     global _current_session_id
     if _current_session_id is None:
@@ -269,7 +273,15 @@ def end_session(summary: str, ctx: Context) -> dict:
                      "if this workspace resolves to none."
         }
     session = policy.t_end_session(_client_name(ctx), _current_session_id, summary)
-    _current_session_id = None
+    if "error" not in session:
+        _current_session_id = None
+    # Kept on a denial, deliberately. Clearing it unconditionally strands the
+    # session open and unclosable in the exact window the scope guard exists
+    # for — and an open session with no summary is the state this product
+    # treats as an interruption. It also makes the denial distinguishable
+    # across two calls: the retry would return "no session was started"
+    # instead of repeating itself, which tells the caller the first call did
+    # something.
     return session
 
 
