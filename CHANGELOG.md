@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.1.4 — unreleased — projects know where they live
+
+**1. A project can now record the directories its code is in.** Until now the store had no
+idea where anything was: `evoctx init` resolved a directory, read manifests out of it,
+printed it, and dropped it. So an assistant asked to name a project had nothing to match its
+workspace against, and could only infer a name from context — which is where invented
+project names came from. Not carelessness; an API that offered no other option.
+
+Migration 005 adds `project_roots` (project, root_path, machine). A table rather than a
+column because one project legitimately has several roots — a worktree, a work machine and
+a home one, a monorepo subdirectory — and a column would force last-write-wins and drop the
+earlier path silently. **Path is a hint, never the identity**: the name stays the key, so a
+cloud-synced store, a clone, and a project with no directory at all all keep working.
+
+Uniqueness is per machine: on a given machine a directory belongs to at most one project,
+but the same absolute path on a different machine may legitimately be a different project.
+
+**2. `evoctx init` on an existing project now links the directory instead of refusing.**
+Before, it printed "already registered, use --force" — and `--force` replaces overview and
+conventions with scraped output. Recording where the code lives should never cost a
+description someone wrote by hand, so linking no longer goes through it.
+
+`--relink` moves a directory that another project already claims; without it, that case
+refuses and names both ways out. It asks first, and `--yes` skips the question — **not**
+`--force`, which means "re-scrape the description" here. Letting one flag do both jobs made
+`--relink --force` move a directory *and* overwrite a curated description when the user had
+explicitly asked for neither. `evoctx unbind` removes a binding outright, for when `init`
+was run one directory too deep.
+
+**3. Descriptions carry provenance.** `projects.description_author` records who wrote the
+overview. Notes have had `author_client` since 0.1.0 for the same reason; projects being
+the one unattributed surface meant an assistant-written overview read identically to a
+curated one, forever, to every future session. Text scraped by `evoctx init` from manifests
+and READMEs is attributed to `init-scrape`, not to you — nobody wrote it.
+
+`description_reviewed_at` and `attention_dismissed_at` exist alongside it as schema only.
+Nothing writes either yet — the review writer arrives with assistant-side registration,
+where a human confirms a proposed description, and the dismissal writer with the
+incomplete-project prompt. They are documented here so the columns are not mistaken for
+working features: today the first answers "no human has approved this" for every project,
+which is true but not yet informative. The clearing rule *is* live: any write that changes
+the overview or conventions clears the review, including the author's own, because a review
+approves specific words. Text that does not change keeps it.
+
+**4. A global note is now explicitly global.** `project=None` meant two different things the
+store could not tell apart: *"the user asked for a note that spans everything"* and
+*"nobody set a project"*. `notes.is_global` records which. Storage stays `NULL` — a sentinel
+project name would have changed grant semantics, since `allows_project(None)` passes on its
+own branch while any string goes through glob matching, so a narrow grant would have started
+hiding global notes that pass today. `evoctx sync` also already creates a real project
+called `global`, so the sentinel would have collided with a shipped feature.
+
+**5. Deleting a project deletes its roots.** Left behind, they would resolve a directory to
+a project that no longer exists and make the directory un-registerable.
+
+**6. Response shapes changed — check this if you script against evoctx.** All additive, but
+worth knowing before you upgrade:
+
+- `evoctx export --format json` gains a top-level `project_roots` key. **An export now
+  describes your machine's directory layout** — absolute paths, tagged with the machine
+  they were true on. Worth knowing before you share one.
+- `get_project` gains `roots`, `description_author`, `description_reviewed_at` and
+  `attention_dismissed_at` — over MCP, to every client
+- note responses (`search_context`, `get_by_id`) gain `is_global`
+- **a project-scoped read now returns global notes too.** `search_context(project="api")`,
+  `get_project("api")` and `evoctx list --project api` include notes marked global, because
+  "spans every project" has to mean something. This is the one change here that alters what
+  an existing call returns rather than only adding keys. A project's own notes are never
+  displaced by them — `recent_notes` bounds each set separately, so five global notes
+  cannot push out everything the project has.
+- `evoctx add --global` marks a note cross-project from the CLI, matching what the
+  `write_note` MCP tool can now do. Every MCP capability gets a CLI mirror; without it the
+  assistant would be the only one able to express the distinction this release adds.
+  `evoctx list`, `show`, `search` and `dump` print `[global]` where they used to print a
+  dash, so the two cases are distinguishable by eye and not only in the API. Bracketed
+  because `evoctx sync` creates a real project *named* `global` — an unbracketed marker
+  would rebuild the same conflation on the display side.
+- **A grant scoped to specific projects can no longer write a global note.** One that spans
+  every project appears in every project's scoped read, so claiming that scope now requires
+  holding it (`projects: ["*"]`). Writing a note with no project at all is unaffected. If a
+  client hits this, the denial names the fix: activate a wider grant.
+- `evoctx doctor` gains three checks: registered directories that are no longer present,
+  notes marked both global and project-scoped, and the pre-upgrade backups described below
+  (so you know they exist and that they are yours to delete).
+- **A grant whose `scope.projects` is present but empty is now rejected**, in either
+  spelling — `projects: []` or a bare `projects:`. It previously parsed as *every* project,
+  which is a scope failing open, and it now also decides who may write a global note. If you
+  have hand-edited `grants.yaml` this way, fix it before upgrading: grant parsing runs
+  inside every tool call, so a rejected file denies all of them.
+- **Upgrading is one-way, and now backs itself up first.** Once migrated, an older evoctx
+  refuses to open the store — correct, but irreversible, and this store is built to be
+  synced between machines that may not upgrade together. The migration writes
+  `store.db.bak-pre-migration-005` before touching anything, via SQLite's backup API rather
+  than a file copy (in WAL mode the file alone is missing whatever is still in the `-wal`).
+
+
 ## 0.1.3 — 2026-07-30 — forward-compatible grants, install guidance that matches reality, first pyright pass, deterministic ordering
 
 **1. A future release could have locked users out of their own store.** `_parse_grant`

@@ -499,6 +499,105 @@ def _check_cloud_sync(checks: list, store_dir: Path) -> None:
         checks.append(("cloud sync", True, "store path is not inside a known cloud-sync folder"))
 
 
+def _check_project_roots(checks: list, db) -> None:
+    """Directory bindings: are they still true, and is the scope invariant held?
+
+    Both are one query each, and both describe facts that go stale silently —
+    a directory gets moved or deleted and nothing notices, because nothing
+    re-reads it.
+    """
+    from pathlib import Path as _P
+
+    roots = db.project_roots()  # every machine; narrowed to this one below
+    machine = _this_machine()
+    here = [r for r in roots if r["machine"] == machine]
+
+    if roots and not here:
+        # Every binding names another machine. Usually that means this box was
+        # renamed — `platform.node()` changed and nothing rebound — and it is
+        # not benign: resolution will find nothing for any project. Reporting
+        # PASS here would hide a fully broken state behind a true sentence.
+        others = sorted({r["machine"] for r in roots})
+        checks.append(("project roots", False,
+                       f"no directory is bound on this machine (hostname '{machine}'); "
+                       f"{len(roots)} binding(s) name {', '.join(others)} — was this "
+                       f"machine renamed? Re-bind with: evoctx init --dir <path> --name <project>"))
+        # deliberately NOT a return: the note-scope check below is independent
+        # of roots, and a synced store's first run on a new box lands here —
+        # exactly where skipping it would hide a conflicted note
+        gone = []
+    else:
+        gone = [r for r in here if not _P(r["root_path"]).is_dir()]
+
+    if gone:
+        # One branch, not two. `is_dir()` is False for deleted, never-existed
+        # AND not-currently-mounted, and those cannot be told apart from path
+        # existence alone: an unmounted volume leaves nothing to stat, and its
+        # mount point (`/Volumes`, `C:\mnt`) is an ordinary directory that
+        # still exists. An earlier attempt tested the path's anchor, which
+        # only distinguishes a Windows drive letter or UNC root; a second
+        # attempt walked up to the first existing ancestor, which is strictly
+        # weaker still — the anchor IS the last ancestor, so anything it
+        # called mounted this calls mounted too.
+        #
+        # So the message carries the ambiguity instead of pretending to
+        # resolve it. `unbind` is named but not led with, because following it
+        # on an unplugged drive destroys a valid binding.
+        listed = ", ".join(f"{r['project']} -> {r['root_path']}" for r in gone[:3])
+        first = gone[0]["root_path"]
+        checks.append(("project roots", False,
+                       f"{len(gone)} registered director(ies) are not present: {listed}"
+                       f" — moved, deleted, or on a drive or share that is not mounted."
+                       f" Reconnect and re-run before changing anything; if one is really"
+                       f" gone: evoctx unbind --dir \"{first}\""))
+    elif here or not roots:
+        checks.append(("project roots", True,
+                       f"{len(here)} director(ies) bound on this machine"
+                       f"{f', {len(roots) - len(here)} on others' if len(roots) > len(here) else ''}"))
+
+    # A note cannot be both global and project-scoped. `add_note` refuses it,
+    # so this is unreachable through the API — but the state is not
+    # unrepresentable at the storage layer, and if it ever occurs the note
+    # appears twice in one project's recent_notes while `delete --project`
+    # silently removes it. Detecting costs a SELECT; the roots table gets a
+    # UNIQUE index for the same reasoning.
+    conflicted = db.conn.execute(
+        "SELECT COUNT(*) FROM notes WHERE is_global = 1 AND project IS NOT NULL"
+    ).fetchone()[0]
+    if conflicted:
+        checks.append(("note scope", False,
+                       f"{conflicted} note(s) are marked global AND scoped to a project; "
+                       f"they will appear twice under that project"))
+    else:
+        # emitted on the healthy path too: every other check reports both
+        # ways, and a check the user never sees is one they cannot trust ran
+        checks.append(("note scope", True,
+                       "no note is both global and project-scoped"))
+
+
+def _this_machine() -> str:
+    from .db import this_machine
+    return this_machine()
+
+
+def _check_migration_backups(checks: list, store_dir: Path) -> None:
+    """Tell the user the pre-upgrade copies exist and are theirs to delete.
+
+    Nothing else in the product mentions them, so they accumulate silently
+    and look like clutter of unknown importance.
+    """
+    backups = sorted(store_dir.glob("store.db.bak-pre-migration-*"))
+    backups = [b for b in backups if b.is_file() and not b.name.endswith(".tmp")]
+    if not backups:
+        return
+    total = sum(b.stat().st_size for b in backups)
+    checks.append(("migration backups", True,
+                   f"{len(backups)} pre-upgrade cop{'y' if len(backups) == 1 else 'ies'}, "
+                   f"{_human_size(total)} ({backups[-1].name}) — kept so an older "
+                   f"evoctx can still read your data; safe to delete once you no longer "
+                   f"need to downgrade"))
+
+
 def _check_staleness(checks: list, db, home: Path) -> None:
     from datetime import datetime, timezone
     row = db.conn.execute("""
@@ -548,8 +647,12 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
             db = Database(store_dir)
             version = db.conn.execute("PRAGMA user_version").fetchone()[0]
             note_count = db.conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+            # the live database only — `store.db*` would also match every
+            # pre-migration backup and roughly double the reported size
             db_size = sum(
-                f.stat().st_size for f in store_dir.glob("store.db*") if f.is_file()
+                (store_dir / n).stat().st_size
+                for n in ("store.db", "store.db-wal", "store.db-shm")
+                if (store_dir / n).is_file()
             )
             checks.append(("database", True,
                            f"schema v{version}/{len(MIGRATIONS)}, "
@@ -566,7 +669,22 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
                                f"evoctx audit-prune --older-than 90d to reclaim space"))
             except Exception:
                 pass
-            _check_staleness(checks, db, home)
+            # individually wrapped, like the two checks above: an is_dir()
+            # against an unreachable network path raises, and unguarded that
+            # would surface as a second contradictory "database" line AND
+            # swallow _check_staleness via the outer handler
+            try:
+                _check_project_roots(checks, db)
+            except Exception as e:
+                checks.append(("project roots", False, f"could not be checked: {e}"))
+            _check_migration_backups(checks, store_dir)
+            # wrapped for the same reason: it parses stored timestamps with
+            # fromisoformat, and one malformed row would otherwise surface as
+            # a second contradictory "database" line via the outer handler
+            try:
+                _check_staleness(checks, db, home)
+            except Exception as e:
+                checks.append(("last activity", False, f"could not be checked: {e}"))
         except SchemaTooNew as e:
             checks.append(("database", False, str(e)))
     except Exception as e:

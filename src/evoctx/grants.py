@@ -115,6 +115,16 @@ class Grant:
             return True
         return any(fnmatch(project, pat) for pat in self.projects)
 
+    def allows_all_projects(self) -> bool:
+        """Does this grant cover every project, including ones not yet created?
+
+        Its own method so the one caller that needs "covers everything" — the
+        global-note write check — stops being the single place that inspects
+        `.projects` literally. `"**"` and `"?*"` also match anything under
+        fnmatch, so they count.
+        """
+        return any(pat in ("*", "**", "?*") for pat in self.projects)
+
     def expires_at(self, activated_at: datetime) -> datetime:
         m = _RELATIVE_EXPIRES.match(self.expires)
         if m:
@@ -163,6 +173,21 @@ def _parse_grant(raw: dict) -> Grant:
         )
         tools = [t for t in tools if t not in unknown]
     scope = raw.get("scope") or {}
+    # `projects: []` reads as "no projects" and used to parse as full access,
+    # because `or ["*"]` cannot tell an empty list from a missing key. That is
+    # a scope failing open, and it now also decides whether a grant may write
+    # global notes — so refuse it rather than guess which was meant.
+    if "projects" in scope and not scope["projects"]:
+        # `not`, not `== []`: a bare `projects:` in YAML parses to None, which
+        # is the spelling a human is likelier to type and which failed open
+        # the same way. A key that is present but empty is a scope somebody
+        # meant to write; guessing "everything" from it is the wrong guess,
+        # and it now also gates who may write global notes.
+        raise GrantError(
+            f"grant '{raw['name']}': 'projects' is present but empty, which is "
+            f"ambiguous — write projects: [\"*\"] for every project, or name the "
+            f"ones you mean. Remove the key entirely to accept the default."
+        )
     return Grant(
         name=raw["name"],
         client=raw.get("client", "*"),

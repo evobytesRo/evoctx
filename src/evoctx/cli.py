@@ -8,6 +8,7 @@ Mirrors of the MCP tools — everything the AI can do, you can do:
   evoctx search-context QUERY [--project NAME] [--limit N]    Same as MCP search_context()
   evoctx get-by-id ID                                         Same as MCP get_by_id() (alias: show)
   evoctx write-note "Title" --project NAME --tags "#decision" Same as MCP write_note() (alias: add)
+                            [--global]                        Note spans every project (not the same as no project)
   evoctx start-session [--project NAME] [--intent "..."]      Same as MCP start_session()
   evoctx end-session "summary" [--id ID]                      Same as MCP end_session() (default: latest open)
   evoctx recent-sessions [--project NAME] [--limit N]         Same as MCP recent_sessions()
@@ -37,7 +38,9 @@ Setup:
 
 Store management (human-only, no MCP equivalent):
 
-  evoctx init [--dir PATH] [--name NAME] [--template NAME]   Register project from directory
+  evoctx init [--dir PATH] [--name NAME] [--template NAME]   Register project + bind its directory
+              [--rescrape] [--relink] [--yes]                 Replace description / move dir / skip prompt
+  evoctx unbind [--dir PATH] [--project NAME]                 Remove a directory binding (project stays)
   evoctx new-project NAME --overview "..."                    Register project manually
   evoctx new-template NAME --overview "..."                   Create a reusable template
   evoctx templates                                            List available templates
@@ -73,7 +76,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .db import AmbiguousPrefix, Database, NoteTooLarge
+from .db import (
+    AmbiguousPrefix,
+    ConflictingNoteScope,
+    Database,
+    NoteTooLarge,
+    RootOwnedByAnotherProject,
+    normalize_root,
+    this_machine,
+)
 from .grants import TOOLS_WILDCARD, GrantError, GrantStore
 from .paths import store_dir
 from .policy import PolicyEngine
@@ -84,6 +95,42 @@ grant_store = GrantStore(STORE_DIR)
 policy = PolicyEngine(db, grant_store)
 
 TEMPLATE_PREFIX = "_"
+
+
+GLOBAL_MARKER = "[global]"
+
+
+def _scope(note: dict, dash: str = "—") -> str:
+    """How a note's scope reads to a human.
+
+    "global" and "no project" are different facts, and printing both as a dash
+    is the conflation this release removes on the storage side — it would be
+    odd to fix the column and leave every human-facing list unable to show it.
+
+    Bracketed, because `evoctx sync` creates a real project named `global`
+    (from `global.md`). A bare "global" would make a note filed under that
+    project indistinguishable from one marked cross-project — the same
+    conflation, rebuilt on the display side. Brackets are used for the same
+    reason everywhere a scope is printed.
+    """
+    if note.get("is_global"):
+        return GLOBAL_MARKER
+    return note.get("project") or dash
+
+# `evoctx init` scrapes manifests and a README paragraph. Nobody wrote that
+# text, so attributing it to "cli" — the label meaning a human typed it —
+# would make machine-generated boilerplate indistinguishable from a curated
+# description, which is the thing description provenance exists to prevent.
+_SCRAPE_AUTHOR = "init-scrape"
+
+# `evoctx sync` is deliberately NOT given a machine author, unlike `init`.
+# What it stores is a markdown file the user maintains by hand — the whole
+# substance is theirs. The only generated part is a one-line overview stub
+# ("Template: fastapi"), and that is a label, not a description: the name is
+# already in `name`. Attributing a hand-written conventions file to a machine
+# would be the same false provenance as attributing scraped text to a human,
+# pointed the other way — and an assistant reading a non-human author treats
+# the text as disposable boilerplate.
 
 
 def _template_name(name: str) -> str:
@@ -108,7 +155,7 @@ def cmd_list_projects(args):
         print("No projects registered. Start with: evoctx init")
         return
     for name in names:
-        proj = db.get_project(name)
+        proj = db.get_project(name, with_roots=False)  # loop: don't fetch what we discard
         overview = (proj["overview"][:70] + "…") if proj and len(proj["overview"]) > 70 else (proj["overview"] if proj else "")
         print(f"  {name:<25} {overview}")
     print(f"\n{len(names)} project(s)")
@@ -121,6 +168,26 @@ def cmd_get_project(args):
         sys.exit(1)
     print(f"Name:    {proj['name']}")
     print(f"Updated: {proj['updated_at']}")
+    if proj.get("description_author"):
+        reviewed = proj.get("description_reviewed_at")
+        # "who wrote this" is the point of the column — init-scrape means it
+        # was extracted from manifests, not written by anyone
+        print(f"Author:  {proj['description_author']}"
+              + (f" (reviewed {reviewed})" if reviewed else " (not reviewed)"))
+    # Templates and the sync-created `global` project describe conventions,
+    # not code, so advising the user to bind a directory to them would be
+    # advice that makes no sense.
+    directory_bound = not (proj["name"].startswith(TEMPLATE_PREFIX)
+                           or proj["name"] == "global")
+    if directory_bound or proj["roots"]:
+        print()
+        print("── Directories " + "─" * 45)
+        if not proj["roots"]:
+            print("(none registered — run: evoctx init --dir <path> --name "
+                  f"{proj['name']})")
+        for r in proj["roots"]:
+            here = "" if r["machine"] == this_machine() else f"  (on {r['machine']})"
+            print(f"  {r['root_path']}{here}")
     print()
     print("── Overview " + "─" * 48)
     print(proj["overview"] or "(empty)")
@@ -136,7 +203,12 @@ def cmd_get_project(args):
         print("(none)")
     for n in proj["recent_notes"]:
         tags = " ".join(n["tags"])
-        print(f"  {n['id'][:8]}  {n['title']}  {tags}")
+        # marked, because this list deliberately mixes the project's own notes
+        # with global ones — unmarked they would read as all belonging here
+        mark = f"{GLOBAL_MARKER} " if n.get("is_global") else ""
+        print(f"  {n['id'][:8]}  {mark}{n['title']}  {tags}")
+    if any(n.get("is_global") for n in proj["recent_notes"]):
+        print(f"  ({GLOBAL_MARKER} notes apply to every project, not only this one)")
 
 
 def cmd_search_context(args):
@@ -146,7 +218,8 @@ def cmd_search_context(args):
         return
     for r in results:
         tags = " ".join(r["tags"])
-        print(f"  {r['id'][:8]}  [{r['project'] or '—'}]  {r['title']}  {tags}")
+        # _scope already brackets the global marker — don't wrap it again
+        print(f"  {r['id'][:8]}  {_scope(r):<12}  {r['title']}  {tags}")
         print(f"           {r['snippet']}")
         print()
     print(f"{len(results)} result(s). Full note: evoctx get-by-id <ID>")
@@ -477,13 +550,14 @@ def cmd_add(args):
     from .secrets import redact_secrets
     _, hits = redact_secrets(content)
     try:
-        note_id = db.add_note(args.title, content, project=args.project, tags=tags, author_client="cli")
-    except NoteTooLarge as e:
+        note_id = db.add_note(args.title, content, project=args.project, tags=tags,
+                              author_client="cli", is_global=args.is_global)
+    except (NoteTooLarge, ConflictingNoteScope) as e:
         print(f"Error: {e}")
         sys.exit(1)
     print(f"Added: {note_id}")
     print(f"  title:   {args.title}")
-    print(f"  project: {args.project or '-'}")
+    print(f"  project: {_scope({'is_global': args.is_global, 'project': args.project}, '-')}")
     print(f"  tags:    {tags}")
     if hits:
         print(f"  note: {hits} likely secret(s) were masked before storing")
@@ -592,8 +666,25 @@ def cmd_templates(args):
         return
     print("Available templates:")
     for t in templates:
-        proj = db.get_project(t)
+        # with_roots=False: templates have no directories, and this is a loop
+        proj = db.get_project(t, with_roots=False)
         print(f"  {t:<25} {proj['overview'][:70] if proj else ''}")
+
+
+def _register(*args_, **kwargs):
+    """`db.register_project`, with the transactional refusal turned into a
+    message.
+
+    The pre-check in `cmd_init` catches the normal case; this catches the
+    two-writer race the db layer's guard exists for, so that path ends in an
+    explanation rather than a traceback.
+    """
+    try:
+        return db.register_project(*args_, **kwargs)
+    except RootOwnedByAnotherProject as e:
+        print(f"That directory is already registered to project '{e.owner}'.")
+        print("Re-run with --relink to move it.")
+        sys.exit(1)
 
 
 def cmd_init(args):
@@ -604,6 +695,24 @@ def cmd_init(args):
 
     if not directory.is_dir():
         print(f"Directory not found: {directory}")
+        sys.exit(1)
+
+    # Ownership check before the manifest scraping below — there is no point
+    # reading package.json for a run that cannot succeed. `register_project`
+    # enforces the same rule transactionally, so this is for the message and
+    # the wasted work, not for correctness.
+    owner = db.project_for_root(directory)
+    # zeroed so the refusal and the relink prompt below don't fire on our own
+    # binding — but remembered, so `--relink` on a directory that is already
+    # ours doesn't claim "no other project claims this directory"
+    already_ours = owner == name
+    if already_ours:
+        owner = None
+    if owner and not args.relink:
+        print(f"That directory is already registered to project '{owner}'.")
+        print(f"  directory: {normalize_root(directory)}")
+        print(f"Either add to that project:  evoctx init --dir \"{directory}\" --name {owner}")
+        print(f"or move it to this one:      evoctx init --dir \"{directory}\" --name {name} --relink")
         sys.exit(1)
 
     overview_lines: list[str] = []
@@ -686,24 +795,73 @@ def cmd_init(args):
         overview = f"{overview} [{stack_hint}]"
 
     # --- apply template if requested ---
+    # Resolved here (so a bad name fails before anything is written) but
+    # announced only on the paths that actually apply it — the link path
+    # below returns early with "Description left untouched", and printing
+    # "Stamped with template" above that would contradict it.
     conventions = project_conventions
+    tname = None
     if args.template:
         tname = _template_name(args.template)
-        tmpl = db.get_project(tname)
+        tmpl = db.get_project(tname, with_roots=False)
         if not tmpl:
             print(f"Template '{tname}' not found. Run: evoctx templates")
             sys.exit(1)
         conventions = _merge_conventions(tmpl["conventions"], project_conventions)
-        print(f"Stamped with template: {tname}")
+
+    moved_from = None
+    if args.relink and not owner and not already_ours:
+        print("Nothing to relink — no other project claims this directory.")
+    if owner and args.relink:
+        # Destructive, so it asks — the same `_confirm` pair `delete` and
+        # `delete-project` use. Silently re-pointing a root on a typo'd --name
+        # is how one directory ends up meaning two things.
+        #
+        # Gated on --yes, NOT --rescrape/--force. Letting one flag do both
+        # jobs made `--relink --force` move a directory *and* overwrite a
+        # hand-written description, with the user having asked for neither.
+        if not _confirm(
+            f"Move {normalize_root(directory)} from project '{owner}' to '{name}'? (y/n)",
+            args.yes,
+        ):
+            print("Cancelled.")
+            return
+        # Announced after the move, not before — and outside the prompt,
+        # because --yes skips the question and a project must never lose its
+        # directory without being named.
+        moved_from = owner
 
     existing = db.get_project(name)
     if existing and not args.force:
-        print(f"Project '{name}' already registered. Use --force to overwrite.")
-        print(f"  overview: {existing['overview'][:80]}")
+        # Link, don't create. Recording where the code lives must never
+        # require overwriting a description someone wrote — before this, the
+        # only way past "already registered" was --force, which replaces the
+        # scraped fields wholesale.
+        _register(name, directory, relink=args.relink)
+        if moved_from:
+            print(f"Moved {normalize_root(directory)} from project '{moved_from}' to '{name}'.")
+        print(f"Project '{name}' already registered — linked this directory to it.")
+        print(f"  directory: {directory}")
+        print(f"  overview:  {existing['overview'][:80]}")
+        print()
+        if tname:
+            print(f"Template '{tname}' NOT applied — that would rewrite the description.")
+        print("Description left untouched. Use --rescrape to replace it "
+              "(overview and conventions; open questions are kept).")
         return
 
-    db.upsert_project(name, overview=overview, conventions=conventions)
+    # One transaction, including the --rescrape description rewrite: a failure
+    # must not leave a re-scraped description bound to nothing.
+    _register(name, directory, overview=overview, conventions=conventions,
+              author=_SCRAPE_AUTHOR, relink=args.relink,
+              overwrite_description=bool(existing))
+    if moved_from:
+        print(f"Moved {normalize_root(directory)} from project '{moved_from}' to '{name}'.")
+    if tname:
+        print(f"Stamped with template: {tname}")
     print(f"Registered project: {name}")
+    # the caller's spelling, not the normalized key — normalisation lowercases
+    # on Windows, and echoing that back reads like the tool renamed the folder
     print(f"  directory: {directory}")
     print(f"  overview:  {overview}")
     print()
@@ -712,13 +870,33 @@ def cmd_init(args):
     print(f"  evoctx update-project {name} --field open_questions --text \"...\"")
 
 
+def cmd_unbind(args):
+    """Remove a directory binding.
+
+    Exists because `init` is the only thing that creates one, and running it
+    one directory too deep would otherwise leave a wrong root permanently —
+    `--relink` moves a binding to another project but cannot remove it, and
+    `delete-project` is a sledgehammer.
+    """
+    directory = Path(args.dir).resolve() if args.dir else Path.cwd()
+    owner = args.project or db.project_for_root(directory)
+    if not owner:
+        print(f"No project is bound to {normalize_root(directory)} on this machine.")
+        sys.exit(1)
+    if not db.remove_project_root(owner, directory):
+        print(f"Project '{owner}' has no binding for {normalize_root(directory)} here.")
+        sys.exit(1)
+    print(f"Unbound {normalize_root(directory)} from project '{owner}'.")
+    print("The project and its notes are untouched.")
+
+
 def cmd_list(args):
     rows = db.list_notes(project=args.project)
     print(f"{'PROJECT':<22} {'TITLE':<50} {'TAGS'}")
     print("-" * 90)
     for r in rows:
         tags = " ".join(r["tags"])
-        print(f"  {(r['project'] or '-'):<20} {r['title']:<50} {tags}")
+        print(f"  {_scope(r, '-'):<20} {r['title']:<50} {tags}")
     print(f"\n{len(rows)} note(s)")
 
 
@@ -750,7 +928,7 @@ def cmd_show(args):
         print(f"Not found: {args.id}")
         sys.exit(1)
     print(f"Title:   {note['title']}")
-    print(f"Project: {note['project'] or '-'}")
+    print(f"Project: {_scope(note, '-')}")
     print(f"Tags:    {note['tags']}")
     print(f"Created: {note['created_at']}")
     print(f"ID:      {note['id']}")
@@ -760,20 +938,28 @@ def cmd_show(args):
 
 def cmd_dump(args):
     print("=== PROJECTS ===")
+    # one query for every project's roots, outside the loop — the per-project
+    # fetch is skipped for the same reason
+    roots_by_project: dict[str, list[dict]] = {}
+    for r in db.project_roots():
+        roots_by_project.setdefault(r["project"], []).append(r)
     for name in db.list_projects():
-        proj = db.get_project(name)
+        proj = db.get_project(name, with_roots=False)
         if proj is None:  # deleted between the listing and this fetch
             continue
         print(f"  {name}")
         print(f"    {proj['overview'][:80]}")
         print(f"    updated: {proj['updated_at']}")
+        for r in roots_by_project.get(name, []):
+            here = "" if r["machine"] == this_machine() else f"  (on {r['machine']})"
+            print(f"    dir: {r['root_path']}{here}")
         print()
 
     rows = db.list_notes(project=args.project)
     print(f"=== NOTES ({len(rows)}) ===")
     for r in rows:
         tag_str = "  " + " ".join(r["tags"]) if r["tags"] else ""
-        print(f"  [{r['project'] or '—':20}]  {r['title']}{tag_str}")
+        print(f"  {_scope(r):22}  {r['title']}{tag_str}")
         print(f"    id: {r['id']}  created: {r['created_at']}")
         print()
 
@@ -782,7 +968,7 @@ def cmd_dump(args):
         if note:
             print("─" * 60)
             print(f"Title:   {note['title']}")
-            print(f"Project: {note['project']}")
+            print(f"Project: {_scope(note, '-')}")
             print(f"Tags:    {note['tags']}")
             print(f"Created: {note['created_at']}")
             print("─" * 60)
@@ -816,7 +1002,13 @@ def cmd_delete(args):
         print(f"Deleted: {note['id']}")
 
     elif args.project:
-        matches = db.list_notes(project=args.project)
+        # `list_notes(project=X)` includes global notes, because they apply to
+        # X — but `delete_notes_by_project` only removes notes actually filed
+        # under X. Counting the wider set would make a destructive prompt ask
+        # permission for work it will not do, and would defeat the
+        # nothing-to-delete short-circuit below.
+        matches = [n for n in db.list_notes(project=args.project)
+                   if n["project"] == args.project]
         if not matches:
             print(f"No notes in project '{args.project}'.")
             return
@@ -843,11 +1035,19 @@ def cmd_delete_project(args):
     if not proj:
         print(f"Project '{args.name}' not found.")
         sys.exit(1)
-    note_count = len(db.list_notes(project=args.name))
+    # notes actually scoped to this project, not what `list --project` shows:
+    # that now includes global notes, which are not this project's to delete
+    note_count = len([n for n in db.list_notes(project=args.name)
+                      if n["project"] == args.name])
     what = f"project '{args.name}'" + (f" and its {note_count} note(s)" if args.with_notes else "")
     if note_count and not args.with_notes:
         print(f"Note: {note_count} note(s) reference this project and will be kept, unlinked "
               f"(re-run with --with-notes to delete them too).")
+    root_count = len(proj["roots"])
+    if root_count:
+        # Roots go unconditionally — say so before asking, since the notes
+        # warning above sets the expectation that collateral is enumerated.
+        print(f"Note: {root_count} directory binding(s) will be removed.")
     if not _confirm(f"Delete {what}? Cannot be undone. (y/n)", args.force):
         print("Cancelled.")
         return
@@ -857,6 +1057,12 @@ def cmd_delete_project(args):
 
 def _export_markdown(data: dict) -> str:
     lines = [f"# evoctx export — {_now_str()}", ""]
+    # roots live once in the dump, under the top-level key, so an importer has
+    # a single source for them. Group them here rather than reading a
+    # per-project copy that would have to be kept in step.
+    roots_by_project: dict[str, list[dict]] = {}
+    for r in data.get("project_roots", []):
+        roots_by_project.setdefault(r["project"], []).append(r)
     for proj in data["projects"]:
         lines.append(f"## Project: {proj['name']}")
         lines.append("")
@@ -866,12 +1072,21 @@ def _export_markdown(data: dict) -> str:
             lines += ["**Conventions**", "", proj["conventions"], ""]
         if proj["open_questions"]:
             lines += ["**Open questions**", "", proj["open_questions"], ""]
+        proj_roots = roots_by_project.get(proj["name"], [])
+        if proj_roots:
+            lines += ["**Directories**", ""]
+            # label the machine: an export can carry roots that exist on a
+            # different machine, and an unlabelled path claims to be local
+            lines += [f"- `{r['root_path']}` (on {r['machine']})" for r in proj_roots]
+            lines.append("")
     lines.append("## Notes")
     lines.append("")
     for note in data["notes"]:
         tags = " ".join(note["tags"])
+        # a deliberate choice, versus the absence of one
+        scope = _scope(note, dash="no project")
         lines.append(f"### {note['title']}")
-        lines.append(f"*{note['project'] or 'no project'} · {note['created_at']} · {tags}*")
+        lines.append(f"*{scope} · {note['created_at']} · {tags}*")
         lines.append("")
         lines.append(note["content"])
         lines.append("")
@@ -920,7 +1135,7 @@ def cmd_sync(args):
     global_file = context_dir / "global.md"
     if global_file.exists():
         conventions = global_file.read_text(encoding="utf-8")
-        existing = db.get_project("global") or {}
+        existing = db.get_project("global", with_roots=False) or {}
         db.upsert_project(
             "global",
             overview=existing.get("overview", "Cross-project global conventions"),
@@ -936,7 +1151,7 @@ def cmd_sync(args):
         for f in sorted(templates_dir.glob("*.md")):
             name = _template_name(f.stem)
             conventions = f.read_text(encoding="utf-8")
-            existing = db.get_project(name) or {}
+            existing = db.get_project(name, with_roots=False) or {}
             db.upsert_project(
                 name,
                 overview=existing.get("overview", f"Template: {f.stem}"),
@@ -952,7 +1167,7 @@ def cmd_sync(args):
         for f in sorted(projects_dir.glob("*.md")):
             name = f.stem
             conventions = f.read_text(encoding="utf-8")
-            existing = db.get_project(name) or {}
+            existing = db.get_project(name, with_roots=False) or {}
             db.upsert_project(
                 name,
                 overview=existing.get("overview", ""),
@@ -1109,6 +1324,11 @@ def main():
     a.add_argument("title")
     a.add_argument("--project", "-p", default=None)
     a.add_argument("--tags", "-t", default="", help="comma-separated: '#decision,#auth'")
+    # dest is is_global because `global` is a Python keyword. Parity: the MCP
+    # write_note tool takes this, so a human must be able to say it too —
+    # otherwise only the assistant can express "this spans every project".
+    a.add_argument("--global", dest="is_global", action="store_true",
+                   help="Mark as deliberately cross-project (not the same as omitting --project)")
     g = a.add_mutually_exclusive_group()
     g.add_argument("--file", "-f", help="Read content from file")
     g.add_argument("--text", help="Inline content string")
@@ -1132,7 +1352,23 @@ def main():
     d.add_argument("--dir", default=None, help="Directory to scan (default: cwd)")
     d.add_argument("--name", default=None, help="Override project name")
     d.add_argument("--template", default=None, help="Stamp with template conventions (e.g. fastapi)")
-    d.add_argument("--force", action="store_true", help="Overwrite if project already exists")
+    # `--rescrape` is the honest name: everywhere else in this CLI `--force`
+    # means "skip the confirmation", and on init it means the opposite — it is
+    # the destructive half. `--force` stays as an alias so existing
+    # invocations keep working; argparse shows both in --help, which is fine
+    # — the help text says what it does.
+    d.add_argument("--rescrape", "--force", dest="force", action="store_true",
+                   help="Replace the description with freshly scraped text "
+                        "(overview and conventions; open questions are kept)")
+    d.add_argument("--relink", action="store_true",
+                   help="Move this directory to this project if another already claims it")
+    d.add_argument("--yes", "-y", action="store_true",
+                   help="Skip the --relink confirmation prompt")
+
+    # unbind
+    ub = sub.add_parser("unbind", help="Remove a directory binding from a project")
+    ub.add_argument("--dir", default=None, help="Directory to unbind (default: cwd)")
+    ub.add_argument("--project", default=None, help="Project to unbind it from (default: whichever owns it)")
 
     # new-project
     e = sub.add_parser("new-project", help="Register a project manually")
@@ -1257,6 +1493,7 @@ def main():
         "show": cmd_show,
         "write-note": cmd_add,
         "add": cmd_add,
+        "unbind": cmd_unbind,
         "start-session": cmd_start_session,
         "end-session": cmd_end_session,
         "recent-sessions": cmd_recent_sessions,

@@ -150,6 +150,36 @@ class PolicyEngine:
                 f"'{project}' (scope: {grant.projects}). The note was NOT saved."
             )
 
+    def check_write_global(self, grant: Grant, is_global: bool) -> None:
+        """A scoped grant may not write a note that spans every project.
+
+        `check_write_project` cannot catch this: a global note carries
+        `project=None`, and `allows_project(None)` returns True by design, so
+        that project-less notes stay visible to scoped grants. That is the
+        right rule for reads — but it means a grant scoped to one project
+        could write content that lands in *every* project's scoped read
+        (`get_project`, `search_context(project=…)`), which is precisely what
+        the scope exists to prevent.
+
+        Writing project-less notes stays allowed; only claiming global scope
+        requires holding global scope.
+
+        What this does NOT close, so nobody reads it as more than it is: a
+        scoped grant can still write a note with no project and no global
+        flag, and `allows_project(None)` means every other grant sees it on an
+        unscoped `search_context()` or `get_by_id()`. Content can still cross
+        scopes that way — that is the existing grant model, unchanged. This
+        refuses only the *claim* of global scope, which is what pulls a note
+        into every project's scoped read.
+        """
+        if is_global and not grant.allows_all_projects():
+            raise PolicyDenied(
+                f"Denied: grant '{grant.name}' is scoped to {grant.projects}, and a "
+                f"global note appears under every project. Write it without "
+                f"is_global, or ask the user to activate a wider grant. "
+                f"The note was NOT saved."
+            )
+
     # ── audited tool entry points (what the server calls) ────────────────────
     # Lifecycle per call: grant check → scope → store → redact → audit → out.
     # The audited query field is post-redaction — a search string can itself
@@ -240,16 +270,21 @@ class PolicyEngine:
 
     def t_write_note(self, client: str, title: str, content: str,
                      project: str | None, tags: list[str] | None,
-                     session_id: str | None) -> str:
+                     session_id: str | None, is_global: bool = False) -> str:
         grant = self._guard(client, "write_note")
         self.check_write_project(grant, project)
+        self.check_write_global(grant, is_global)
         (title, content), hits = self._redact_inbound(grant, title, content)
         note_id = self.db.add_note(title, content, project=project, tags=tags,
-                                   session_id=session_id, author_client=client)
-        # title only — the content is already in the store, don't duplicate it
+                                   session_id=session_id, author_client=client,
+                                   is_global=is_global)
+        # title only — the content is already in the store, don't duplicate it.
+        # is_global is recorded because "deliberately cross-project" and "no
+        # project chosen" are the distinction this release exists to make, and
+        # the audit log is the durable record of who did what.
         self._log(client, "write_note", "write", grant,
-                  {"title": title, "project": project}, [note_id], note_id,
-                  inbound_hits=hits)
+                  {"title": title, "project": project, "is_global": is_global},
+                  [note_id], note_id, inbound_hits=hits)
         return note_id
 
     def t_start_session(self, client: str, project: str | None, intent: str | None) -> dict:

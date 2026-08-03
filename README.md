@@ -197,7 +197,7 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 | `get_project(name)` | `evoctx get-project NAME` |
 | `search_context(...)` | `evoctx search-context QUERY [--project NAME] [--limit N]` (alias: `search`) |
 | `get_by_id(id)` | `evoctx get-by-id ID` — ID prefix is enough (alias: `show`) |
-| `write_note(...)` | `evoctx write-note "Title" --project NAME --tags "#decision" --text "..."` (alias: `add`) |
+| `write_note(...)` | `evoctx write-note "Title" --project NAME --tags "#decision" --text "..."` (alias: `add`); `--global` marks a note as spanning every project |
 | `start_session(...)` | `evoctx start-session [--project NAME] [--intent "..."]` |
 | `end_session(summary)` | `evoctx end-session "summary" [--id ID]` — default: latest open |
 | `recent_sessions(...)` | `evoctx recent-sessions [--project NAME] [--limit N]` |
@@ -205,7 +205,9 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 Plus store management commands with no MCP equivalent (deliberately — deletion and bulk ops are human-only):
 
 ```
-evoctx init [--dir PATH] [--template NAME]   # register project (auto-detects stack)
+evoctx init [--dir PATH] [--template NAME]   # register project + bind the directory to it
+            [--rescrape] [--relink] [--yes]   # replace description / move the directory / skip the prompt
+evoctx unbind [--dir PATH] [--project NAME]   # remove a directory binding (the project stays)
 evoctx new-project NAME --overview "..."
 evoctx import-dir path/to/notes/ --project NAME
 evoctx update-project NAME --field conventions --file conventions.md
