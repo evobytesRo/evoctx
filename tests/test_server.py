@@ -20,13 +20,50 @@ def server(tmp_path, monkeypatch):
 EXPECTED_TOOLS = {
     "list_projects", "get_project", "search_context", "get_by_id",
     "write_note", "start_session", "end_session", "recent_sessions",
-    "list_grants",
+    "list_grants", "register_project",
 }
 
 
 def test_all_tools_registered(server):
     tools = asyncio.run(server.mcp.list_tools())
     assert {t.name for t in tools} == EXPECTED_TOOLS
+
+
+def test_both_instruction_channels_offer_registration(server):
+    """`instructions=` and `docs/instructions-snippet.md` are the same guidance
+    delivered two ways — the handshake block every client gets automatically,
+    and the text a user pastes into a rules file. They drifted: phase 3 added
+    `register_project`, the snippet was updated, and the handshake block kept
+    telling the assistant to show a hint and stop in the one branch the tool
+    exists for. The automatic channel was the stale one.
+
+    Pinned on the null branch specifically, because that is where the drift
+    was and where it costs the release its headline capability.
+    """
+    from pathlib import Path
+
+    delivered = server.mcp.instructions or ""
+    snippet = (Path(__file__).parent.parent / "docs" / "instructions-snippet.md"
+               ).read_text(encoding="utf-8")
+
+    for channel, text in (("instructions=", delivered), ("snippet", snippet)):
+        assert "workspace.hint" in text, f"{channel} lost the null-branch guidance"
+        assert "register_project" in text, (
+            f"{channel} tells the assistant what to do when no project resolves "
+            f"but never names the tool that fixes it"
+        )
+
+
+def test_every_registered_tool_is_grantable(server):
+    """The two lists must not drift. A tool registered with FastMCP but absent
+    from `ALL_TOOLS` is denied to everyone, permanently and silently: a
+    wildcard grant expands to `ALL_TOOLS`, an enumerated one is rejected by
+    `_parse_grant` for naming a tool it does not know, and `grant upgrade` has
+    nothing to add. The tool would simply never be callable."""
+    from evoctx.grants import ALL_TOOLS
+
+    tools = asyncio.run(server.mcp.list_tools())
+    assert {t.name for t in tools} == set(ALL_TOOLS)
 
 
 def test_write_then_search_then_get(server):

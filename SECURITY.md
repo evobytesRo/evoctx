@@ -92,6 +92,16 @@ Nothing verifies them. Grant `client:` matching and audit-log attribution are fo
 your own setup and getting a readable record**, not for authenticating who's really on the
 other end of the connection. A process willing to lie about its name defeats this instantly.
 
+**Identity is not the only unverified client assertion.** `confirmed_by_user` on
+`register_project()` is the same shape: the client asserts that a human read and approved the
+description it wrote, nothing verifies that, and it durably stamps `description_reviewed_at` —
+a column whose whole meaning is "a human approved this text". A client that always sends it
+makes every description it writes read as human-approved, permanently. Authorship is never
+laundered: `description_author` records the client either way, deliberately, so **when
+provenance matters read the author, not the review stamp.** This compounds §2 — a description
+carrying an approval stamp is trusted more by later sessions, which is exactly the
+amplification §2 warns about.
+
 ## 6. The audit log is an accountability record, not tamper-proof forensics
 
 `audit_log` is append-only, enforced by SQL triggers that raise on `UPDATE`/`DELETE`. That stops

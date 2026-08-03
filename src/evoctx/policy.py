@@ -16,10 +16,10 @@ import json
 from typing import Callable, TypeVar
 
 from .audit import AuditWriter
-from .db import Database
-from .grants import Grant, GrantStore
+from .db import Database, RootNotADirectory, RootOwnedByAnotherProject
+from .grants import ALL_TOOLS, Grant, GrantStore, predates_current_tools
 from .redact import Redactor
-from .resolve import NONE, resolve_workspace
+from .resolve import NONE, current_directory, resolve_workspace
 
 T = TypeVar("T")
 
@@ -65,10 +65,27 @@ class PolicyEngine:
                 f"a matching grant: evoctx grant activate <name>"
             )
         if not grant.allows_tool(tool):
+            # Two different problems, two different fixes. A grant can lack a
+            # tool because a release added it after the grant was written, or
+            # because the user left it out on purpose — and only the first is
+            # something `grant upgrade` will act on. `predates_current_tools`
+            # is what distinguishes them; the inference "the grant does not
+            # name it, so the grant predates it" is exactly the one this
+            # release refuses to make, because it turns a deliberate
+            # restriction into an out-of-date file. Telling the first user to
+            # "activate a wider grant" sends them after a grant that does not
+            # exist; telling the second to run `grant upgrade` sends them to a
+            # command that will not touch their grant.
+            outdated = tool in ALL_TOOLS and predates_current_tools(grant.tools)
+            fix = ("run: evoctx grant upgrade — this grant predates "
+                   f"{tool}() and lists only the tools that existed when it "
+                   "was written"
+                   if outdated else
+                   "activate a wider grant: evoctx grant activate <name>")
             raise PolicyDenied(
                 f"Denied: grant '{grant.name}' does not allow {tool}(). "
                 f"Allowed: {', '.join(grant.effective_tools())}. Ask the user to "
-                f"activate a wider grant: evoctx grant activate <name>"
+                f"{fix}"
             )
         return grant
 
@@ -104,6 +121,29 @@ class PolicyEngine:
         block["nearby"] = [
             n for n in block["nearby"] if grant.allows_project(n["project"])
         ]
+        # An unregistered directory is fixable from inside the conversation
+        # now, so the hint has to say so — it is the channel the model actually
+        # relays, and a hint naming only the CLI sends the user out of the
+        # session to do what the assistant could have done.
+        #
+        # Only at rung 3, which `suggested_name` identifies: a refused
+        # `CONTEXT_PROJECT` is a config typo, and registering there would bind
+        # this directory to a name that came from a misconfigured env var,
+        # while "no readable cwd" is a workspace `register_project` genuinely
+        # cannot bind. Both keep the CLI text.
+        #
+        # Only when the grant allows the tool. Offering a call the caller will
+        # be denied is worse than offering the CLI, which always works.
+        if (block["project"] is None and block.get("suggested_name")
+                and grant.allows_tool("register_project")):
+            name = block["suggested_name"]
+            block["hint"] = (
+                f"This directory is not registered to any project, and no name "
+                f"was guessed. Ask the user whether to register it; if they "
+                f"agree, read the workspace and call register_project("
+                f"name='{name}', overview=...). They can also do it themselves "
+                f"by running in that directory: evoctx init --name {name}"
+            )
         project = block.get("project")
         if project is not None and not grant.allows_project(project):
             block["project"] = None
@@ -297,6 +337,63 @@ class PolicyEngine:
         result = {"projects": projects, "workspace": self.workspace(grant)}
         self._log(client, "list_projects", "read", grant, None, projects, result)
         return result
+
+    def t_register_project(self, client: str, name: str, overview: str,
+                           conventions: str = "", open_questions: str = "",
+                           confirmed_by_user: bool = False) -> dict:
+        """Create-or-link a project and bind the server's own directory to it.
+
+        **The path is not an argument and deliberately cannot be.** The
+        assistant supplies the description; the server supplies the location.
+        A path parameter would put the one fact the caller cannot verify back
+        under the caller's control, which is the whole failure this release
+        exists to remove.
+
+        Authorship is the calling client, unconditionally. `confirmed_by_user`
+        records that a human approved the text and never changes who wrote it:
+        if approval flipped the label to human-authored, one rubber-stamped
+        "looks good" would erase the provenance permanently. It is also an
+        unverifiable self-report — like every other client claim here, this is
+        policy for cooperative clients, not a sandbox — so it is stored as the
+        weaker fact it actually is.
+        """
+        grant = self._guard(client, "register_project")
+        name = name.strip()
+        if not name:
+            # Nothing downstream refuses this: `fnmatch("", "*")` is True, so
+            # the scope check passes, and no layer validates the name. An empty
+            # project would take the directory binding and make every correct
+            # registration afterwards fail with "already registered to ''" —
+            # unfixable from here, since deleting is human-only by design.
+            return {"error": "A project name is required. Use the "
+                             "`suggested_name` from list_projects(), or ask "
+                             "the user what to call it."}
+        self.check_write_project(grant, name)
+        cwd = current_directory()
+        if cwd is None:
+            return {"error": "This server has no readable working directory, "
+                             "so there is nothing to register. Ask the user to "
+                             "run: evoctx init --name <name>"}
+        # masked before storage, like every other write that takes free text
+        (overview, conventions, open_questions), inbound = self._redact_inbound(
+            grant, overview, conventions, open_questions)
+        try:
+            root = self.db.register_project(
+                name, cwd, overview=overview, conventions=conventions,
+                open_questions=open_questions, author=client,
+                reviewed=confirmed_by_user,
+            )
+        except (RootOwnedByAnotherProject, RootNotADirectory, ValueError) as e:
+            # expected refusals, not failures: they carry the reason a human
+            # needs, and an exception would reach the client as a stack trace
+            return {"error": str(e)}
+        # the scoped read, not the raw row: linking an existing project is the
+        # main case, and returning it unfiltered would hand back an overview
+        # this grant redacts and notes its exclude_tags hide
+        project = self.get_project(grant, name)
+        self._log(client, "register_project", "write", grant, {"name": name},
+                  [name], project, inbound_hits=inbound)
+        return {**(project or {"name": name}), "root": root}
 
     def t_get_project(self, client: str, name: str) -> dict | None:
         grant = self._guard(client, "get_project")

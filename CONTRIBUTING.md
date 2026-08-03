@@ -42,11 +42,16 @@ before tagging:
 2. `CHANGELOG.md` top heading is that version with today's date, and its summary covers the
    whole release.
 3. `README.md` status line names that version.
-4. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean.
-5. Push `main`, wait for CI green — the tag is what publishes.
-6. `git tag -a vX.Y.Z && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
+4. **If this release adds an MCP tool:** it is in `ALL_TOOLS`, registered in `server.py`, and
+   the *outgoing* complete tool set is appended to `PRIOR_TOOL_SETS` — otherwise every
+   existing enumerated grant silently loses the new tool with nothing reporting it.
+   `test_prior_tool_sets_covers_the_previous_release` fails until you do, and its literal is
+   the thing to update.
+5. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean.
+6. Push `main`, wait for CI green — the tag is what publishes.
+7. `git tag -a vX.Y.Z && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
    trusted publishing, and cuts the GitHub release.
-7. Install from PyPI into a clean venv and check `evoctx version`.
+8. Install from PyPI into a clean venv and check `evoctx version`.
 
 ## Design principles, if you're extending this
 

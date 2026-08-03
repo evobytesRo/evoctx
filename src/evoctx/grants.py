@@ -24,18 +24,66 @@ import yaml
 ALL_TOOLS = [
     "list_projects", "get_project", "search_context", "get_by_id",
     "write_note", "start_session", "end_session", "recent_sessions",
-    "list_grants",
+    "list_grants", "register_project",
 ]
 
 # A grant may list "*" instead of enumerating tools, so it never goes stale as
-# tools are added. NOT the shipped default: 0.1.2 raises GrantError on any
-# unrecognised name including "*", and that raise happens inside
-# grants() -> active_grant() -> PolicyEngine.check(), so a 0.1.3-written
-# grants.yaml reaching a 0.1.2 machine — via rollback, or a cloud-synced home
-# directory — would fail EVERY tool call there. Defaulting to "*" would create
-# exactly the lockout this release exists to remove, pointed backwards.
-# Flip the default once 0.1.2 is no longer in circulation.
+# tools are added. It is now the shipped default, and 0.1.4 is where that
+# changed.
+#
+# 0.1.3's default enumerated every tool, on the reasoning that "*" breaks a
+# 0.1.2 machine: 0.1.2 raises GrantError on any unrecognised name including
+# "*", inside grants() -> active_grant() -> PolicyEngine.check(), so every tool
+# call there fails. True — but it does not distinguish the options, which is
+# what a default has to do. An enumerated default listing `register_project`
+# breaks 0.1.2 identically, for the identical reason, and a default that
+# omitted the tool to stay 0.1.2-readable would deny it on every fresh 0.1.4
+# store instead. Only 0.1.3+ drops unknown names gracefully. The 0.1.2 exposure
+# is the same whichever way this goes, so it decides nothing.
+#
+# What does decide: a fresh store has no deliberately-narrow grant to respect,
+# so "*" costs nothing there and means the file never needs revisiting as tools
+# are added. Existing files are left alone and upgraded on request, by
+# `evoctx grant upgrade` — which preserves a narrow grant by refusing to touch
+# one at all (see `predates_current_tools`), NOT by "only adding tool names".
+# That distinction is the round-1 defect of this release: adding every missing
+# name to a read-only grant hands over the whole store while leaving scope and
+# expiry untouched to look conservative.
 TOOLS_WILDCARD = "*"
+
+# The complete tool set of each earlier release, newest first.
+#
+# `grant upgrade` exists for one situation: a grant that meant "everything"
+# when it was written, and no longer does because a release added a tool. That
+# is only recognisable against what "everything" *was*. Without this list the
+# only available rule is "every tool this build ships that you did not name",
+# which cannot tell a stale everything-grant from a deliberately narrow one —
+# and would answer a read-only payments grant by adding `write_note` to it.
+#
+# So an enumerated grant is auto-upgraded only when its tools are exactly one
+# of these sets. Anything else is the user's own composition: neither edited
+# nor reported. `doctor` passes it, because a narrowing someone made on
+# purpose is not a fault, and reporting it would make the health check
+# unsatisfiable without destroying the grant.
+#
+# **Append the outgoing set here whenever ALL_TOOLS grows.** A release that
+# forgets does NOT degrade to the manual channel — it fails silently and in the
+# worst direction: the stale grant matches no prior set, so it is never
+# considered at all. `doctor` then passes a grant that does not cover the
+# build's tools, `grant upgrade` reports nothing missing while blaming the user
+# for a narrowing they never made, and the denial sends them after a wider
+# grant that does not exist. That is precisely the lockout this release
+# removes, reintroduced by an omission.
+#
+# `test_prior_tool_sets_covers_the_previous_release` is what actually enforces
+# the append; this comment cannot. Growing ALL_TOOLS without adding the
+# outgoing set fails in CI instead of on someone's machine.
+PRIOR_TOOL_SETS = [
+    # 0.1.0 - 0.1.3
+    ["list_projects", "get_project", "search_context", "get_by_id",
+     "write_note", "start_session", "end_session", "recent_sessions",
+     "list_grants"],
+]
 
 DEFAULT_GRANTS_YAML = """\
 # evoctx grants — what a connected AI client may do with your store.
@@ -43,20 +91,24 @@ DEFAULT_GRANTS_YAML = """\
 # Fields:
 #   client    glob matched against the client's self-reported name
 #   tools     which MCP tools the client may call. "*" means every tool,
-#             including ones added by future releases — switch to it if you
-#             don't want to revisit this list when evoctx gains a tool.
-#             (Left enumerated by default so this file stays readable by
-#             evoctx 0.1.2, which rejects "*". Safe to change once every
-#             machine sharing this store is on 0.1.3+.)
+#             including ones added by future releases, which is why it is the
+#             default — an enumerated list silently denies each new tool until
+#             you come back and add it. Enumerate when you mean to restrict,
+#             but know what that costs: a list you wrote yourself is NEVER
+#             auto-upgraded, deliberately, because evoctx cannot tell a
+#             restriction you meant from one a release left behind. Add new
+#             tools by hand, or use "*". `evoctx grant upgrade` only refreshes
+#             a grant that listed every tool of an earlier release. (Note:
+#             evoctx 0.1.2 rejects "*" and would fail every call reading this
+#             file. So does any list naming a tool 0.1.2 never had, so this is
+#             not a reason to enumerate.)
 #   scope     projects allowlist (glob ok) + tags whose notes are invisible
 #   redactions  regex rewrites applied to every response before it leaves
 #   expires   mandatory: ISO timestamp, or +Nd/+Nh/+Nm relative to activation
 grants:
   - name: everything
     client: "*"
-    tools: [list_projects, get_project, search_context, get_by_id,
-            write_note, start_session, end_session, recent_sessions,
-            list_grants]
+    tools: ["*"]
     scope:
       projects: ["*"]
       exclude_tags: []
@@ -81,6 +133,117 @@ _RELATIVE_EXPIRES = re.compile(r"^\+(\d+)([dhm])$")
 
 class GrantError(ValueError):
     """grants.yaml is invalid."""
+
+
+_NAME_KEY = re.compile(r"^\s*-\s+name:\s*[\"']?([^\"'\s#]+)", re.MULTILINE)
+_TOOLS_KEY = re.compile(r"^\s*tools:\s*", re.MULTILINE)
+
+
+def predates_current_tools(tools: list[str]) -> bool:
+    """Did this exact tool list mean "every tool" in some earlier release?
+
+    The one rule behind three answers that have to agree: whether `upgrade`
+    edits a grant, whether `doctor` reports it, and whether a denial tells the
+    user their grant is out of date. If they disagree, `doctor` fails a config
+    the upgrade refuses to fix, or a denial sends someone to run a command
+    that will not touch their grant.
+
+    False for a wildcard grant (nothing to be out of date about) and false for
+    any list the user composed themselves — a grant missing `write_note`
+    because someone wanted it read-only does not predate anything.
+    """
+    return (TOOLS_WILDCARD not in tools
+            and set(tools) in [set(s) for s in PRIOR_TOOL_SETS])
+
+
+def _insert_tools(text: str, close_at: int, names: list[str]) -> str:
+    """`names` added just inside the `]` at `close_at`. One definition, because
+    the candidate that gets validated and the text that gets written must be
+    produced the same way or the validation proves nothing."""
+    return text[:close_at] + ", " + ", ".join(names) + text[close_at:]
+
+
+def _tools_by_grant(text: str) -> dict[str, set[str]]:
+    """Grant name -> the tools it actually grants, parsed from a candidate
+    document that is not on disk.
+
+    The point is the "not on disk" part: it lets `upgrade_tools` check its own
+    edit before writing, instead of writing and hoping the rollback path is
+    reachable.
+
+    Uses `yaml.safe_load` — the same loader `grants()` does — but not
+    `_parse_grant`, so this answers "would this file load, and what would it
+    grant", not "is every grant in it valid". That is the question the caller
+    has: it is inserting names into one sequence, which cannot make a
+    previously-valid grant invalid.
+
+    Entries whose tools are not a plain list of strings are skipped rather
+    than coerced. `tools: ["*", [oops]]` loads fine — the wildcard
+    short-circuits `_parse_grant`'s unknown-name check, so the nested list
+    survives — and `set()` on it raises TypeError from a function whose
+    callers are guarding for parse errors.
+    """
+    data = yaml.safe_load(text) or {}
+    out: dict[str, set[str]] = {}
+    for raw in data.get("grants") or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        tools = raw.get("tools") or []
+        if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools):
+            continue
+        out[str(raw["name"])] = set(tools)
+    return out
+
+
+def _tools_sequence_span(text: str, grant_name: str) -> int | None:
+    """Offset of the closing `]` of `grant_name`'s `tools:` flow sequence.
+
+    Returns None when there is nothing safe to edit — the grant is not found,
+    it has no `tools:` before the next grant begins, or its tools are a block
+    sequence rather than a bracketed one. None means "tell the user", never
+    "guess": this file gates every tool call, so a bad edit denies all of them.
+
+    Brackets are matched outside string literals, so a tool name containing
+    `]` cannot unbalance the scan — the same rule `install.py` applies to
+    `.code-workspace` files, for the same reason.
+    """
+    starts = {m.group(1): m.start() for m in _NAME_KEY.finditer(text)}
+    if grant_name not in starts:
+        return None
+    begin = starts[grant_name]
+    # bounded by the next grant, so a later grant's tools: is never edited
+    later = [s for s in starts.values() if s > begin]
+    end = min(later) if later else len(text)
+
+    key = _TOOLS_KEY.search(text, begin, end)
+    if key is None:
+        return None
+    i = key.end()
+    while i < end and text[i] in " \t":
+        i += 1
+    if i >= end or text[i] != "[":
+        return None            # block sequence, or empty — not ours to rewrite
+
+    depth, in_string, quote, escaped = 0, False, "", False
+    while i < end:
+        c = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif c == "\\":
+                escaped = True
+            elif c == quote:
+                in_string = False
+        elif c in "\"'":
+            in_string, quote = True, c
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None                # unbalanced — treat as unreadable, not as editable
 
 
 @dataclass
@@ -233,6 +396,155 @@ class GrantStore:
             self.grants_path.write_text(DEFAULT_GRANTS_YAML, encoding="utf-8")
         if not self.active_path.exists():
             self.activate("everything")
+
+    def missing_tools(self) -> dict[str, list[str]]:
+        """Per grant that *meant every tool*, the tools it no longer covers.
+
+        Deliberately not "every tool this build ships that you did not name".
+        That rule cannot distinguish a grant left behind by a release from one
+        someone narrowed on purpose, so it answers a read-only payments grant
+        by reporting `write_note` as missing — and then `doctor` fails a
+        correct configuration, the denial text claims a grant "predates" a tool
+        it excludes on purpose, and `upgrade` offers to add it. The narrowing
+        is the user's decision and nothing here gets to second-guess it.
+
+        A grant counts as stale only when its tools are exactly one of
+        `PRIOR_TOOL_SETS` — a complete set from an earlier release, i.e.
+        provably "everything, as of then". Empty for a `"*"` grant, which is
+        what the wildcard is for.
+        """
+        out = {}
+        for name, grant in self.grants().items():
+            if not predates_current_tools(grant.tools):
+                continue
+            gap = [t for t in ALL_TOOLS if t not in grant.tools]
+            if gap:
+                out[name] = gap
+        return out
+
+    def upgrade_tools(self, dry_run: bool = False) -> dict:
+        """Add newly-shipped tools to a grant that meant *every* tool when it
+        was written.
+
+        Exists because **adding an MCP tool denies it to every existing user**:
+        a grant lists the tools that existed when it was written, and a name
+        it does not contain is refused. A release that adds a tool therefore
+        has to ship the way to grant it, or the tool is unreachable for
+        everyone who already has a `grants.yaml`.
+
+        **Which grants those are is `predates_current_tools`' answer, and the
+        protection lives there — not in "we only add tool names".** That was
+        the original reasoning and it is insufficient: adding every missing
+        tool name to a read-only payments grant hands over the whole store
+        just as surely as rewriting it to `"*"` would, while leaving scope and
+        expiry untouched to make it look conservative. Only a grant whose
+        tools are exactly a `PRIOR_TOOL_SETS` entry is edited; a list the user
+        composed is left alone entirely — not edited, and not reported either,
+        since a narrowing someone made on purpose is not a fault to flag.
+        Scope, expiry and client are never touched by either path.
+
+        **Edits the text, does not round-trip the YAML.** `grants.yaml` is
+        documentation as much as configuration — the shipped file is more
+        comment than data, and users hand-edit it. `yaml.safe_dump` would
+        parse and re-emit it, dropping every comment and reordering keys, so
+        the upgrade would cost the user their own annotations. Instead the
+        missing names are inserted before the closing `]` of each grant's
+        `tools:` sequence, leaving every other byte untouched.
+
+        A grant whose `tools:` is a block sequence (`- list_projects` on its
+        own line) has no `]` to insert before, and guessing at indentation to
+        synthesise one is how a config file gets corrupted. Those are reported
+        under `manual` with the names to add, rather than edited.
+        """
+        # `errors` is per grant, not one field: success is per candidate now,
+        # so a single `error` alongside a populated `updated` reads as "nothing
+        # was written" on the same screen as the list of what was written.
+        report: dict = {"updated": {}, "manual": {}, "errors": {}, "backup": None}
+        gaps = self.missing_tools()
+        if not gaps:
+            return report
+
+        # Bytes, not text. `read_text`/`write_text` translate newlines, so a
+        # LF file on Windows comes back CRLF — every line rewritten, and a
+        # `.bak` that is not a copy of what was there. "Leaving every other
+        # byte untouched" has to be literally true of a file people version.
+        raw = self.grants_path.read_bytes()
+        text = original = raw.decode("utf-8")
+
+        candidates = []
+        for name, gap in gaps.items():
+            span = _tools_sequence_span(text, name)
+            if span is None:
+                report["manual"][name] = gap
+            else:
+                candidates.append((span, name, gap))
+
+        # **Each candidate is validated ALONE, against the untouched original.**
+        # Validating the combined edit and discarding everything on failure
+        # means one grant with a legacy quirk — a legal trailing comma is
+        # enough — vetoes every other grant in the file, so the upgrade path
+        # this release exists to ship degrades to a no-op and tells the user to
+        # hand-edit grants that needed nothing. Per-candidate, one bad grant
+        # costs only itself.
+        #
+        # Validating BEFORE the file is touched, rather than writing and
+        # rolling back: `grants()` runs yaml.safe_load, so a malformed sequence
+        # raises yaml.YAMLError, not GrantError, and a rollback guarded on the
+        # wrong exception leaves a corrupt grants.yaml on disk — which denies
+        # every tool call, not just this one.
+        accepted = []
+        for close_at, name, gap in candidates:
+            trial = _insert_tools(original, close_at, gap)
+            try:
+                landed = _tools_by_grant(trial)
+            except (GrantError, yaml.YAMLError, TypeError) as e:
+                # TypeError is a belt, not the fix: `_tools_by_grant` skipping
+                # entries whose tools are not a list of strings is what stops
+                # an unhashable `tools: ["*", [oops]]` elsewhere in the file
+                # from raising. Kept because nothing above this catches one if
+                # a future edit reintroduces the possibility, and the cost of
+                # being wrong is a traceback out of an unrelated grant.
+                report["errors"][name] = str(e)
+                report["manual"][name] = gap
+                continue
+            # ...and the names must actually land somewhere that grants them. A
+            # `]` inside a comment inside the sequence ends the bracket scan
+            # there, so the insert can go into the comment: valid YAML, parses
+            # clean, grants nothing, and every re-run appends another copy.
+            if not set(gap).issubset(landed.get(name, set())):
+                report["manual"][name] = gap
+                continue
+            accepted.append((close_at, name, gap))
+
+        if not accepted:
+            return report
+
+        # Reverse document order, so an edit never shifts an offset located
+        # before it.
+        for close_at, name, gap in sorted(accepted, reverse=True):
+            text = _insert_tools(text, close_at, gap)
+            report["updated"][name] = gap
+
+        # The composition, once. Each part is known good and the inserts are
+        # disjoint, so this should never fire — but "should never" is not a
+        # reason to write an unchecked file that gates every tool call.
+        try:
+            _tools_by_grant(text)
+        except (GrantError, yaml.YAMLError, TypeError) as e:
+            for name in report["updated"]:
+                report["errors"][name] = str(e)
+            report["manual"].update(report["updated"])
+            report["updated"] = {}
+            return report
+
+        if dry_run:
+            return report
+        backup = self.grants_path.with_suffix(".yaml.bak")
+        backup.write_bytes(raw)
+        self.grants_path.write_bytes(text.encode("utf-8"))
+        report["backup"] = backup
+        self._grants_mtime = -1.0
+        return report
 
     def activate(self, name: str) -> Grant:
         grant = self.grants().get(name)

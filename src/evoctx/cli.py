@@ -36,10 +36,11 @@ Setup:
   evoctx doctor                                               Verify store, grants, server, client configs
   evoctx --version | evoctx version                           Show the installed version
 
-Store management (human-only, no MCP equivalent):
+Store management (human-only unless noted):
 
   evoctx init [--dir PATH] [--name NAME] [--template NAME]   Register project + bind its directory
               [--rescrape] [--relink] [--yes]                 Replace description / move dir / skip prompt
+                                                              (MCP: register_project)
   evoctx unbind [--dir PATH] [--project NAME]                 Remove a directory binding (project stays)
   evoctx new-project NAME --overview "..."                    Register project manually
   evoctx new-template NAME --overview "..."                   Create a reusable template
@@ -321,6 +322,33 @@ def cmd_grant(args):
         print(f"Redactions:   {len(g.redactions)} pattern(s)")
         print(f"Expires:      {g.expires}")
 
+    elif args.action == "upgrade":
+        report = grant_store.upgrade_tools(dry_run=args.dry_run)
+        if not report["updated"] and not report["manual"]:
+            print("No grant is missing a tool this build ships.")
+            print("(Grants you narrowed yourself are left alone — `upgrade` only "
+                  "adds tools to a grant that listed every tool of an earlier "
+                  "release. Use `evoctx grant show NAME` to see one.)")
+            return
+        for name, tools in report["updated"].items():
+            verb = "would add" if args.dry_run else "added"
+            print(f"{verb} to '{name}': {', '.join(tools)}")
+        for name, tools in report["manual"].items():
+            # a block sequence, a sequence this scanner would have to guess at,
+            # or an edit that did not verify — all of them end here rather than
+            # in a half-applied file. The reason is attached to the grant it
+            # belongs to: a standalone error line reads as a verdict on the
+            # whole run, which since fix 2 it is not.
+            why = report["errors"].get(name, "")
+            first_line = why.splitlines()[0] if why else ""
+            print(f"'{name}' was not edited{f' ({first_line})' if first_line else ''}"
+                  f" — add by hand if you want it to have these: {', '.join(tools)}")
+        if report["backup"]:
+            print(f"\nBackup: {report['backup']}")
+        print(f"Config: {grant_store.grants_path}")
+        if report["updated"] and not args.dry_run:
+            print("Grants are hot-reloaded — no restart needed.")
+
     elif args.action == "activate":
         if not args.name:
             print("Usage: evoctx grant activate NAME")
@@ -510,8 +538,11 @@ def cmd_hook(args):
 
     if args.event == "session-start":
         print(
-            "evoctx: call start_session(project, intent), then recent_sessions() "
-            "before starting work — open entries there were likely interrupted."
+            "evoctx: call list_projects() first — it names the project this "
+            "directory belongs to, or says nothing matched, in which case offer "
+            "to register it with register_project(). Then start_session(project, "
+            "intent), then recent_sessions() before starting work — open entries "
+            "there were likely interrupted."
         )
         return
 
@@ -1397,7 +1428,8 @@ def main():
     g2.add_argument("--text")
 
     # init
-    d = sub.add_parser("init", help="Auto-detect project from a directory and register it")
+    d = sub.add_parser("init", help="Auto-detect project from a directory and register it "
+                                    "(MCP: register_project)")
     d.add_argument("--dir", default=None, help="Directory to scan (default: cwd)")
     d.add_argument("--name", default=None, help="Override project name")
     d.add_argument("--template", default=None, help="Stamp with template conventions (e.g. fastapi)")
@@ -1473,9 +1505,12 @@ def main():
     lg = sub.add_parser("list-grants", help="What the active grant allows (MCP: list_grants)")
     lg.add_argument("--client", default="cli", help="Evaluate as this client name")
 
-    gr = sub.add_parser("grant", help="Manage grants: list / show NAME / activate NAME / deactivate")
-    gr.add_argument("action", choices=["list", "show", "activate", "deactivate"])
+    gr = sub.add_parser("grant", help="Manage grants: list / show NAME / activate NAME / "
+                                      "deactivate / upgrade")
+    gr.add_argument("action", choices=["list", "show", "activate", "deactivate", "upgrade"])
     gr.add_argument("name", nargs="?", default=None)
+    gr.add_argument("--dry-run", action="store_true",
+                    help="upgrade only: show what would be added, write nothing")
 
     # install / doctor
     ins = sub.add_parser("install", help="Write MCP config for a client")

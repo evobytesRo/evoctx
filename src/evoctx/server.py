@@ -54,9 +54,13 @@ mcp = FastMCP(
         "At session start: call list_projects() first. It returns the known project names "
         "AND a `workspace` block naming the project this working directory belongs to — use "
         "that name; never infer one from the directory or the conversation. When "
-        "workspace.project is null nothing matched, and the answer is to show the user "
-        "workspace.hint, not to pick a plausible name: a note filed under a name that does "
-        "not exist is stranded, invisible under the real project. When workspace.confidence "
+        "workspace.project is null nothing matched: show the user workspace.hint and offer "
+        "to register this workspace — never pick a plausible name, because a note filed "
+        "under a name that does not exist is stranded, invisible under the real project. If "
+        "they agree, call register_project(name, overview, ...): read the workspace first "
+        "(README, manifests, entry points), propose workspace.suggested_name, and note that "
+        "the server binds its own directory — there is no path argument. When "
+        "workspace.confidence "
         "is 'default' the name is the launching folder's project and the workspace may span "
         "others listed in workspace.nearby — pass a name explicitly when the work targets "
         "one of those. "
@@ -99,8 +103,9 @@ def list_projects(ctx: Context) -> dict:
       the launching folder's project, and a workspace can span several repos,
       so when the work targets one of these, pass its name explicitly.
     - `cwd`, `suggested_name`, `hint` — present when unresolved: what the
-      server sees, and how to register it. Show the hint to the user rather
-      than working around it.
+      server sees, and how to register it. Show the hint to the user; when it
+      offers registration, ask before calling register_project(). Never work
+      around an unresolved workspace by inventing a name.
 
     Callers written against the older shape, which returned a bare list of
     names, will see a dict instead. The names are under `projects`.
@@ -259,6 +264,62 @@ def recent_sessions(ctx: Context, project: str | None = None, limit: int = 10) -
         limit: Max results (default 10)
     """
     return policy.t_recent_sessions(_client_name(ctx), project, limit)
+
+
+@mcp.tool()
+def register_project(
+    name: str,
+    overview: str,
+    ctx: Context,
+    conventions: str = "",
+    open_questions: str = "",
+    confirmed_by_user: bool = False,
+) -> dict:
+    """
+    Register this workspace as a project, binding it to the directory the
+    server is running in.
+
+    Call this only when list_projects() returned `workspace.project: null` and
+    the user has agreed to register — **ask first, every time.** Registration
+    creates a durable record under a name every future session will use.
+
+    **You do not choose the directory.** The server binds its own working
+    directory, the one reported as `workspace.cwd`. There is no path argument
+    and you cannot register somewhere else.
+
+    **You do choose the text, so read the workspace before writing it.** Open
+    the README, the manifests, the entry points. A description paraphrased from
+    the directory name is worse than none — it reads as knowledge to every
+    later session.
+
+    Args:
+        name: Project name. Use `workspace.suggested_name` unless the user
+              names it. If the name already exists, this LINKS the directory to
+              it and leaves its description alone — the normal case, since every
+              project created before directories existed has no path.
+        overview: What this codebase is, who it is for, what state it is in.
+                  A short paragraph, not a sentence and not a page.
+        conventions: Patterns worth obeying — layering rules, the "we always /
+                     we never" facts someone would otherwise learn by breaking
+                     them. Omit rather than pad.
+        open_questions: Decisions genuinely not yet made. Omit rather than pad.
+        confirmed_by_user: True only if you asked and they agreed, in this
+                           conversation. It records that a human approved the
+                           text; it does NOT change who is recorded as having
+                           written it, which is you either way.
+
+    Returns:
+        The registered project, plus `root` (the directory now bound) — or
+        `{"error": ...}` if registration was refused: a blank name, no readable
+        working directory, or the directory already belongs to another project.
+        On an error **nothing was written**. Relay the message and do not carry
+        on as though the project exists; a following start_session(project=…)
+        or write_note(project=…) under that name would strand its record.
+    """
+    return policy.t_register_project(
+        _client_name(ctx), name, overview, conventions, open_questions,
+        confirmed_by_user=confirmed_by_user,
+    )
 
 
 @mcp.tool()

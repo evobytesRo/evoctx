@@ -139,7 +139,11 @@ independently, so one client ending its session can't touch another's. `CONTEXT_
 MCP handshake name as a fallback) tags every note and audit entry with which client wrote it, so
 `evoctx audit --client cursor` and friends still separate them out afterward. The default
 `grants.yaml` grants every client the same access (`client: "*"`); scope it per-client if you
-want Copilot and Claude Code to see different tools or projects.
+want Copilot and Claude Code to see different tools or projects. One thing to know before you
+do: an enumerated `tools:` list you wrote yourself is **never** auto-upgraded — `evoctx grant
+upgrade` only refreshes a grant that listed every tool of an earlier release — so it will
+silently miss tools added by future releases. Add them by hand when you want them, or use
+`tools: ["*"]` and restrict with `scope:` instead.
 
 ## The `CONTEXT_CLIENT` env var
 

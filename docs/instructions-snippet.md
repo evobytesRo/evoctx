@@ -81,8 +81,13 @@ MUST DO, every session:
 - **Start:** call `list_projects()` first. It returns `projects` (the names) and a
   `workspace` block naming the project this directory belongs to — **use that name, never
   guess one.** If `workspace.project` is null, nothing matched: show the user
-  `workspace.hint` instead of inventing a name, because a note filed under a name that does
-  not exist is stranded and invisible under the real project. If `workspace.confidence` is
+  `workspace.hint` and offer to register this workspace — **never invent a name**, because a
+  note filed under a name that does not exist is stranded and invisible under the real
+  project. If they agree, call `register_project(name, overview, ...)`: read the workspace
+  first (README, manifests, entry points), since a description paraphrased from the directory
+  name reads as knowledge to every later session. The server binds its own directory — there
+  is no path argument, and `workspace.suggested_name` is the name to propose. If
+  `workspace.confidence` is
   `default`, the name is the launching folder's — pass a name explicitly when the work
   targets one of the repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and

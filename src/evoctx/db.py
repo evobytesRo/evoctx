@@ -1176,7 +1176,8 @@ class Database:
     def register_project(self, name: str, path, overview: str = "",
                          conventions: str = "", open_questions: str = "",
                          author: str = "cli", relink: bool = False,
-                         overwrite_description: bool = False) -> str:
+                         overwrite_description: bool = False,
+                         reviewed: bool = False) -> str:
         """Create-or-link a project and bind a directory, atomically.
 
         The one function both front-ends go through — `evoctx init` today, the
@@ -1213,11 +1214,23 @@ class Database:
             exists = self.conn.execute(
                 "SELECT 1 FROM projects WHERE name = ?", (name,)
             ).fetchone()
+            wrote_description = not exists or overwrite_description
             if not exists:
                 _insert_project_row(self.conn, name, overview, conventions,
                                     open_questions, author)
             elif overwrite_description:
                 _update_description(self.conn, name, overview, conventions, author)
+            if reviewed and wrote_description:
+                # Only for text THIS call wrote. Linking a directory to an
+                # existing project writes no description, so stamping a review
+                # there would mark someone else's words as approved — the
+                # laundering the column exists to prevent, arrived at from the
+                # other side. Set after the write, inside the same
+                # transaction, because both writers clear it.
+                self.conn.execute(
+                    "UPDATE projects SET description_reviewed_at = ? WHERE name = ?",
+                    (_now(), name),
+                )
             _insert_root(self.conn, name, root, machine)
         return root
 

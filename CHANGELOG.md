@@ -123,7 +123,59 @@ until it is fixed. A store with no directories bound at all otherwise passes, si
 every store the moment it upgrades, and stays true for anyone whose projects are topics
 rather than code.
 
-**10. Response shapes changed — check this if you script against evoctx.** Additive except
+**10. New tool: `register_project`, so an assistant can register a workspace it has read.**
+`list_projects()` now says when a directory belongs to no project; this is how that gets
+fixed without the user leaving the conversation to run a CLI command.
+
+**The tool has no path argument, deliberately.** The server binds its own working directory
+— the one it already reports as `workspace.cwd`. A path parameter would put the single fact
+the caller cannot verify back under the caller's control, which is the failure this whole
+release exists to remove. The assistant supplies the description, having been told in the
+tool contract to read the workspace rather than paraphrase a directory name.
+
+Authorship is recorded as the calling client, always. `confirmed_by_user` records that a
+human approved the text and never changes who is recorded as having written it: if approval
+flipped that label, one rubber-stamped "looks good" would erase the provenance permanently.
+It is also an unverifiable self-report, so it is stored as the weaker fact it actually is —
+and it is ignored entirely when the call merely *links* an existing project, since no
+description was written for anyone to have approved.
+
+**11. `evoctx grant upgrade` — and you may need it.** Adding an MCP tool denies it to every
+existing user: a grant lists the tools that existed when it was written, so `register_project`
+is refused by every `grants.yaml` already on disk.
+
+**It only touches a grant that meant "every tool".** A grant is upgraded when its tool list
+is exactly the complete set of some earlier release — provably "everything, as of then". A
+list you composed yourself is left alone entirely, and **not** reported: `doctor` passes it,
+because a narrowing you made on purpose is not a fault. The reason is that "every tool this
+build ships that you did not name" cannot tell a grant a release left behind from one you
+narrowed deliberately, and would answer a read-only payments grant by adding `write_note` to
+it. Same rule decides all three answers, so they cannot disagree: what `upgrade` edits, what
+`doctor` reports, and whether a denial tells you your grant is out of date.
+
+The cost of that choice, stated plainly: **an enumerated grant you wrote yourself will
+silently miss tools added by future releases.** Add them by hand, or use `tools: ["*"]`.
+
+It adds names and nothing else — never scope, expiry or client. It edits the file's text
+rather than round-tripping the YAML, so your comments and line endings survive byte for byte;
+a `tools:` written as a block sequence is reported for you to edit rather than rewritten by
+guesswork. The candidate is parsed **before** anything is written and the result is checked
+to have actually granted what it claims, so a malformed or ineffective edit never reaches
+disk — a broken `grants.yaml` denies *every* call. The previous file is kept as
+`grants.yaml.bak`.
+
+`evoctx doctor` reports grants that predate the tools this build ships, and a denial for a
+tool that exists now names `grant upgrade` rather than sending you to look for a wider grant
+that was never the problem.
+
+**12. Fresh stores now default to `tools: ["*"]`.** 0.1.3 shipped an enumerated default to
+stay readable by 0.1.2, which rejects `"*"`. That reasoning does not survive contact with
+this release: an enumerated default naming `register_project` breaks 0.1.2 identically, and
+one omitting it would deny the tool on every fresh install. The 0.1.2 exposure is the same
+either way, so it decides nothing — and a fresh store has no deliberately-narrow grant to
+respect. Existing files are untouched; `grant upgrade` is opt-in.
+
+**13. Response shapes changed — check this if you script against evoctx.** Additive except
 for `list_projects()` above, but worth knowing before you upgrade:
 
 - `evoctx export --format json` gains a top-level `project_roots` key. **An export now

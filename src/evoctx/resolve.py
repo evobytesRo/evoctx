@@ -214,10 +214,12 @@ def resolve_workspace(db: Database, env: Mapping[str, str] | None = None,
     block["nearby"] = _nearby_roots(db, here, exclude=None)
     suggested = Path(here).name
     block["suggested_name"] = suggested or None
-    # The hint names the CLI rather than a tool because registration from the
-    # assistant side is step 3 of this release and does not exist yet. When it
-    # lands, this is where it gets offered — conditional on the grant allowing
-    # it, since a tool the caller may not use is not a next step.
+    # The CLI is the floor, not the whole answer. `PolicyEngine.workspace`
+    # replaces this hint with one offering `register_project()` when the
+    # caller's grant allows that tool — a tool the caller may not use is not a
+    # next step, and this function has no grant to check. Callers with no
+    # grant at all (`doctor`) are CLI users anyway, so the text they get here
+    # is already the right one for them.
     block["hint"] = (
         f"This directory is not registered to any project. Nothing was "
         f"resolved and no name was guessed. To register it, run in that "

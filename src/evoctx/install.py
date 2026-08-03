@@ -829,6 +829,21 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
                            f"'{active.grant.name}' expires {active.expires_at.isoformat()}"))
         else:
             checks.append(("active grant", False, f"{reason} — run: evoctx grant activate everything"))
+        # A grant that listed every tool of an earlier release goes silently
+        # short when a release adds one; the client discovers it as a denial
+        # mid-task, and this finds it first. Only that case — `missing_tools`
+        # judges it by `predates_current_tools`, not by "does not name it",
+        # because a grant narrowed on purpose is not out of date and failing
+        # it here would make this check unsatisfiable without destroying it.
+        gaps = gs.missing_tools()
+        if gaps:
+            listed = "; ".join(f"{n}: {', '.join(t)}" for n, t in sorted(gaps.items()))
+            checks.append(("grant tools", False,
+                           f"{len(gaps)} grant(s) predate tools this build ships "
+                           f"({listed}) — run: evoctx grant upgrade"))
+        else:
+            checks.append(("grant tools", True,
+                           "every grant covers the tools this build ships"))
     except GrantError as e:
         checks.append(("grants.yaml", False, str(e)))
 

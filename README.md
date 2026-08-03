@@ -202,6 +202,7 @@ MUST DO, every session:
 | `get_by_id(id)` | Full content after a search hit |
 | `write_note(title, content, project?, tags?)` | Record decisions and observations as you go |
 | `end_session(summary)` | Last call — closes the session with what was built/decided/open |
+| `register_project(name, overview, ...)` | Register this workspace as a project. No path argument — the server binds its own working directory; the assistant supplies only the description |
 | `list_grants()` | What the active grant allows — so "do you have access to X?" gets an honest answer |
 
 Writes are append-only by design: the assistant can add notes but never edit or delete. Deletion is a human-only operation. Note content over 256KB is rejected — split it into multiple notes. Every note also carries `author_client` (`cli` for a human, the client name for an assistant) so past notes read as informational context, not as instructions from the current session.
@@ -215,6 +216,7 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 | MCP tool | CLI |
 |---|---|
 | `list_projects()` | `evoctx list-projects` |
+| `register_project(...)` | `evoctx init [--name NAME]` |
 | `get_project(name)` | `evoctx get-project NAME` |
 | `search_context(...)` | `evoctx search-context QUERY [--project NAME] [--limit N]` (alias: `search`) |
 | `get_by_id(id)` | `evoctx get-by-id ID` — ID prefix is enough (alias: `show`) |
@@ -268,7 +270,8 @@ To tighten from there, add a scoped grant to `grants.yaml`
   - name: daily-coding
     client: "*"
     tools: [list_projects, get_project, search_context, get_by_id,
-            write_note, start_session, end_session, recent_sessions, list_grants]
+            write_note, start_session, end_session, recent_sessions,
+            list_grants, register_project]
     scope:
       projects: ["*"]
       exclude_tags: ["#personal", "#finance"]   # these notes become invisible
@@ -288,8 +291,9 @@ evoctx grant deactivate               # every call denied until re-activated
 evoctx list-grants                    # what the active grant allows (MCP mirror)
 ```
 
-A denied call returns an error naming the exact `evoctx grant activate` command to fix it,
-so the AI can relay it to you. Scope-blocked notes read as nonexistent (no existence leak);
+A denied call returns an error naming the exact command to fix it — `evoctx grant activate`
+for a grant that is too narrow, `evoctx grant upgrade` for one written before the tool
+existed — so the AI can relay it to you. Scope-blocked notes read as nonexistent (no existence leak);
 out-of-scope **writes** fail loudly instead — silent write loss is worse.
 
 ## Redaction
