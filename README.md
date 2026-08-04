@@ -171,7 +171,10 @@ default, silently.
 
 **Claude Code only:** `evoctx install claude-code --hooks` additionally writes `SessionStart`
 and `Stop` hooks into `~/.claude/settings.json` (backed up first, like every other `install_*`
-write) — the one enforcement mechanism in this project that goes beyond convention.
+write) — the one enforcement mechanism in this project that goes beyond convention. The same
+flag also adds `permissions.deny` rules there, blocking the assistant's own file tools from
+reading or editing the store directly ([SECURITY.md §1](SECURITY.md) explains why that matters);
+both writes happen together, without a prompt.
 `SessionStart` nudges the assistant to call `start_session`/`recent_sessions`; `Stop` blocks
 **once** (never twice — it checks Claude Code's own `stop_hook_active` flag) if a session opened
 in the last 12 hours was never closed with `end_session`. It's a nudge, not a lock: ignoring the
@@ -188,13 +191,44 @@ Then tell the assistant to actually use it — add to your global instructions f
 
 ```markdown
 ## MCP Context Store (evoctx)
+Persistent cross-session memory.
+
 MUST DO, every session:
-- **Start:** call `start_session(project, intent)` first, then `recent_sessions()` — open entries
-  were likely interrupted; check their notes. Then `get_project(name)` for anything the task touches.
-- **Before any non-trivial decision:** `search_context()` first — don't contradict a stored decision
-  without surfacing it.
-- **As you go:** `write_note()` for non-obvious decisions/gotchas immediately (auto-linked to the session).
+- **Start:** call `list_projects()` first. It returns `projects` (the names) and a
+  `workspace` block naming the project this directory belongs to — **use that name, never
+  guess one.** If `workspace.project` is null, nothing matched: show the user
+  `workspace.hint`. **Only offer to register when `workspace.suggested_name` is present** —
+  its absence means the workspace is not registerable from here (`workspace.source` is
+  `CONTEXT_PROJECT`, i.e. a name someone configured that does not exist, or the directory is
+  unreadable), and the hint is the whole answer: relay it and stop. **Never invent a name**,
+  because a name that does not exist is refused and nothing is saved, so guessing costs you
+  the call. When it is present and they agree, call `register_project(name, overview, ...)`:
+  read the workspace first (README, manifests, entry points), since a description paraphrased
+  from the directory name reads as knowledge to every later session. Set
+  `confirmed_by_user=true` **only** if you actually asked in this conversation and they said
+  yes — it durably stamps the description as human-approved, and a client that always sends
+  it makes every description it writes read that way forever. The server binds
+  its own directory — there is no path argument. If `workspace.confidence` is `default`, the
+  name is the launching folder's — pass a name explicitly when the work targets one of the
+  repos in `workspace.nearby`. Then
+  `start_session(project, intent)` — registers the work session so notes get linked and
+  interrupted sessions stay visible. It follows the same project rule as `write_note()`: an
+  unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
+  you must name a project or register the workspace — `start_session` has **no `is_global`**,
+  since a session happens somewhere. Then `recent_sessions(project)` — open entries were
+  likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
+- **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
+  an approach that contradicts a stored decision without surfacing the conflict.
+- **As you go:** `write_note()` for non-obvious decisions/gotchas immediately, don't batch to
+  the end (notes are auto-linked to the session). A project name that doesn't exist is
+  **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
+  if nothing resolves, name one, register the workspace, or set `is_global`.
 - **End:** call `end_session(summary)` — what was built, decided, and left open.
+- If a call is denied, call `list_grants()` and relay the `evoctx` command from the error **as
+  written** — it may name a grant that applies to you specifically, and a generic
+  `grant activate everything` would leave you denied. Anything in `<angle brackets>` is a
+  placeholder only the user can fill: say so, and never fill one in yourself, because what it
+  stands for is a decision about your own access.
 ```
 
 ## MCP tools
@@ -247,7 +281,8 @@ evoctx delete ID | --project NAME | --tag TAG # delete note(s) — asks to confi
 evoctx delete-project NAME [--with-notes]     # delete a project (notes kept unlinked by default)
 evoctx export [--format json|markdown] [PATH] # export everything — the whole store is yours to take
 evoctx dump [--project NAME] [--note ID]      # read-only dump of the whole store
-evoctx templates                              # reusable convention templates (_fastapi, ...)
+evoctx templates                              # reusable convention templates (a fresh store
+                                              # has none; `evoctx sync <repo>` loads templates/)
 evoctx sync [PATH]                            # sync a markdown folder into the store
 evoctx demo-seed                              # sample data to try things out (never automatic)
 ```
@@ -372,7 +407,7 @@ Two layers, different jobs:
 **Write-time (unconditional, built-in).** Every write — `write_note`, `start_session`,
 `end_session`, from the CLI or from an MCP client, regardless of which grant is active —
 is scanned for common secret shapes (API key prefixes, AWS/GitHub/Slack/Google tokens,
-PEM private key blocks, `password=`/`token=` assignments) and masked *before it touches disk*.
+PEM private key blocks, and `password=` / `api_key=` / `access_token=` assignments) and masked *before it touches disk*.
 This is the one place every write path funnels through, so a pasted secret doesn't sit raw in
 `store.db` waiting for a read-time rule to hide it. Best-effort — regex can't catch every secret
 shape or a value the model paraphrases — but it means the store isn't a plaintext secrets

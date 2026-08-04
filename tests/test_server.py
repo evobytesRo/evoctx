@@ -42,16 +42,35 @@ def test_both_instruction_channels_offer_registration(server):
     """
     from pathlib import Path
 
+    root = Path(__file__).parent.parent
     delivered = server.mcp.instructions or ""
-    snippet = (Path(__file__).parent.parent / "docs" / "instructions-snippet.md"
-               ).read_text(encoding="utf-8")
+    snippet = (root / "docs" / "instructions-snippet.md").read_text(encoding="utf-8")
+    # **Three channels, not two.** README carries its own copy of the same
+    # block, and it is the copy people actually paste — it is on the page they
+    # are already reading, while the snippet file is a link away. It drifted
+    # exactly that way: at 0.1.4 release prep the README block was still
+    # byte-identical to v0.1.3's, telling the assistant to call
+    # `start_session(project, ...)` with a name it has no way to learn, which
+    # this release turned from a silent misfile into a hard refusal. This test
+    # pinned the two channels that did not drift.
+    readme = (root / "README.md").read_text(encoding="utf-8")
 
-    for channel, text in (("instructions=", delivered), ("snippet", snippet)):
+    for channel, text in (("instructions=", delivered),
+                          ("snippet", snippet),
+                          ("README", readme)):
         assert "workspace.hint" in text, f"{channel} lost the null-branch guidance"
         assert "register_project" in text, (
             f"{channel} tells the assistant what to do when no project resolves "
             f"but never names the tool that fixes it"
         )
+
+    # and README's copy must BE the snippet's, not merely resemble it
+    block = snippet[snippet.index("## MCP Context Store (evoctx)"):]
+    block = block[:block.index("```")].rstrip()
+    assert block in readme, (
+        "README's pasted block has diverged from docs/instructions-snippet.md — "
+        "they are the same guidance and only one of them gets updated"
+    )
 
 
 def test_no_channel_offers_is_global_to_start_session(server):

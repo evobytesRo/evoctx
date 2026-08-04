@@ -6,13 +6,16 @@ rather than catastrophic if it happens.
 
 ## Your data outlives the project
 
-The store is 4 plain SQLite tables. If this project goes quiet, your data isn't locked in —
+The store is 5 plain SQLite tables. If this project goes quiet, your data isn't locked in —
 it's queryable with any SQLite client on day one, and `evoctx export` (or `sqlite3 store.db`
 directly) gets it all out in JSON or Markdown.
 
 ```sql
-notes(id, title, content, project, tags, session_id, author_client, created_at, updated_at)
-projects(name, overview, conventions, open_questions, updated_at)
+notes(id, title, content, project, tags, session_id, author_client, created_at, updated_at,
+      is_global)
+projects(name, overview, conventions, open_questions, updated_at,
+         description_author, description_reviewed_at, attention_dismissed_at)
+project_roots(project, root_path, machine, added_at)
 sessions(id, project, client, intent, started_at, ended_at, summary)
 audit_log(id, ts, connection_id, client, grant_name, tool, action, query,
           record_ids, result_count, response_bytes, redactions_applied)
@@ -48,10 +51,19 @@ before tagging:
    `test_prior_tool_sets_covers_the_previous_release` fails until you do, and its literal is
    the thing to update.
 5. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean.
-6. Push `main`, wait for CI green — the tag is what publishes.
-7. `git tag -a vX.Y.Z && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
+6. **Run the audience sweep below against the release, don't read it.** Steps 1–5 are all
+   mechanical — version strings, tool lists, tests — and none of them can see a sentence that
+   became false. 0.1.4's release review found the README still carrying the *previous*
+   release's instructions snippet byte-for-byte, telling assistants to pass a project name
+   that this release turned into a hard refusal; a shipped example contradicting the shipped
+   default; and a security document promising write-time redaction on a path that did not have
+   it. Every one of those is invisible to a diff and obvious to one execution. Check counts and
+   enumerations first ("gains three checks", "5 tables", lists of flags) — they rot fastest and
+   are cheapest to verify.
+7. Push `main`, wait for CI green — the tag is what publishes.
+8. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
    trusted publishing, and cuts the GitHub release.
-8. Install from PyPI into a clean venv and check `evoctx version`.
+9. Install from PyPI into a clean venv and check `evoctx version`.
 
 ## Change the prose in the same commit as the code
 

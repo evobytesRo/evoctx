@@ -54,12 +54,17 @@ mcp = FastMCP(
         "At session start: call list_projects() first. It returns the known project names "
         "AND a `workspace` block naming the project this working directory belongs to — use "
         "that name; never infer one from the directory or the conversation. When "
-        "workspace.project is null nothing matched: show the user workspace.hint and offer "
-        "to register this workspace — never pick a plausible name, because a name that does "
-        "not exist is refused and nothing is saved. If "
+        "workspace.project is null nothing matched: show the user workspace.hint, and offer "
+        "to register this workspace ONLY when workspace.suggested_name is present — its "
+        "absence means this workspace cannot be registered from here (workspace.source is "
+        "CONTEXT_PROJECT, naming a project that does not exist, or the directory is "
+        "unreadable), and the hint is the whole answer. Never pick a plausible name, because "
+        "a name that does not exist is refused and nothing is saved. If it is present and "
         "they agree, call register_project(name, overview, ...): read the workspace first "
         "(README, manifests, entry points), propose workspace.suggested_name, and note that "
-        "the server binds its own directory — there is no path argument. When "
+        "the server binds its own directory — there is no path argument. Set "
+        "confirmed_by_user only if you asked in this conversation and they said yes: it "
+        "durably stamps the description as human-approved. When "
         "workspace.confidence "
         "is 'default' the name is the launching folder's project and the workspace may span "
         "others listed in workspace.nearby — pass a name explicitly when the work targets "
@@ -112,10 +117,15 @@ def list_projects(ctx: Context) -> dict:
     - `nearby` — other registered projects in this workspace. A `default` is
       the launching folder's project, and a workspace can span several repos,
       so when the work targets one of these, pass its name explicitly.
-    - `cwd`, `suggested_name`, `hint` — present when unresolved: what the
-      server sees, and how to register it. Show the hint to the user; when it
-      offers registration, ask before calling register_project(). Never work
-      around an unresolved workspace by inventing a name.
+    - `cwd` and `hint` — present when unresolved: what the server sees, and
+      what to do about it. Show the hint to the user.
+    - `suggested_name` — present **only** when this workspace can be
+      registered from here, i.e. `source` is neither `CONTEXT_PROJECT` (a
+      configured name that does not exist — a typo to fix, not a workspace to
+      register) nor an unreadable directory. Offer registration only when it
+      is there, and ask before calling register_project(). Never work around
+      an unresolved workspace by inventing a name.
+    - `source` — which rung answered: `CONTEXT_PROJECT`, `cwd`, or none.
 
     Callers written against the older shape, which returned a bare list of
     names, will see a dict instead. The names are under `projects`.
@@ -133,10 +143,15 @@ def get_project(name: str, ctx: Context) -> dict | None:
     tagged with the machine it exists on, so a root recorded elsewhere is not
     mistaken for a local one — plus `description_author` (who wrote the
     overview; `init-scrape` means it was auto-extracted from manifests, not
-    written by anyone), `description_reviewed_at` (null until a human has
-    confirmed it) and `attention_dismissed_at` (set when the user declined to
-    complete this project's record). Nothing writes the last two yet, so both
-    are null on every project today.
+    written by anyone), `description_reviewed_at` (set when
+    `register_project` was called with `confirmed_by_user`, and cleared by any
+    later write that changes the text) and `attention_dismissed_at` (set when
+    the user declined to complete this project's record — nothing writes this
+    one yet, so it is null on every project today).
+
+    Read `description_author`, not the review stamp, when provenance matters:
+    `confirmed_by_user` is an unverified client claim, so it records that a
+    human was said to have approved the text, never who wrote it.
 
     `recent_notes` includes notes marked global, since those apply to every
     project by definition.

@@ -79,8 +79,9 @@ somewhere else would hide the typo indefinitely.
 **Shape change:** `list_projects()` returned a bare list of names and now returns a dict.
 The names are under `projects`. A client whose rules file still carries the 0.1.3
 instructions snippet keeps working — the tool is unchanged in name and arguments, and an
-assistant reading the response sees the names one key deeper — but reinstall the snippet
-(`evoctx install <client>` prints it) to get the part that tells it not to guess.
+assistant reading the response sees the names one key deeper — but re-read
+`docs/instructions-snippet.md` and replace the block in your rules file to get the part that
+tells it not to guess. (`evoctx install` points at that file; it does not print the text.)
 
 Changing an existing tool's response was the deliberate choice over adding a new tool: a
 grant enumerates the tools that existed when it was written, so **adding** one denies it to
@@ -414,10 +415,10 @@ for `list_projects()` above, but worth knowing before you upgrade:
   above is otherwise silent: a `scope.projects` entry differing from a real project only by
   case now matches nothing, and the only symptom is a denial mid-task. Globs and
   not-yet-created projects are left alone — only the near miss is evidence of the flip.
-- `evoctx doctor` gains five checks: registered directories that are no longer present,
-  notes marked both global and project-scoped, the pre-upgrade backups described below (so
-  you know they exist and that they are yours to delete), the resolved workspace, and the
-  workspace folders declaring the server. Three more appear **only once a per-client grant
+- `evoctx doctor` gains three more checks beyond the two in item 9: registered directories
+  that are no longer present, notes marked both global and project-scoped, and the
+  pre-upgrade backups described below (so you know they exist and that they are yours to
+  delete). Three more appear **only once a per-client grant
   exists** — `per-client grants` (the entries, their expiry, and the older-build wipe
   warning), `client grant coverage` (installed clients running on the machine-wide
   fallback), and `per-client grant resolution` (installed clients that resolution denies,

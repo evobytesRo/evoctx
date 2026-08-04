@@ -7,8 +7,8 @@ and add the [instructions snippet](instructions-snippet.md) to the client's rule
 
 The `command` below is the `evoctx` executable from your install (run `evoctx doctor`
 to see the resolved path), given `serve` to launch the MCP server rather than the CLI.
-Once the package is on PyPI, `--uvx` writes `"command": "uvx", "args": ["evoctx", "serve"]`
-instead — machine-independent.
+`--uvx` writes `"command": "uvx", "args": ["evoctx", "serve"]` instead — machine-independent,
+and the package is on PyPI so it resolves without a local install.
 
 ## Claude Code
 
@@ -147,9 +147,19 @@ write contention, see `tests/test_concurrency.py`). Each process tracks its own 
 independently, so one client ending its session can't touch another's. `CONTEXT_CLIENT` (or the
 MCP handshake name as a fallback) tags every note and audit entry with which client wrote it, so
 `evoctx audit --client cursor` and friends still separate them out afterward. The default
-`grants.yaml` grants every client the same access (`client: "*"`); scope it per-client if you
-want Copilot and Claude Code to see different tools or projects. One thing to know before you
-do: an enumerated `tools:` list you wrote yourself is **never** auto-upgraded — `evoctx grant
+`grants.yaml` grants every client the same access (`client: "*"`).
+
+**To give clients different access, activate a grant *for that client*:**
+
+```
+evoctx grant activate read-only --client "cursor*"    # cursor gets this one
+evoctx grant activate everything                      # everyone else gets this one
+```
+
+Editing a grant's own `client:` glob and activating it machine-wide does **not** do this — it
+denies every client the glob does not match, which is the whole reason `--client` exists (see
+[README](../README.md#a-different-grant-per-client) for the precedence and expiry rules). One
+thing to know before you restrict a grant's tools: an enumerated `tools:` list you wrote yourself is **never** auto-upgraded — `evoctx grant
 upgrade` only refreshes a grant that listed every tool of an earlier release — so it will
 silently miss tools added by future releases. Add them by hand when you want them, or use
 `tools: ["*"]` and restrict with `scope:` instead.

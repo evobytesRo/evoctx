@@ -69,3 +69,33 @@ def test_policy_write_note_tags_client(db, tmp_path):
     db.upsert_project("p1")
     note_id = engine.t_write_note("claude-code", "t", "x", "p1", None, None)
     assert db.get_note(note_id)["author_client"] == "claude-code"
+
+
+def test_project_descriptions_are_secret_scanned_like_note_bodies(db):
+    """SECURITY.md promises write-time masking "regardless of entry point".
+    Project text was the entry point where it did not happen — which mattered
+    little while `evoctx init` scraped overviews from a README, and matters
+    now that `register_project` lets a model write three fields of free prose
+    straight to disk. A model summarising a repo it has just read is exactly
+    the caller most likely to quote a `.env` line into an overview."""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    db.upsert_project("p", overview=f"see {secret}",
+                      conventions="password=hunter2xyz",
+                      open_questions=f"why {secret}")
+    proj = db.get_project("p")
+    assert secret not in proj["overview"]
+    assert "hunter2xyz" not in proj["conventions"]
+    assert secret not in proj["open_questions"]
+    assert "[REDACTED" in proj["overview"]
+
+
+def test_register_project_masks_what_the_model_wrote(db, tmp_path):
+    """The MCP path specifically — it is the one a model drives."""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db.register_project("api", repo, overview=f"overview {secret}",
+                        conventions="password=hunter2xyz", author="claude-code")
+    proj = db.get_project("api")
+    assert secret not in proj["overview"]
+    assert "hunter2xyz" not in proj["conventions"]

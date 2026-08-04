@@ -23,7 +23,8 @@ the same actor has a lower-level door into the same data.** The honest way to cl
 is client-side: pair evoctx with your MCP client's own permission system so the assistant's file
 tools can't read or write the store's files directly. For Claude Code, that means a
 `permissions.deny` rule covering the store directory (`evoctx doctor` shows the path) —
-`evoctx install claude-code --hooks` offers to write this for you. Other clients vary; check
+`evoctx install claude-code --hooks` writes this for you, alongside the hooks and without a
+separate prompt. Other clients vary; check
 whether yours supports scoping file-tool access and apply the same idea.
 
 If your threat model includes "the AI itself is adversarial," grants don't solve it. Grants
@@ -122,8 +123,10 @@ wider of the two, the remediation would be the widening. The
 `deactivate` kill switch clears per-client entries along with the machine-wide grant, so
 pulling it leaves nothing active.
 
-**Nothing evoctx prints will tell you to remove an entry in order to restore access.** That
-is a deliberate constraint on its own output, not a claim about what you can do: removing a
+**No message about a lapsed grant, a narrow one, or an ambiguity between two globs will
+tell you to remove an entry in order to restore access** — with one deliberate exception,
+below. That is a constraint on evoctx's own output, not a claim about what you can do:
+removing a
 narrow entry drops its client to the machine-wide grant, and the server instructions tell an
 assistant to relay these commands verbatim — so a denied assistant would be relaying a
 request for the access it was just refused. Ambiguity between two globs is resolved by

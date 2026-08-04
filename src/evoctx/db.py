@@ -230,6 +230,26 @@ def _insert_root(conn: sqlite3.Connection, project: str, root: str, machine: str
         raise RootOwnedByAnotherProject(root, owner[0] if owner else "another project")
 
 
+def _redact_description(overview: str, conventions: str, open_questions: str):
+    """Mask secret shapes in a project's three free-text fields.
+
+    `add_note` and the session writers have masked their text since 0.1.0, and
+    SECURITY.md promises it happens "regardless of entry point". Project text
+    was the entry point it did not happen at — which mattered little while
+    `evoctx init` scraped it from a README, and matters now that
+    `register_project` lets a model write three fields of free prose straight
+    to disk. A model summarising a repo it has just read is exactly the caller
+    most likely to quote a `.env` line into an overview.
+
+    Applied here, at the row writers, so the CLI paths (`init`,
+    `new-project`, `update-project`) are covered by the same change rather
+    than by remembering to call it.
+    """
+    return (redact_secrets(overview or "")[0],
+            redact_secrets(conventions or "")[0],
+            redact_secrets(open_questions or "")[0])
+
+
 def _insert_project_row(conn: sqlite3.Connection, name: str, overview: str,
                         conventions: str, open_questions: str, author: str) -> None:
     """The one new-project INSERT. Does not commit.
@@ -241,6 +261,8 @@ def _insert_project_row(conn: sqlite3.Connection, name: str, overview: str,
     overview"). Two of them applying `overview or conventions` and one
     applying `overview` would give the same input two different answers.
     """
+    overview, conventions, open_questions = _redact_description(
+        overview, conventions, open_questions)
     conn.execute(
         "INSERT INTO projects (name, overview, conventions, open_questions, "
         "updated_at, description_author) VALUES (?, ?, ?, ?, ?, ?)",
@@ -259,6 +281,7 @@ def _update_description(conn: sqlite3.Connection, name: str, overview: str,
     repo would otherwise clear a human's approval and reattribute the author,
     for text nobody touched. `IS NOT` is null-safe.
     """
+    overview, conventions, _ = _redact_description(overview, conventions, "")
     conn.execute(
         """
         UPDATE projects SET
@@ -1108,6 +1131,8 @@ class Database:
           writes only would leave a human's rewrite carrying the previous
           text's review.
         """
+        overview, conventions, open_questions = _redact_description(
+            overview, conventions, open_questions)
         self.conn.execute(
             """
             INSERT INTO projects (name, overview, conventions, open_questions, updated_at,

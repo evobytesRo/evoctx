@@ -81,15 +81,20 @@ MUST DO, every session:
 - **Start:** call `list_projects()` first. It returns `projects` (the names) and a
   `workspace` block naming the project this directory belongs to — **use that name, never
   guess one.** If `workspace.project` is null, nothing matched: show the user
-  `workspace.hint` and offer to register this workspace — **never invent a name**, because a
-  name that does not exist is refused and nothing is saved, so guessing costs you the call.
-  If they agree, call `register_project(name, overview, ...)`: read the workspace
-  first (README, manifests, entry points), since a description paraphrased from the directory
-  name reads as knowledge to every later session. The server binds its own directory — there
-  is no path argument, and `workspace.suggested_name` is the name to propose. If
-  `workspace.confidence` is
-  `default`, the name is the launching folder's — pass a name explicitly when the work
-  targets one of the repos in `workspace.nearby`. Then
+  `workspace.hint`. **Only offer to register when `workspace.suggested_name` is present** —
+  its absence means the workspace is not registerable from here (`workspace.source` is
+  `CONTEXT_PROJECT`, i.e. a name someone configured that does not exist, or the directory is
+  unreadable), and the hint is the whole answer: relay it and stop. **Never invent a name**,
+  because a name that does not exist is refused and nothing is saved, so guessing costs you
+  the call. When it is present and they agree, call `register_project(name, overview, ...)`:
+  read the workspace first (README, manifests, entry points), since a description paraphrased
+  from the directory name reads as knowledge to every later session. Set
+  `confirmed_by_user=true` **only** if you actually asked in this conversation and they said
+  yes — it durably stamps the description as human-approved, and a client that always sends
+  it makes every description it writes read that way forever. The server binds
+  its own directory — there is no path argument. If `workspace.confidence` is `default`, the
+  name is the launching folder's — pass a name explicitly when the work targets one of the
+  repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and
   interrupted sessions stay visible. It follows the same project rule as `write_note()`: an
   unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
