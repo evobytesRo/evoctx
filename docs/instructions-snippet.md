@@ -103,8 +103,11 @@ MUST DO, every session:
   **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
   if nothing resolves, name one, register the workspace, or set `is_global`.
 - **End:** call `end_session(summary)` — what was built, decided, and left open.
-- If a call is denied, call `list_grants()` and relay the `evoctx` command from the error to
-  the user.
+- If a call is denied, call `list_grants()` and relay the `evoctx` command from the error **as
+  written** — it may name a grant that applies to you specifically, and a generic
+  `grant activate everything` would leave you denied. Anything in `<angle brackets>` is a
+  placeholder only the user can fill: say so, and never fill one in yourself, because what it
+  stands for is a decision about your own access.
 ```
 
 ---

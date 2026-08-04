@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.4 — unreleased — projects know where they live
+## 0.1.4 — 2026-08-04 — projects know where they live, and each client can have its own grant
 
 **1. A project can now record the directories its code is in.** Until now the store had no
 idea where anything was: `evoctx init` resolved a directory, read manifests out of it,
@@ -417,11 +417,12 @@ for `list_projects()` above, but worth knowing before you upgrade:
 - `evoctx doctor` gains five checks: registered directories that are no longer present,
   notes marked both global and project-scoped, the pre-upgrade backups described below (so
   you know they exist and that they are yours to delete), the resolved workspace, and the
-  workspace folders declaring the server. More appear **only once a per-client grant
-  exists**: the entries and their expiry, any installed client that resolution denies,
-  which installed clients are running on the machine-wide fallback, and the older-build
-  wipe warning. Unconditionally they would fire on every fresh install, where every client
-  legitimately runs on the default.
+  workspace folders declaring the server. Three more appear **only once a per-client grant
+  exists** — `per-client grants` (the entries, their expiry, and the older-build wipe
+  warning), `client grant coverage` (installed clients running on the machine-wide
+  fallback), and `per-client grant resolution` (installed clients that resolution denies,
+  which is the only one of the three that fails). Unconditionally they would fire on every
+  fresh install, where every client legitimately runs on the default.
 - **A grant whose `scope.projects` is present but empty is now rejected**, in either
   spelling — `projects: []` or a bare `projects:`. It previously parsed as *every* project,
   which is a scope failing open, and it now also decides who may write a global note. If you

@@ -4,7 +4,7 @@ A local, personal context store for AI coding assistants, exposed over [MCP](htt
 
 Your assistant reads project context at session start, searches past decisions mid-work, and writes notes back before ending — so the next session (in any MCP-capable client) starts oriented instead of from zero. One SQLite store on your machine, shared across every workspace and every client that connects. No cloud component.
 
-> **Status: v0.1.3.** Grants, redaction, audit logging, and sessions all work today. On PyPI — `pip install evoctx`. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+> **Status: v0.1.4.** Projects are bound to the directories their code lives in, so the assistant resolves the workspace instead of guessing a name; each client can have its own grant; grants, redaction, audit logging and sessions all work today. On PyPI — `pip install evoctx`. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ---
 
@@ -157,13 +157,17 @@ installed, `evoctx install claude-code` detects it and prints a `claude mcp add 
 command for one-time global registration instead. Full explanation: [docs/clients.md](docs/clients.md).
 
 `doctor` checks package/store/schema/FTS5/grant/server-command/client-configs, plus:
+which project this directory resolves to and which workspace folders declare the server;
 notes or sessions filed under a name that is not a project (they are invisible under the real
 one — `evoctx project-merge` moves them), which projects have no directory on this machine,
-how many notes a scoped grant can no longer read,
-store size and note count, days since the last note or session (a configured client with no
-recent activity usually means the instructions snippet isn't actually being followed), and
-whether the store folder sits inside OneDrive/iCloud/Dropbox/Google Drive — those sync an
-unencrypted SQLite file off-device by default, silently.
+registered directories that no longer exist, how many notes a scoped grant can no longer read;
+your per-client grants and any installed client they leave denied (only once you have some);
+a `scope.projects` entry that differs from a real project only by case, which since 0.1.4
+matches nothing; store size and note count, days since the last note or session (a configured
+client with no recent activity usually means the instructions snippet isn't actually being
+followed), the pre-upgrade backups, and whether the store folder sits inside
+OneDrive/iCloud/Dropbox/Google Drive — those sync an unencrypted SQLite file off-device by
+default, silently.
 
 **Claude Code only:** `evoctx install claude-code --hooks` additionally writes `SessionStart`
 and `Stop` hooks into `~/.claude/settings.json` (backed up first, like every other `install_*`
@@ -203,10 +207,10 @@ MUST DO, every session:
 | `get_project(name)` | Load overview, conventions, open questions, recent notes |
 | `search_context(query, project?, limit?)` | Find relevant notes mid-work |
 | `get_by_id(id)` | Full content after a search hit |
-| `write_note(title, content, project?, tags?)` | Record decisions and observations as you go. An unknown project name is refused and nothing is saved; an unset one takes the workspace's own |
+| `write_note(title, content, project?, tags?, is_global?)` | Record decisions and observations as you go. An unknown project name is refused and nothing is saved; an unset one takes the workspace's own. `is_global` marks a note as spanning every project — deliberately not the same as leaving `project` unset |
 | `end_session(summary)` | Last call — closes the session with what was built/decided/open |
 | `register_project(name, overview, ...)` | Register this workspace as a project. No path argument — the server binds its own working directory; the assistant supplies only the description |
-| `list_grants()` | What the active grant allows — so "do you have access to X?" gets an honest answer |
+| `list_grants()` | What *this client* is allowed — resolved per client, since one may have its own grant — so "do you have access to X?" gets an honest answer |
 
 Writes are append-only by design: the assistant can add notes but never edit or delete. Deletion is a human-only operation. Note content over 256KB is rejected — split it into multiple notes. Every note also carries `author_client` (`cli` for a human, the client name for an assistant) so past notes read as informational context, not as instructions from the current session.
 
