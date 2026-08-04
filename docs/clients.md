@@ -20,6 +20,15 @@ every entry in the `.code-workspace` `folders` array — and a file in the direc
 itself usually lives. To cover such a parent, add `{"path": "."}` to the `folders` array so it
 becomes a folder in its own right.
 
+**Each declaring folder gets its own server connection**, so a multi-root workspace with five
+folders that all declare evoctx opens five of them. Measured 2026-08-04 on Windows: one
+connection costs five OS processes — the console-script shim, two venv redirectors, the
+launcher and the server — so that workspace is running ~25. They are reclaimed correctly when
+the client closes the connection (verified: closing stdin exits the whole chain), and they
+share one SQLite store safely under WAL, so this is a memory cost rather than a fault. If it
+matters, declare evoctx in fewer folders: one is enough to reach the store, since the store
+is machine-wide and not per folder.
+
 It does **not** read `~/.claude/settings.json`'s `mcpServers` key, even though that key looks
 like it should be the global mechanism. (Verified 2026-07-30: with a project `.mcp.json`
 emptied while `settings.json` still declared the server, the tools were absent from the
