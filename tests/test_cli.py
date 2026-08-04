@@ -466,6 +466,13 @@ def test_the_printed_recovery_is_executed_and_fixes_the_state(
     state = json.loads(path.read_text(encoding="utf-8"))
     state["activated_at"] = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
     path.write_text(json.dumps(state), encoding="utf-8")
+    # The store re-reads on mtime change. This write can land in the same
+    # filesystem tick as the read the previous command just did, which leaves
+    # the cache looking current and the grant looking unexpired — it passed
+    # locally and failed on Windows CI, which is the definition of a race.
+    # Editing the file behind the store's back is the test's own shortcut, so
+    # invalidating is the test's own job.
+    cli.grant_store._active_mtime = None
 
     run(cli, monkeypatch, "grant", "list")
     out = capsys.readouterr().out
@@ -489,6 +496,10 @@ def test_a_grant_name_that_is_not_text_explains_instead_of_tracebacking(
     (tmp_path / "active_grant.json").write_text(
         json.dumps({"name": ["everything"], "activated_at": "2026-01-01T00:00:00+00:00"}),
         encoding="utf-8")
+    # safe today (the fixture's fresh store leaves the cache invalidated), but
+    # this is the same write-behind-the-cache shape that raced on Windows CI
+    # one test above — pinned rather than left depending on fixture internals
+    cli.grant_store._active_mtime = None
     run(cli, monkeypatch, "grant", "list")
     out = capsys.readouterr().out
     assert "not text" in out

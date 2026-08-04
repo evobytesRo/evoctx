@@ -86,12 +86,20 @@ def test_normalize_root_resolves_symlinks(tmp_path):
     assert normalize_root(link) == normalize_root(real)
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX paths are case-sensitive")
+@pytest.mark.skipif(os.name == "nt",
+                    reason="normalize_root casefolds on Windows by design")
 def test_normalize_root_keeps_case_on_posix(tmp_path):
     """Casefolding unconditionally would merge two genuinely different
-    directories on a case-sensitive filesystem."""
-    (tmp_path / "Foo").mkdir()
-    (tmp_path / "foo").mkdir()
+    directories on a case-sensitive filesystem.
+
+    Deliberately does NOT create the directories. It used to, and macOS is
+    the counter-example that broke it: APFS defaults to case-insensitive, so
+    `Foo` and `foo` cannot coexist and the second `mkdir` raised
+    `FileExistsError` — a test asserting posix behaviour, failing on a posix
+    machine, for a reason that has nothing to do with the function. What is
+    under test is whether `normalize_root` casefolds, which on posix is a
+    pure string operation.
+    """
     assert normalize_root(tmp_path / "Foo") != normalize_root(tmp_path / "foo")
 
 
