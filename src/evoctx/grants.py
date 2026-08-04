@@ -252,6 +252,20 @@ def match_client_key(keys, client: str) -> tuple[str | None, list[str]]:
     return top[0], []
 
 
+def _tie_is_between_exact_keys(tied, client: str) -> bool:
+    """Did this ambiguity come from rule 1 rather than rule 2?
+
+    The two tiers tie for opposite reasons and only one of them has a
+    remedy. A rule-2 tie is several globs of equal specificity: adding an
+    exact key outranks all of them. A rule-1 tie is the exact key, present
+    more than once under different casings — so there is nothing left to
+    outrank it with, and `activate` refuses every spelling by naming the
+    other one.
+    """
+    folded = client.casefold()
+    return all(k.casefold() == folded for k in tied)
+
+
 def _insert_tools(text: str, close_at: int, names: list[str]) -> str:
     """`names` added just inside the `]` at `close_at`. One definition, because
     the candidate that gets validated and the text that gets written must be
@@ -538,14 +552,67 @@ class GrantStore:
         self._grants: dict[str, Grant] = {}
         self._grants_mtime: float = -1.0
         self._active: dict | None = None
-        self._active_mtime: float = -1.0
+        # `None` means "reload next read". It must NOT be a value `stat`
+        # can also produce: this was -1.0, which is exactly what the read
+        # computes for a file that does not exist — so after any write in
+        # this process, deleting the file read as "cache is current" and a
+        # later merge wrote stale entries back over the store.
+        self._active_mtime: float | None = None
+        # why the last read produced nothing, "" when it produced a real
+        # (possibly empty) document — the difference between "no grant is
+        # active" and "this file is unreadable", which the write path needs
+        # and the read path deliberately flattens
+        self._active_unreadable: str = ""
         self.ensure_default_files()
 
     def ensure_default_files(self) -> None:
+        """Write the defaults a fresh store needs, and never raise here.
+
+        This runs in `GrantStore.__init__`, which `cli.py` calls at module
+        level — so anything that escapes fails *every* command, including
+        `grant deactivate` and `doctor`, the two you reach for when something
+        is wrong. A store whose `grants.yaml` exists but has no grant named
+        `everything` did exactly that: no `active_grant.json`, so this called
+        `activate("everything")`, which raised `GrantError` out of the import.
+
+        Falling back to another grant keeps the store usable, and **the
+        fallback is the narrowest one**, announced on stderr. Alphabetical
+        order is not an access policy: with `admin` and `read-only` in the
+        file it silently activated `admin`, machine-wide, from a read-only
+        command like `doctor`. Deleting `active_grant.json` is a plausible
+        "revoke everything", and that made it a self-grant.
+
+        Nothing is activated at all when the file cannot be parsed. That is
+        still a working store — every call is denied until someone activates
+        a grant, which `doctor` reports and every denial names — and it is
+        the only honest answer when the set of grants is unknown.
+        """
         if not self.grants_path.exists():
             self.grants_path.write_text(DEFAULT_GRANTS_YAML, encoding="utf-8")
-        if not self.active_path.exists():
+        if self.active_path.exists():
+            return
+        try:
+            available = self.grants()
+        except Exception:
+            # NOT just GrantError: `grants()` runs `yaml.safe_load` and then
+            # `.get` on the result, so a mis-indented file raises
+            # `yaml.ParserError` and a top-level list raises `AttributeError`.
+            # Both escaped from here — which is `GrantStore.__init__`, which
+            # `cli.py` runs at import — and killed every command, including
+            # `grant deactivate` and `doctor`, the two you reach for when
+            # `grants.yaml` is what is wrong.
+            return
+        if "everything" in available:
             self.activate("everything")
+            return
+        if not available:
+            return
+        narrowest = min(available.values(),
+                        key=lambda g: (len(g.effective_tools()), g.name))
+        print(f"evoctx: no grant named 'everything' in {self.grants_path}; "
+              f"activated '{narrowest.name}', the narrowest one. Change it with: "
+              f"evoctx grant activate <name>", file=sys.stderr)
+        self.activate(narrowest.name)
 
     def missing_tools(self) -> dict[str, list[str]]:
         """Per grant that *meant every tool*, the tools it no longer covers.
@@ -716,7 +783,7 @@ class GrantStore:
         tmp = self.active_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
         os.replace(tmp, self.active_path)
-        self._active_mtime = -1.0
+        self._active_mtime = None
 
     def activate(self, name: str, client_key: str | None = None) -> Grant:
         """Make `name` the active grant — machine-wide, or for one client.
@@ -750,6 +817,7 @@ class GrantStore:
                 f"no grant named '{name}' in {self.grants_path} "
                 f"(have: {', '.join(self.grants()) or 'none'})"
             )
+        self._refuse_if_unreadable()
         now = datetime.now(timezone.utc).isoformat()
         state = dict(self._active_state())
         # `client_entries`, not `state["clients"]`: the raw value is
@@ -847,8 +915,11 @@ class GrantStore:
         """
         now = datetime.now(timezone.utc).isoformat()
         if client_key is None:
+            # No guard: the kill switch never reads the file, and it is the
+            # documented way out of an unreadable one.
             self._write_active({"name": None, "activated_at": now})
             return
+        self._refuse_if_unreadable()
         state = dict(self._active_state())
         clients = dict(self.client_entries())
         if client_key not in clients:
@@ -890,6 +961,14 @@ class GrantStore:
         directly and fails every call on. This is the only write that does not
         go through `activate`'s own guard for that.
         """
+        if not snapshot and self._active_unreadable:
+            # The snapshot of a file that could not be parsed is `{}`, and
+            # writing that back replaces whatever the user was about to
+            # repair with a deny-all file — while the caller prints "Nothing
+            # was changed." Leave it alone; `activate` refuses on this state
+            # anyway, so the only way here is a rollback that has nothing to
+            # roll back to.
+            return
         state = dict(snapshot)
         state.setdefault("name", None)
         state.setdefault("activated_at", datetime.now(timezone.utc).isoformat())
@@ -932,21 +1011,60 @@ class GrantStore:
         """
         mtime = self.active_path.stat().st_mtime if self.active_path.exists() else -1.0
         if mtime != self._active_mtime:
+            unreadable = ""
+            if not self.active_path.exists():
+                # Absent is not corrupt. It is the fresh-store state, which
+                # `ensure_default_files` fills in — treating it as unreadable
+                # made the write guard refuse on a store that had never been
+                # written to.
+                state = {}
+                self._active, self._active_unreadable = state, ""
+                self._active_mtime = mtime
+                return state
             try:
                 state = json.loads(self.active_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-                print(f"evoctx: cannot read {self.active_path} ({e}); treating it as "
-                      f"no active grant. Fix it with: evoctx grant activate <name>",
-                      file=sys.stderr)
+                unreadable = str(e)
                 state = {}
             if not isinstance(state, dict):
-                print(f"evoctx: {self.active_path} does not contain a JSON object; "
-                      f"treating it as no active grant. Fix it with: evoctx grant "
-                      f"activate <name>", file=sys.stderr)
+                unreadable = "the file does not contain a JSON object"
                 state = {}
+            if unreadable:
+                print(f"evoctx: cannot read {self.active_path} ({unreadable}); "
+                      f"treating it as no active grant until it is fixed",
+                      file=sys.stderr)
             self._active = state
+            self._active_unreadable = unreadable
             self._active_mtime = mtime
         return self._active or {}
+
+    def _refuse_if_unreadable(self) -> None:
+        """Guard every write that merges into active_grant.json.
+
+        `_active_state` answers `{}` for a file it could not parse, which is
+        right for reads — no grant resolves, every call is denied, safe. It is
+        catastrophic for writes: `activate` merges onto `{}`, sees no
+        `clients`, and writes a clean two-key file. One stray byte in that
+        file and the next routine `evoctx grant activate` silently deleted
+        every per-client narrowing, exit 0, with a success line. That is the
+        same wipe the CHANGELOG warns about for pre-0.1.4 builds, except 0.1.4
+        doing it to itself from a plausible hand edit.
+
+        A file that cannot be read is not a file whose contents are `{}`. So
+        the write refuses, and says which of the two recoveries applies —
+        repair the JSON to keep the entries, or `deactivate` to reset. Bare
+        `deactivate` deliberately does not call this: it is the kill switch,
+        it never reads the file, and it has to stay reachable when everything
+        else about the store is broken.
+        """
+        if self._active_state() or not self._active_unreadable:
+            return
+        raise GrantError(
+            f"{self.active_path} cannot be read ({self._active_unreadable}), so "
+            f"writing to it would discard whatever it holds — including any "
+            f"per-client grants. Fix the JSON by hand to keep them, or run "
+            f"`evoctx grant deactivate` to reset the file and start over."
+        )
 
     def recovery_command(self, client: str | None = None) -> str:
         """The command that fixes a denial **for this client**.
@@ -981,13 +1099,35 @@ class GrantStore:
             entries = self.client_entries()
             key, tied = match_client_key(entries, client)
             if tied:
-                # Which of the tied entries to drop is the user's decision —
-                # one may be narrow and one wide — and a command that picks
-                # for them removes an access rule they wrote, on the strength
-                # of an arbitrary sort. Three-way ties compound it: removing
-                # one still leaves the denial. The reason names the keys and
-                # the grants behind them; the choice is theirs.
-                return 'evoctx grant deactivate --client "<key>"'
+                if _tie_is_between_exact_keys(tied, client):
+                    # **No command can fix this one.** Adding an exact key is
+                    # the answer to a glob tie; here the exact key already
+                    # exists twice, differing only by case, and `activate`
+                    # refuses every spelling by pointing at the other — a
+                    # closed loop with no exit, which is worse than a
+                    # placeholder because it looks actionable. Removal would
+                    # terminate, and is exactly what must not be printed: one
+                    # of the two entries is the narrower, and deleting that
+                    # one promotes the client.
+                    #
+                    # So point at the state and let the reason carry the fix.
+                    # Which rule to keep is a decision only the user can make,
+                    # and the file is the only place it can be made.
+                    return "evoctx grant list"
+                # **Resolve a glob tie by adding, never by removing.**
+                # Suggesting a removal looked safe because the key was a
+                # placeholder, and it was not: the reason lists exactly two
+                # fillings and one of them deletes the narrower entry, so the
+                # printed repair for "this client is denied" promoted it to
+                # the wider grant. Reproduced end to end.
+                #
+                # An exact key wins rule 1 over every glob, so naming this
+                # client concretely settles which grant applies without
+                # touching either rule the user wrote — and the grant stays a
+                # placeholder, so access can only widen if they choose it. A
+                # three-way glob tie needs no special case: one exact key
+                # outranks all of them at once.
+                return f'evoctx grant activate <name> --client "{client}"'
             if key is not None:
                 scope = f' --client "{key}"'
                 name = entries[key].get("name")
@@ -1036,9 +1176,14 @@ class GrantStore:
         per-client grants.
         """
         key, tied = match_client_key(self.client_entries(), client)
-        if tied:
-            return 'evoctx grant deactivate --client "<key>"'
-        scope = f' --client "{key}"' if key is not None else ""
+        # Same rules as `recovery_command`, and the reason they are stated
+        # twice is that this branch has now twice kept a defect after that
+        # one lost it — first the removal, then the unrunnable exact-tie
+        # command. Both times the property test found it, and only after it
+        # stopped treating placeholders as out of scope.
+        if _tie_is_between_exact_keys(tied, client) and tied:
+            return "evoctx grant list"
+        scope = f' --client "{client if tied else key}"' if (tied or key) else ""
         return f"evoctx grant activate <name>{scope}"
 
     # `_default_grant_name` used to live here and fell back to `everything`
@@ -1085,10 +1230,20 @@ class GrantStore:
                 # narrow entry and the wide one.
                 pairs = ", ".join(
                     f"{k!r} -> {entries[k].get('name') or '(none)'}" for k in tied)
+                # The grants are named, not just the keys, because whichever
+                # way this is resolved the user is choosing between them —
+                # and for the rule-1 case they are choosing by hand, so they
+                # need to see what each one grants before deleting a line.
+                # (An earlier comment here said "the user has to pick one to
+                # remove", which stopped being true for the glob tie.)
+                how = (f"delete one of them from {self.active_path} — they are the "
+                       f"same key written twice, so no command can pick between them"
+                       if _tie_is_between_exact_keys(tied, client) else
+                       "give this client an entry of its own, which outranks both")
                 return None, (
                     f"client '{client}' is covered by {len(tied)} per-client "
                     f"grants that are equally specific ({pairs}), so which one "
-                    f"applies is undefined — remove one"
+                    f"applies is undefined — {how}"
                 )
 
         if key is not None:
@@ -1242,8 +1397,26 @@ class GrantStore:
                     blocking.append((key, detail if not usable else
                                      f"still resolves to grant "
                                      f"'{entries[key].get('name')}'", usable))
-            elif not usable and client_key_specificity(key) >= score:
-                warning.append((key, detail))
+            else:
+                spec = client_key_specificity(key)
+                if spec == score:
+                    # A tie, and this is the one rule-2 case that needs no
+                    # glob intersection to be worth saying: *if* any client
+                    # matches both, resolution refuses and that client is
+                    # denied outright — whether this key is usable or not.
+                    # Filtering on `not usable` here repeated one tier down
+                    # the exact inversion this function was fixed for: it
+                    # warned about the expired key, which merely denies, and
+                    # said nothing about the usable one, which denies just as
+                    # hard and looks healthy in every listing.
+                    warning.append((key, f"ties with '{new_key}' on specificity, "
+                                         f"so any client matching both is denied"))
+                elif not usable and spec > score:
+                    # More specific and cannot serve: it wins for the clients
+                    # it covers and leaves them denied. More specific and
+                    # usable is left alone — that is an override beside a
+                    # family default, the precedence rule this ships.
+                    warning.append((key, detail))
         return blocking, warning
 
     def denied_clients(self, names) -> list[tuple[str, str]]:

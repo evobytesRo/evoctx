@@ -169,7 +169,7 @@ class PolicyEngine:
     def list_projects(self, grant: Grant) -> list[str]:
         return self._out(grant, [p for p in self.db.list_projects() if grant.allows_project(p)])
 
-    def workspace(self, grant: Grant, cwd=None) -> dict:
+    def workspace(self, grant: Grant, client: str, cwd=None) -> dict:
         """The resolved workspace, filtered to what this grant may know about.
 
         Resolution runs against the whole store — a directory belongs to the
@@ -223,7 +223,14 @@ class PolicyEngine:
             block["hint"] = (
                 f"This directory resolves to a project outside grant "
                 f"'{grant.name}' (scope: {grant.projects}), so it is reported "
-                f"as unresolved. Ask the user to activate a wider grant."
+                f"as unresolved. Ask the user to run: "
+                # `list_projects()` is the first call of every session, so
+                # this is the denial a model meets most often — and it was the
+                # last one still ending in "activate a wider grant" with no
+                # command to relay. A narrowed client told that runs a
+                # machine-wide activate against the scalar it does not resolve
+                # through, and stays exactly as denied.
+                f"{self.grants.widen_command(client)}"
             )
         return block
 
@@ -308,7 +315,7 @@ class PolicyEngine:
                 f"{self.grants.widen_command(client)}"
             )
 
-    def resolve_write_project(self, grant: Grant, project: str | None,
+    def resolve_write_project(self, grant: Grant, client: str, project: str | None,
                               is_global: bool, tool: str) -> str | None:
         """The project a write lands under — refusing rather than guessing.
 
@@ -374,7 +381,7 @@ class PolicyEngine:
         if project is not None:
             if not self.db.project_exists(project):
                 known = ", ".join(self.list_projects(grant)) or "none yet"
-                block = self.workspace(grant)
+                block = self.workspace(grant, client)
                 here = block.get("project")
                 # "register this workspace" only when it is not registered —
                 # otherwise it is dead advice contradicted by the sentence
@@ -390,7 +397,7 @@ class PolicyEngine:
                 )
             return project
 
-        block = self.workspace(grant)
+        block = self.workspace(grant, client)
         resolved = block.get("project")
         if resolved:
             return resolved
@@ -525,7 +532,7 @@ class PolicyEngine:
         """
         grant = self._guard(client, "list_projects")
         projects = self.list_projects(grant)
-        result = {"projects": projects, "workspace": self.workspace(grant)}
+        result = {"projects": projects, "workspace": self.workspace(grant, client)}
         self._log(client, "list_projects", "read", grant, None, projects, result)
         return result
 
@@ -619,7 +626,7 @@ class PolicyEngine:
         # grant does not cover. A scope-denied default must fail loudly rather
         # than fall back to NULL, which would file the note nowhere to dodge
         # an error.
-        project = self.resolve_write_project(grant, project, is_global,
+        project = self.resolve_write_project(grant, client, project, is_global,
                                              tool="write_note")
         self.check_write_project(grant, client, project)
         (title, content), hits = self._redact_inbound(grant, title, content)
@@ -637,7 +644,7 @@ class PolicyEngine:
 
     def t_start_session(self, client: str, project: str | None, intent: str | None) -> dict:
         grant = self._guard(client, "start_session")
-        project = self.resolve_write_project(grant, project, is_global=False,
+        project = self.resolve_write_project(grant, client, project, is_global=False,
                                              tool="start_session")
         self.check_write_project(grant, client, project, thing="session")
         (intent,), hits = self._redact_inbound(grant, intent) if intent else ((intent,), 0)

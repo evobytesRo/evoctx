@@ -455,6 +455,61 @@ def test_doctor_reports_one_line_per_cause_not_two(tmp_path):
     assert "per-client grant resolution" not in checks
 
 
+def test_doctor_flags_a_scope_entry_that_differs_only_by_case(tmp_path):
+    """0.1.4 made project scoping case-sensitive everywhere. Correct, and a
+    silent break for anyone whose casing was carried by the old Windows
+    behaviour — the grant just stops covering that project, and the only
+    symptom is a denial mid-task. Disclosed in the CHANGELOG; this is what
+    makes it noticeable."""
+    store = tmp_path / "store"
+    db = Database(store)
+    db.upsert_project("Payments", overview="x")
+    gs = GrantStore(store)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: pay\n    client: "*"\n    tools: ["*"]\n'
+        '    scope: {projects: ["payments", "pay*", "not-created-yet"]}\n'
+        '    expires: "+8h"\n', encoding="utf-8")
+    gs._grants_mtime = -1.0
+    checks = {check: (ok, detail) for check, ok, detail in doctor(store, tmp_path)}
+    ok, detail = checks["grant scope casing"]
+    assert ok is False
+    assert "'payments'" in detail and "'Payments'" in detail
+    # globs too: `pay*` also matched on pre-0.1.4 Windows and matches nothing
+    # now, and skipping them left half the flip invisible
+    assert "pay*" in detail
+    # but scoping to a project you have not created yet is legitimate, and
+    # matches nothing in either casing — not evidence of the flip
+    assert "not-created-yet" not in detail
+
+
+def test_doctor_is_quiet_when_the_casing_matches(tmp_path):
+    store = tmp_path / "store"
+    db = Database(store)
+    db.upsert_project("Payments", overview="x")
+    gs = GrantStore(store)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: pay\n    client: "*"\n    tools: ["*"]\n'
+        '    scope: {projects: ["Payments"]}\n    expires: "+8h"\n', encoding="utf-8")
+    gs._grants_mtime = -1.0
+    names = [check for check, _, _ in doctor(store, tmp_path)]
+    assert "grant scope casing" not in names
+
+
+def test_a_store_without_an_everything_grant_is_still_usable(tmp_path):
+    """`GrantStore.__init__` runs at cli.py import, so anything escaping it
+    fails every command — including `grant deactivate` and `doctor`, the two
+    you reach for when something is wrong. A grants.yaml with no grant named
+    `everything` and no active_grant.json did exactly that."""
+    store = tmp_path / "store"
+    store.mkdir(parents=True)
+    (store / "grants.yaml").write_text(
+        'grants:\n  - name: work\n    client: "*"\n    tools: ["*"]\n'
+        '    expires: "+30d"\n', encoding="utf-8")
+    gs = GrantStore(store)                    # must not raise
+    active, _ = gs.active_grant()
+    assert active is not None and active.grant.name == "work"
+
+
 def test_doctor_flags_missing_grant(tmp_path):
     store = tmp_path / "store"
     Database(store)

@@ -12,6 +12,7 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 SERVER_NAME = "evoctx"
@@ -798,11 +799,12 @@ def installed_clients(home: Path, include_cwd: bool = True) -> list[tuple[str, s
 
     `name` is the name of the client whose config file this is — the same
     string `install` writes into it as `CONTEXT_CLIENT`, and therefore what
-    grants and audit entries are normally matched against. Inferred from
-    which config was found rather than read back out of it — a limitation,
-    not a safeguard: if someone edits `CONTEXT_CLIENT`, that edited value is
-    what the client actually reports, and every grant check built on this
-    list then answers about a name nobody sends.
+    grants and audit entries are matched against. Read from the config's
+    `CONTEXT_CLIENT` where it sets one, falling back to the client this
+    config belongs to. That env var is what the client actually reports, so
+    inferring from the filename made every grant check built on this list
+    answer about a name nobody sends — on a list that now decides the exit
+    code of a store-mutating command. `display` says so when the two differ.
     `display` may add where it was found, which matters for claude-code and
     is noise everywhere else.
 
@@ -817,9 +819,12 @@ def installed_clients(home: Path, include_cwd: bool = True) -> list[tuple[str, s
         if client.config_path.exists():
             try:
                 config = json.loads(client.config_path.read_text(encoding="utf-8") or "{}")
-                if SERVER_NAME in config.get(client.key, {}):
-                    found.append((name, name))
-            except (json.JSONDecodeError, OSError):
+                entry = config.get(client.key, {}).get(SERVER_NAME)
+                if entry is not None:
+                    reported = (entry.get("env") or {}).get("CONTEXT_CLIENT") or name
+                    display = name if reported == name else f"{name} (as {reported})"
+                    found.append((reported, display))
+            except (json.JSONDecodeError, OSError, AttributeError):
                 pass
     codex_path = home / ".codex" / "config.toml"
     if codex_path.exists():
@@ -828,8 +833,16 @@ def installed_clients(home: Path, include_cwd: bool = True) -> list[tuple[str, s
         # release also runs from `grant activate --client`, a command that
         # mutates the store.
         try:
-            if f"[mcp_servers.{SERVER_NAME}]" in codex_path.read_text(encoding="utf-8"):
-                found.append(("codex", "codex"))
+            toml = codex_path.read_text(encoding="utf-8")
+            if f"[mcp_servers.{SERVER_NAME}]" in toml:
+                # codex is TOML, so there is no parsed entry to read — but
+                # `install` writes CONTEXT_CLIENT into this file too, so
+                # hardcoding "codex" made this the one client whose reported
+                # name was still inferred. Cheap regex over the same file.
+                m = re.search(r'CONTEXT_CLIENT\s*=\s*"([^"]+)"', toml)
+                reported = m.group(1) if m else "codex"
+                display = "codex" if reported == "codex" else f"codex (as {reported})"
+                found.append((reported, display))
         except (OSError, UnicodeDecodeError):
             pass
     # claude-code is project-scoped, not under home — checked against the
@@ -839,11 +852,60 @@ def installed_clients(home: Path, include_cwd: bool = True) -> list[tuple[str, s
     if include_cwd and claude_code_path.exists():
         try:
             config = json.loads(claude_code_path.read_text(encoding="utf-8") or "{}")
-            if SERVER_NAME in config.get("mcpServers", {}):
-                found.append(("claude-code", "claude-code (this directory)"))
-        except (json.JSONDecodeError, OSError):
+            entry = config.get("mcpServers", {}).get(SERVER_NAME)
+            if entry is not None:
+                reported = (entry.get("env") or {}).get("CONTEXT_CLIENT") or "claude-code"
+                where = ("this directory" if reported == "claude-code"
+                         else f"claude-code in this directory, as {reported}")
+                found.append((reported, f"{reported} ({where})"))
+        except (json.JSONDecodeError, OSError, AttributeError):
             pass
     return found
+
+
+def _check_scope_casing(checks: list, gs, db) -> None:
+    """A `scope.projects` entry that matches a real project except for case.
+
+    0.1.4 made project scoping case-sensitive on every platform — it was on
+    the same divergent `fnmatch` as client matching, so a grant scoped to
+    `Payments` also matched project `payments` on Windows and never on Linux.
+    Correct, and a **silent break** for anyone whose casing was carried by the
+    old Windows behaviour: the grant simply stops covering that project, and
+    the only symptom is a denial mid-task.
+
+    So detect what was disclosed but not otherwise noticeable: a pattern that
+    matches nothing now and *would* have matched case-insensitively. That is
+    the same question for a glob as for a literal — `fnmatchcase(p, pat)`
+    false while the casefolded pair is true — so `Evo*` against project
+    `evobytes-api` is caught too. An earlier version skipped globs on the
+    grounds that "a glob is not a name to compare", which is a non-reason and
+    left half the flip invisible.
+
+    A pattern matching nothing in either casing is not reported: scoping a
+    grant to a project you have not created yet is legitimate and common.
+    Only the near miss, which is evidence of the flip rather than of intent.
+    """
+    projects = list(db.list_projects())
+    if not projects:
+        return
+    misses = []
+    for name, grant in sorted(gs.grants().items()):
+        for pattern in grant.projects:
+            if any(fnmatchcase(p, pattern) for p in projects):
+                continue                        # matches something as written
+            near = [p for p in projects
+                    if fnmatchcase(p.casefold(), pattern.casefold())]
+            if near:
+                shown = ", ".join(repr(p) for p in near[:3])
+                misses.append(f"grant '{name}' scopes to '{pattern}', which now "
+                              f"matches nothing — did you mean {shown}?")
+    if misses:
+        one = len(misses) == 1
+        checks.append(("grant scope casing", False,
+                       f"{len(misses)} scope entr{'y' if one else 'ies'} "
+                       f"{'matches' if one else 'match'} nothing as written but would "
+                       f"match ignoring case ({'; '.join(misses)}) — fix the casing in "
+                       f"{gs.grants_path}"))
 
 
 def _check_client_grants(checks: list, gs, installed: list[str]) -> None:
@@ -1000,6 +1062,10 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
         checks.append(("store dir", False, f"{store_dir}: {e}"))
         return checks
 
+    # None whenever the store could not be opened — the grants block below
+    # runs regardless (a broken database must not hide a broken grant file),
+    # and the checks that need both have to say which one is missing.
+    db = None
     try:
         from .db import MIGRATIONS, Database, SchemaTooNew
         try:
@@ -1107,6 +1173,15 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
             checks.append(("grant tools", True,
                            "every grant covers the tools this build ships"))
         _check_client_grants(checks, gs, [name for name, _ in installed])
+        if db is not None:
+            # needs both files; a store that would not open already failed
+            # its own line above, and repeating it here would read as a
+            # second, different fault
+            try:
+                _check_scope_casing(checks, gs, db)
+            except Exception as e:
+                checks.append(("grant scope casing", False,
+                               f"could not be checked: {e}"))
     except GrantError as e:
         checks.append(("grants.yaml", False, str(e)))
 

@@ -532,9 +532,16 @@ def cmd_grant(args):
             # named: removing the key drops that client to the machine-wide
             # grant, and only the user knows whether renewing it or pointing
             # it elsewhere is what they meant.
+            # The advice is the addition, not "fix or remove". Saying "remove"
+            # in prose walked straight past the comment above it: deleting
+            # that key drops its client to the machine-wide grant, which is
+            # the widening this release keeps taking back out of its own
+            # output — and a guard that greps for `grant deactivate` cannot
+            # see the word "remove".
             fail("These clients have their own key, and it cannot serve them:",
                  *(f"  {key}: {why}" for key, why in broken),
-                 "Fix or remove each before narrowing the family: evoctx grant list")
+                 "Point each at a grant that works, and they keep their own "
+                 "access: evoctx grant activate <name> --client \"<key>\"")
 
         print(succeeded)
         if blocking:
@@ -569,8 +576,14 @@ def cmd_grant(args):
             # writing a glob intersection engine, so this warns on any
             # unusable key at least as specific and accepts the false
             # positives. The check above is the sound half.
-            print("Warning: these keys are at least as specific, cannot serve, and may "
-                  "take precedence for clients you have not installed here:")
+            # The reason travels per key now, and they are not the same
+            # fault: one ties on specificity and serves fine (any client
+            # matching both is denied), the other cannot serve at all. The
+            # header used to assert "cannot serve" for both — and a user told
+            # a live key cannot serve removes it, which drops that client to
+            # the machine-wide grant.
+            print("Warning: these keys may take precedence for clients you have "
+                  "not installed here:")
             for key, why in warning:
                 print(f"  {key}: {why}")
 

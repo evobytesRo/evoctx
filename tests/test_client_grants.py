@@ -77,6 +77,21 @@ def state_of(store) -> dict:
     return json.loads(store.active_path.read_text(encoding="utf-8"))
 
 
+def _add_raw_key(store, key: str, grant: str) -> None:
+    """Write a `clients` key straight into the file, bypassing `activate`.
+
+    `activate` refuses a key differing from an existing one only by case, so
+    a rule-1 tie is unreachable through the API — and it is reachable in
+    reality, by a hand edit or a merge, which is the whole reason
+    `match_client_key` ties at that tier.
+    """
+    state = state_of(store)
+    state.setdefault("clients", {})[key] = {
+        "name": grant, "activated_at": state["activated_at"]}
+    store.active_path.write_text(json.dumps(state), encoding="utf-8")
+    store._active_mtime = None
+
+
 def run_recovery(store, command: str) -> None:
     """Execute a printed recovery command against `store`, as a user would.
 
@@ -99,6 +114,8 @@ def run_recovery(store, command: str) -> None:
         store.activate(parts[3], client_key=key)
     elif parts[2] == "deactivate":
         store.deactivate(client_key=key)
+    elif parts[2] == "list":
+        pass            # a pointer at the state, not an action
     else:
         raise AssertionError(f"unknown recovery action: {command}")
 
@@ -275,7 +292,9 @@ def test_ambiguous_client_is_denied_and_both_keys_named(store):
     active, reason = store.active_grant("claude-code")
     assert active is None
     assert "claude*" in reason and "*e-code" in reason
-    assert "deactivate --client" in store.recovery_command("claude-code")
+    # the fix is an ADDITION: an exact key outranks every tied glob, so this
+    # settles the ambiguity without deleting either rule the user wrote
+    assert store.recovery_command("claude-code") ==         'evoctx grant activate <name> --client "claude-code"'
 
 
 def test_a_hand_written_case_clash_denies_rather_than_widening(store, db):
@@ -288,11 +307,79 @@ def test_a_hand_written_case_clash_denies_rather_than_widening(store, db):
     state["clients"]["cursor"] = {"name": "read-only",
                                   "activated_at": state["activated_at"]}
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     engine = PolicyEngine(db, store)
     for spelling in ("cursor", "Cursor", "CURSOR"):
         with pytest.raises(PolicyDenied, match="equally specific"):
             engine.check(spelling, "write_note")
+
+
+def test_a_corrupt_file_is_never_overwritten_by_a_merging_write(store):
+    """The read path answers `{}` for a file it cannot parse — right for
+    reads, catastrophic for writes. `activate` merged onto that `{}`, saw no
+    `clients`, and wrote a clean two-key file: one stray byte and the next
+    routine `evoctx grant activate` silently deleted every per-client
+    narrowing, exit 0, with a success line.
+
+    Reproduced end to end before the fix. The same wipe the CHANGELOG warns
+    about for pre-0.1.4 builds, except 0.1.4 doing it to itself from a
+    plausible hand edit.
+    """
+    store.activate("read-only", client_key="cursor*")
+    raw = store.active_path.read_text(encoding="utf-8")
+    store.active_path.write_text(raw.rstrip()[:-1] + ",}", encoding="utf-8")
+    store._active_mtime = None
+
+    with pytest.raises(GrantError, match="cannot be read"):
+        store.activate("everything")
+    with pytest.raises(GrantError, match="cannot be read"):
+        store.deactivate(client_key="cursor*")
+    # the bytes are untouched, so hand-repairing the JSON still recovers them
+    assert store.active_path.read_text(encoding="utf-8").endswith(",}")
+    assert "cursor*" in store.active_path.read_text(encoding="utf-8")
+
+
+def test_the_kill_switch_is_the_documented_way_out_of_a_corrupt_file(store):
+    """It never reads the file, so it stays reachable when everything else
+    about the store is broken — and it denies everything, so it cannot widen.
+    That is what makes it safe to exempt from the guard above."""
+    store.activate("read-only", client_key="cursor*")
+    store.active_path.write_text("{oops", encoding="utf-8")
+    store._active_mtime = None
+    store.deactivate()
+    assert store.client_entries() == {}
+    assert store.active_grant("cursor-1")[0] is None
+    store.activate("everything")              # and the store works again
+    assert store.active_grant("cursor-1")[0].grant.name == "everything"
+
+
+def test_a_rollback_never_replaces_an_unreadable_file(store):
+    """`active_state_snapshot()` of an unparseable file is `{}`, and writing
+    that back replaces what the user was about to repair with a deny-all
+    file — while the caller prints "Nothing was changed."."""
+    store.active_path.write_text("{oops", encoding="utf-8")
+    store._active_mtime = None
+    snapshot = store.active_state_snapshot()
+    store.restore_active(snapshot)
+    assert store.active_path.read_text(encoding="utf-8") == "{oops"
+
+
+def test_a_usable_equally_specific_glob_is_reported(store):
+    """Rule 2 filtered on `not usable`, repeating one tier down the exact
+    inversion rule 1 was fixed for: it warned about the expired key, which
+    merely denies, and said nothing about the usable one, which denies just
+    as hard and looks healthy in every listing."""
+    store.activate("everything", client_key="claude*")
+    _, warning = store.shadowing_keys("*e-code")          # both score 6
+    assert [k for k, _why in warning] == ["claude*"]
+    assert "ties" in warning[0][1]
+
+
+def test_a_more_specific_usable_glob_is_left_alone(store):
+    """That is an override beside a family default — the precedence rule this
+    ships. Warning on it would train people to ignore the check."""
+    store.activate("everything", client_key="cursor-pro*")
+    assert store.shadowing_keys("cur*") == ([], [])
 
 
 def test_malformed_clients_value_does_not_break_activation(store):
@@ -303,7 +390,7 @@ def test_malformed_clients_value_does_not_break_activation(store):
     store.active_path.write_text(
         json.dumps({"name": "everything", "activated_at": "2026-01-01T00:00:00+00:00",
                     "clients": ["cursor"]}), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     assert store.client_entries() == {}
     store.activate("everything")
     assert "clients" not in state_of(store)     # normalised away, not preserved
@@ -316,7 +403,7 @@ def test_malformed_activation_time_explains_instead_of_raising(store):
     state = state_of(store)
     del state["clients"]["cursor*"]["activated_at"]
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     active, reason = store.active_grant("cursor-1")
     assert active is None
     assert "activation time" in reason
@@ -384,7 +471,7 @@ def test_a_concrete_key_whose_grant_excludes_it_is_not_usable(store):
     state = state_of(store)
     state["clients"]["vscode"]["name"] = "read-only"      # client: "cursor*"
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     usable, detail = store.entry_usable("vscode")
     assert usable is False
     assert "covers client 'cursor*'" in detail
@@ -454,7 +541,7 @@ def test_recovery_for_an_expired_entry_actually_restores_the_client(store):
     state["clients"]["cursor*"]["activated_at"] = (
         datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     assert store.active_grant("cursor-1")[0] is None
 
     run_recovery(store, store.recovery_command("cursor-1"))
@@ -499,22 +586,28 @@ def test_recovery_for_a_machine_wide_expiry_names_the_grant_that_lapsed(store, t
     assert "everything" not in store.recovery_command()
 
 
-def test_recovery_for_a_tie_refuses_to_choose_an_entry_to_delete(store):
-    """No single command fixes this: which of the tied entries to drop is the
-    user's call — one may be narrow and one wide — and a three-way tie leaves
-    the denial standing after any one removal. So it prints a placeholder and
-    the reason enumerates the keys.
+def test_recovery_for_a_tie_resolves_by_adding_never_by_removing(store):
+    """A placeholder is not a mitigation when the reason lists the fillings.
 
-    The command it used to print deleted `tied[0]`, sorted; `deactivate`
-    matched keys by casefold in *file* order. On a `Cursor`/`cursor` pair
-    those disagree, so the product's own remediation removed the entry it did
-    not name and promoted the client from read-only to everything."""
-    store.activate("everything", client_key="claude*")
+    This used to print `deactivate --client "<key>"`, and the reason names
+    exactly two keys — so one of the two obvious completions deletes the
+    *narrower* entry and promotes the client from denied to the wider grant.
+    Reproduced end to end before the fix: claude-code went to `everything`,
+    all ten tools.
+
+    An exact key wins rule 1 over every glob, so naming the client concretely
+    settles which grant applies without touching either rule the user wrote,
+    and the grant stays a placeholder so access can only widen by their
+    explicit choice. It also scales: one exact key outranks a three-way tie,
+    where removals would have to be repeated."""
+    store.activate("read-only", client_key="claude*")
     store.activate("everything", client_key="*e-code")
-    command = store.recovery_command("claude-code")
-    assert command == 'evoctx grant deactivate --client "<key>"'
+    assert store.recovery_command("claude-code") ==         'evoctx grant activate <name> --client "claude-code"'
     _, reason = store.active_grant("claude-code")
     assert "claude*" in reason and "*e-code" in reason
+    assert "remove" not in reason
+    # and the grants behind the keys are named, so the choice is informed
+    assert "read-only" in reason and "everything" in reason
 
 
 def test_deactivate_removes_the_key_named_not_the_one_written_first(store):
@@ -526,7 +619,7 @@ def test_deactivate_removes_the_key_named_not_the_one_written_first(store):
     state["clients"]["cursor"] = {"name": "read-only",
                                   "activated_at": state["activated_at"]}
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     store.deactivate(client_key="Cursor")
     assert list(store.client_entries()) == ["cursor"]
     assert store.active_grant("cursor")[0].grant.name == "read-only"
@@ -548,20 +641,31 @@ def test_an_unreadable_file_denies_instead_of_raising(store, capsys):
     truncated file failed every tool call with a traceback — including the
     `grant activate` that would have repaired it."""
     store.active_path.write_text("", encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     active, reason = store.active_grant("cursor-1")
     assert active is None and "no grant is active" in reason
     assert "cannot read" in capsys.readouterr().err
-    store.activate("everything")                    # and the repair path works
+    # ...but the WRITE path refuses. This test used to activate over the
+    # corrupt file and assert the repair worked — invisibly wrong, because
+    # this fixture has no per-client entries to lose. With entries, that same
+    # `activate` silently deleted every one of them.
+    with pytest.raises(GrantError, match="cannot be read"):
+        store.activate("everything")
+    # the kill switch is the documented way out, and never reads the file
+    store.deactivate()
+    store.activate("everything")
     assert store.active_grant("cursor-1")[0] is not None
 
 
 def test_a_top_level_json_array_denies_instead_of_raising(store, capsys):
     store.active_path.write_text("[1, 2, 3]", encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     assert store.active_grant("cursor-1")[0] is None
     assert store.client_entries() == {}
     assert "does not contain a JSON object" in capsys.readouterr().err
+    with pytest.raises(GrantError, match="cannot be read"):
+        store.activate("read-only", client_key="cursor*")
+    store.deactivate()
     store.activate("read-only", client_key="cursor*")
     assert store.active_grant("cursor-1")[0].grant.name == "read-only"
 
@@ -615,7 +719,13 @@ def test_no_remediation_this_feature_prints_can_ever_widen_a_client(store, tmp_p
         entries = store.client_entries()
         key, tied = match_client_key(entries, client)
         if tied:
-            names = [entries[k].get("name") for k in tied]
+            # The NARROWEST of the tied grants, not the union. Unioning them
+            # licenses exactly the widening a tie invites: resolving the
+            # ambiguity towards the broader of the two would pass. Whatever
+            # the user meant by writing both, it is at most the smaller.
+            grants = [store.grants().get(entries[k].get("name")) for k in tied]
+            sets = [access_of(g) for g in grants if g is not None]
+            return set.intersection(*sets) if sets else set()
         elif key is not None:
             names = [entries[key].get("name")]
         else:
@@ -639,7 +749,7 @@ def test_no_remediation_this_feature_prints_can_ever_widen_a_client(store, tmp_p
         target["activated_at"] = (
             datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
         store.active_path.write_text(json.dumps(state), encoding="utf-8")
-        store._active_mtime = -1.0
+        store._active_mtime = None
 
     scenarios = [
         ("expired entry", lambda: (store.activate("read-only", client_key="cursor*"),
@@ -655,9 +765,18 @@ def test_no_remediation_this_feature_prints_can_ever_widen_a_client(store, tmp_p
             store.activate("read-only", client_key="cursor*"),
             write_grants(tmp_path, TWO_GRANTS.replace("  - name: read-only",
                                                       "  - name: renamed")))),
-        ("ambiguous keys", lambda: (
-            store.activate("everything", client_key="claude*"),
+        # narrow on one key, wide on the other — with the same grant on
+        # both, `min` and `union` of the tied ceilings are equal and the
+        # change that made it `min` could not be discriminated at all
+        ("ambiguous glob keys", lambda: (
+            store.activate("read-only", client_key="claude*"),
             store.activate("everything", client_key="*e-code"))),
+        # both written raw: `activate` refuses the second by design, so this
+        # state is only reachable the way it is reachable in reality — a hand
+        # edit or a merge. Narrow on one, wide on the other.
+        ("ambiguous exact keys, differing only by case", lambda: (
+            _add_raw_key(store, "Cursor-1", "read-only"),
+            _add_raw_key(store, "cursor-1", "everything"))),
     ]
     for label, setup in scenarios:
         store.deactivate()
@@ -675,8 +794,61 @@ def test_no_remediation_this_feature_prints_can_ever_widen_a_client(store, tmp_p
             for command in (store.recovery_command(client),
                             store.recovery_command(),
                             store.widen_command(client)):
-                if "<" in command:
-                    continue          # a placeholder is a decision, not an act
+                # **Never a removal.** Skipping placeholders was how the last
+                # widening survived a full round: `deactivate --client
+                # "<key>"` looked safe *because* the key was a placeholder,
+                # while the reason listed exactly two fillings and one of them
+                # deleted the narrower entry. The effect of `activate X` is
+                # legible in the command; the effect of a removal is not, so
+                # these two producers may not emit one at all.
+                assert "deactivate" not in command, (
+                    f"{label}: {command!r} tells the user to remove something. "
+                    f"What that grants is invisible in the command itself."
+                )
+
+                if "<name>" in command:
+                    # Substitute every legal filling. A grant name is an
+                    # explicit access choice, so the invariant is not "stays
+                    # under the ceiling" — it is that the command DOES WHAT IT
+                    # SAYS: pick grant G and the client ends up on G. A
+                    # command that silently resolves elsewhere (a shadowing
+                    # key, an excluded client) is the other half of the same
+                    # defect — advice that looks applied and is not.
+                    refused = usable_fillings = 0
+                    for g in sorted(store.grants()):
+                        g_obj = store.grants()[g]
+                        if not g_obj.matches_client(client):
+                            continue        # activate refuses this pairing
+                        now = datetime.now(timezone.utc)
+                        if g_obj.expires_at(now) <= now:
+                            continue        # expires on contact; the CLI
+                                            # refuses it and says why
+                        snapshot = store.active_state_snapshot()
+                        try:
+                            run_recovery(store, command.replace("<name>", g))
+                        except GrantError:
+                            store.restore_active(snapshot)
+                            refused += 1
+                            continue        # refused up front, never applied
+                        active, _ = store.active_grant(client)
+                        landed = active.grant.name if active else None
+                        store.restore_active(snapshot)
+                        usable_fillings += 1
+                        assert landed == g, (
+                            f"{label}: {command!r} with <name>={g!r} left "
+                            f"{client!r} on {landed!r}"
+                        )
+                    # **A command every filling refuses is not a fix.** The
+                    # tier-1 case-pair tie printed exactly that: `activate
+                    # <name> --client "cursor"` refused for every spelling by
+                    # pointing at the other key — a closed loop that this
+                    # loop's `continue` swallowed as "refused up front".
+                    assert usable_fillings or not refused, (
+                        f"{label}: {command!r} was refused for every one of "
+                        f"{refused} legal fillings, so it fixes nothing"
+                    )
+                    continue
+
                 snapshot = store.active_state_snapshot()
                 run_recovery(store, command)
                 after = access_for(client)
@@ -686,6 +858,85 @@ def test_no_remediation_this_feature_prints_can_ever_widen_a_client(store, tmp_p
                     f"{sorted(after - ceiling)} — beyond what was configured "
                     f"for it"
                 )
+
+
+def test_no_source_string_advises_removing_a_per_client_entry():
+    """The invariant made structural instead of authorial.
+
+    Seven review rounds found the same defect — advice to remove a
+    per-client entry, which hands that client back to the wider machine-wide
+    grant — each time in a different file, because several modules compose
+    their own remediation text.
+
+    The first version of this guard grepped for the literal `grant
+    deactivate` and skipped `grants.py` entirely. It missed the live instance
+    immediately: `cli.py` said *"Fix or remove each ... evoctx grant list"*,
+    which names no command at all. So this looks for the **advice**, not one
+    spelling of it — a removal verb in a string that is also about per-client
+    grants — and it covers every module including `grants.py`, minus an
+    explicit allowlist of sites argued safe one by one.
+    """
+    import ast
+    import pathlib
+    import re
+
+    # Each entry is a substring of a string that is allowed to say this, and
+    # why. Anything not listed here has to be justified before it is added.
+    ALLOWED = {
+        # the kill switch: it denies everything, so it cannot widen, and it
+        # is the documented way out of an unreadable active_grant.json
+        "to reset the file and start over",
+        # `deactivate --client`'s own error text, which fires when the user
+        # already chose to remove and named a key that does not exist
+        "no per-client grant under key",
+        "Removal takes the key exactly as written",
+        # the rule-1 tie: no command can fix it, so the reason says to edit
+        # the file. It names both grants so the choice is informed.
+        "so no command can pick between them",
+    }
+    # Deliberately NOT also filtering on "does it mention keys or entries".
+    # The live instance was *"Fix or remove each before narrowing the family:
+    # evoctx grant list"* — about entries throughout, naming none of those
+    # words — so a second condition let it straight through. Any string that
+    # mentions an evoctx grant command and a removal verb has to be argued
+    # for in ALLOWED: a false positive costs one line there, a miss costs a
+    # widening.
+    REMOVAL = re.compile(r"remove|removing|delete|deleting|deactivate", re.I)
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "evoctx"
+    offenders = []
+    for path in sorted(src.rglob("*.py")):          # rglob: a subpackage counts
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # Every docstring, including cli.py's `evoctx help` banner. A
+        # docstring *explains* why removal is dangerous — which several of
+        # these deliberately do at length — while an emitted string *advises*
+        # it. Only the second is a defect, and the AST tells them apart
+        # exactly. Comments never reach the tree at all.
+        docstrings = set()
+        for holder in ast.walk(tree):
+            if isinstance(holder, (ast.Module, ast.ClassDef,
+                                   ast.FunctionDef, ast.AsyncFunctionDef)):
+                body = getattr(holder, "body", None)
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docstrings.add(id(body[0].value))
+        for node in ast.walk(tree):
+            if id(node) in docstrings or not isinstance(node, ast.Constant):
+                continue
+            text = node.value
+            if not isinstance(text, str) or "evoctx grant" not in text:
+                continue
+            if not REMOVAL.search(text):
+                continue
+            if any(ok in text for ok in ALLOWED):
+                continue
+            offenders.append(f"{path.name}:{node.lineno}: {text[:70]!r}")
+    assert not offenders, (
+        "these advise removing a per-client entry, which widens the client "
+        "that had it — if one is genuinely safe, add it to ALLOWED with the "
+        f"argument: {offenders}"
+    )
 
 
 # ── usability and shadowing ──────────────────────────────────────────────────
@@ -738,7 +989,7 @@ def test_an_entry_its_grant_excludes_is_reported_as_blocking_not_expired(store):
     state = state_of(store)
     state["clients"]["vscode"]["name"] = "read-only"       # client: "cursor*"
     store.active_path.write_text(json.dumps(state), encoding="utf-8")
-    store._active_mtime = -1.0
+    store._active_mtime = None
     blocking, _ = store.shadowing_keys("vscode*")
     assert [k for k, _why, _ok in blocking] == ["vscode"]
     assert "covers client 'cursor*'" in blocking[0][1]

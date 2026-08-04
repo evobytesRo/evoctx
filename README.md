@@ -345,7 +345,9 @@ way it was**, so a non-zero exit never leaves a grant applied. What it does *not
 an exact key winning over a broader glob you just wrote: that is the documented precedence
 rule, so it says which clients kept their own entry and how to bring them in line. No message
 here ever suggests deleting an entry to fix a denial — removing one hands its client back to
-the wider machine-wide grant, which is the opposite of what a narrow entry was for.
+the wider machine-wide grant, which is the opposite of what a narrow entry was for. Every
+fix is an addition, including for two keys that tie: giving that client an entry of its own
+outranks both and settles it without deleting either rule you wrote.
 
 ⚠️ **One-way door across versions.** An evoctx older than 0.1.4 running `grant activate` on
 this store rewrites `active_grant.json` and **silently erases every per-client entry** — it

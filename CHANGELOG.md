@@ -345,10 +345,28 @@ promote the client it belonged to.
 denial.** Removing one hands its client back to the machine-wide grant, which is normally
 the wider one — so the remedy for a misconfigured narrowing would be to undo the narrowing,
 and an assistant relaying the command verbatim would be asking for the access it was just
-refused. Where the fix is a removal only you can choose between, the command carries a
-`<placeholder>` and the reason names what you need in order to choose. A test asserts the
-property directly: run every remediation this feature can print, from the state that printed
-it, and no client ends up with a tool it did not have.
+refused. Every fix is an **addition**: even an ambiguous pair of keys is settled by giving
+that client an entry of its own, which outranks both, rather than by deleting one of them.
+Where the grant to use is your choice, the command carries a `<name>` placeholder and the
+reason names the grants behind each key so the choice is informed.
+
+Two tests hold that. One runs every remediation across seven failure states and asserts no
+client ends with more access than was *configured* for it — measured against what is written
+down for that client, not against what it currently has, because renewing a lapsed entry
+legitimately restores access. The other scans the source: no module may emit a string
+suggesting an entry be removed. The second exists because "these two functions are the only
+producers" was asserted in prose and was not true — four other modules compose `evoctx
+grant ...` strings, and the same defect kept reappearing in whichever one had not been
+looked at.
+
+**A file that cannot be read is never overwritten.** `active_grant.json` failing to parse
+resolves to "no grant is active" — the safe answer for reads. It was also, until now, what
+the *write* path merged onto: one stray byte, and the next routine `grant activate` saw no
+`clients` map, wrote a clean two-key file, and silently deleted every per-client narrowing,
+exit 0, with a success line. `activate` and `deactivate --client` now refuse and name the
+two recoveries — repair the JSON to keep the entries, or `grant deactivate` to reset. The
+kill switch is deliberately exempt: it never reads the file, and it denies everything, so it
+cannot widen.
 
 **`grant activate --client` restores the store on any non-zero exit.** Every check it makes
 asks what the store resolves to, which is only answerable once the entry is written — so it
@@ -392,6 +410,10 @@ for `list_projects()` above, but worth knowing before you upgrade:
   machine-wide grant. It now resolves **for the calling client**: answering "may I call X?"
   from the machine default while that client's real calls run against a narrower entry
   would be the one wrong answer this tool cannot afford.
+- `evoctx doctor` gains a **grant scope casing** check, because the case-sensitivity change
+  above is otherwise silent: a `scope.projects` entry differing from a real project only by
+  case now matches nothing, and the only symptom is a denial mid-task. Globs and
+  not-yet-created projects are left alone — only the near miss is evidence of the flip.
 - `evoctx doctor` gains five checks: registered directories that are no longer present,
   notes marked both global and project-scoped, the pre-upgrade backups described below (so
   you know they exist and that they are yours to delete), the resolved workspace, and the

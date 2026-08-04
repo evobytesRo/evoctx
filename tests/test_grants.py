@@ -225,7 +225,7 @@ def test_workspace_resolving_out_of_scope_reads_as_unresolved(db, tmp_path):
     beta_dir.mkdir()
     db.register_project("beta", beta_dir)
 
-    block = engine.workspace(grant, cwd=beta_dir)
+    block = engine.workspace(grant, "test-client", cwd=beta_dir)
     assert block["project"] is None
     assert block["confidence"] == "none"
     assert "beta" not in block["hint"]
@@ -239,7 +239,7 @@ def test_workspace_resolving_in_scope_is_returned(db, tmp_path):
     alpha_dir.mkdir()
     db.register_project("alpha", alpha_dir)
 
-    assert engine.workspace(grant, cwd=alpha_dir)["project"] == "alpha"
+    assert engine.workspace(grant, "test-client", cwd=alpha_dir)["project"] == "alpha"
 
 
 def test_nearby_is_filtered_to_the_grants_scope(db, tmp_path):
@@ -252,7 +252,7 @@ def test_nearby_is_filtered_to_the_grants_scope(db, tmp_path):
     db.register_project("alpha", alpha_dir)
     db.register_project("beta", beta_dir)
 
-    block = engine.workspace(grant, cwd=alpha_dir)
+    block = engine.workspace(grant, "test-client", cwd=alpha_dir)
     assert block["project"] == "alpha"
     assert [n["project"] for n in block["nearby"]] == []
 
