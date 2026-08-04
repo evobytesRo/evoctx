@@ -345,9 +345,16 @@ way it was**, so a non-zero exit never leaves a grant applied. What it does *not
 an exact key winning over a broader glob you just wrote: that is the documented precedence
 rule, so it says which clients kept their own entry and how to bring them in line. No message
 here ever suggests deleting an entry to fix a denial — removing one hands its client back to
-the wider machine-wide grant, which is the opposite of what a narrow entry was for. Every
-fix is an addition, including for two keys that tie: giving that client an entry of its own
-outranks both and settles it without deleting either rule you wrote.
+the wider machine-wide grant, which is the opposite of what a narrow entry was for. For two
+globs that tie, the fix is an addition: giving that client an entry of its own outranks both
+and settles it without deleting either rule you wrote.
+
+**Two keys differing only in case are the one thing no command can fix**, and evoctx says so
+rather than pretending otherwise. `Cursor` and `cursor` are the same key, so the entry that
+would outrank them already exists — twice — and `grant activate` refuses every spelling by
+pointing at the other one. Open `active_grant.json` and delete one; the denial names both
+keys and the grant behind each, so you can see what you are choosing between. `grant
+activate` will not let you create that state, but a hand edit or a merge can.
 
 ⚠️ **One-way door across versions.** An evoctx older than 0.1.4 running `grant activate` on
 this store rewrites `active_grant.json` and **silently erases every per-client entry** — it

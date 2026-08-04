@@ -122,6 +122,17 @@ wider of the two, the remediation would be the widening. The
 `deactivate` kill switch clears per-client entries along with the machine-wide grant, so
 pulling it leaves nothing active.
 
+**Nothing evoctx prints will tell you to remove an entry in order to restore access.** That
+is a deliberate constraint on its own output, not a claim about what you can do: removing a
+narrow entry drops its client to the machine-wide grant, and the server instructions tell an
+assistant to relay these commands verbatim — so a denied assistant would be relaying a
+request for the access it was just refused. Ambiguity between two globs is resolved by
+*adding* an entry for that client, which outranks both. Ambiguity between two case-variants
+of the same key has no command at all, because the entry that would outrank them is the one
+already present twice; there evoctx says to edit `active_grant.json` by hand and names both
+entries with their grants, so the removal is a decision you make with the trade-off in front
+of you rather than one a printed command makes for you.
+
 What this does **not** do is verify that a per-client grant is one the client can actually
 use. A key whose grant carries a narrower `client` glob of its own is caught when the key
 is a concrete name; when both are globs it is not, because deciding whether two globs
