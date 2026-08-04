@@ -69,6 +69,14 @@ Two independent layers, described in full in [README.md](README.md#redaction):
   retroactively protect data written under a looser one. (Write-time redaction is what actually
   prevents that; read-time redaction is for narrowing what a *specific* less-trusted client sees.)
 
+**Write-time masking applies to writes, so it does not reach back.** Project descriptions
+were not scanned before 0.1.4 (note bodies and session text always were). If a description
+written by an older version holds something secret-shaped, upgrading does not clean it —
+migration 005 adds columns, it does not rewrite your text, and a sweep that edited existing
+descriptions would silently mangle any prose that merely looked like a key. Rewriting the
+description (`evoctx update-project NAME --field overview --file …`, or `evoctx init
+--rescrape`) masks it on the way back in. `evoctx dump` shows you what is actually stored.
+
 Neither layer is encryption. Redacted text is still recoverable by anyone with direct file
 access to `store.db` for anything the write-time patterns didn't catch.
 

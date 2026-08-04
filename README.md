@@ -405,7 +405,8 @@ your store between machines, upgrade all of them.
 Two layers, different jobs:
 
 **Write-time (unconditional, built-in).** Every write — `write_note`, `start_session`,
-`end_session`, from the CLI or from an MCP client, regardless of which grant is active —
+`end_session`, and since 0.1.4 project descriptions too (`register_project`, `evoctx init`,
+`update-project`), from the CLI or from an MCP client, regardless of which grant is active —
 is scanned for common secret shapes (API key prefixes, AWS/GitHub/Slack/Google tokens,
 PEM private key blocks, and `password=` / `api_key=` / `access_token=` assignments) and masked *before it touches disk*.
 This is the one place every write path funnels through, so a pasted secret doesn't sit raw in

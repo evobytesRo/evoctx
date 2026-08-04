@@ -688,7 +688,10 @@ def cmd_install(args):
     if args.client == "claude-code":
         project_dir = _Path(args.dir) if args.dir else _Path.cwd()
         path, entry = install_claude_code(project_dir, uvx=args.uvx)
-        print(f"Wrote {path} (backup: .bak):")
+        # the backup only exists if the file did; claiming one on a fresh
+        # install sends people looking for a file that was never written
+        backup = path.with_suffix(path.suffix + ".bak")
+        print(f"Wrote {path}{' (backup: .bak)' if backup.exists() else ''}:")
         print(json.dumps({SERVER_NAME: entry}, indent=2))
         print()
         print("Claude Code (VS Code extension) reads MCP servers from a project-scoped")
@@ -722,7 +725,7 @@ def cmd_install(args):
             print("(ChatGPT Desktop does not support local stdio MCP servers.)")
             sys.exit(1)
         entry = install_json_client(client, uvx=args.uvx)
-        print(f"Wrote {client.config_path} (backup: .bak):")
+        print(f"Wrote {client.config_path}{' (backup: .bak)' if client.config_path.with_suffix(client.config_path.suffix + '.bak').exists() else ''}:")
         print(json.dumps({SERVER_NAME: entry}, indent=2))
         tip = NEXT_STEPS.get(args.client)
         if tip:
@@ -752,7 +755,10 @@ def cmd_install(args):
         # claude-code already printed its own, more accurate step (reload the
         # VS Code window — "restart the client" is wrong for an extension)
         print("Restart the client, then verify with: evoctx doctor")
-    print("Add the instructions snippet to the client's rules file — see docs/instructions-snippet.md")
+    print("Add the instructions snippet to the client's rules file. In a clone:")
+    print("  docs/instructions-snippet.md")
+    print("Installed from PyPI (the wheel ships code only):")
+    print("  https://github.com/evobytesRo/evoctx/blob/main/docs/instructions-snippet.md")
 
 
 def cmd_doctor(args):
@@ -1188,7 +1194,14 @@ def cmd_init(args):
     # the caller's spelling, not the normalized key — normalisation lowercases
     # on Windows, and echoing that back reads like the tool renamed the folder
     print(f"  directory: {directory}")
-    print(f"  overview:  {overview}")
+    # Read the stored text back rather than echoing the local variable. The
+    # overview is scraped from a README, the store masks secret shapes in it
+    # on write, and echoing the pre-mask copy put the raw secret into terminal
+    # scrollback and CI logs — while telling the user the store contains text
+    # it does not. The re-link branch above already prints what was stored;
+    # this is the branch that did not.
+    stored = db.get_project(name) or {}
+    print(f"  overview:  {stored.get('overview', overview)}")
     print()
     print(f"Refine with:")
     print(f"  evoctx update-project {name} --field conventions --text \"...\"")

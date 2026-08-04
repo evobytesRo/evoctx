@@ -35,14 +35,16 @@ the one unattributed surface meant an assistant-written overview read identicall
 curated one, forever, to every future session. Text scraped by `evoctx init` from manifests
 and READMEs is attributed to `init-scrape`, not to you — nobody wrote it.
 
-`description_reviewed_at` and `attention_dismissed_at` exist alongside it as schema only.
-Nothing writes either yet — the review writer arrives with assistant-side registration,
-where a human confirms a proposed description, and the dismissal writer with the
-incomplete-project prompt. They are documented here so the columns are not mistaken for
-working features: today the first answers "no human has approved this" for every project,
-which is true but not yet informative. The clearing rule *is* live: any write that changes
-the overview or conventions clears the review, including the author's own, because a review
-approves specific words. Text that does not change keeps it.
+`description_reviewed_at` is written by `register_project(confirmed_by_user=True)` —
+item 10 below — and only when that call authored the description; linking an existing
+project leaves it alone. It records that a human was *said* to have approved the text, which
+is an unverified client claim, so read `description_author` when provenance matters
+([SECURITY.md §5](SECURITY.md)). `attention_dismissed_at` is still schema only: nothing
+writes it, and its writer arrives with the incomplete-project prompt.
+
+The clearing rule is live for both: any write that changes the overview or conventions
+clears the review, including the author's own, because a review approves specific words.
+Text that does not change keeps it.
 
 **4. A global note is now explicitly global.** `project=None` meant two different things the
 store could not tell apart: *"the user asked for a note that spans everything"* and
@@ -429,6 +431,12 @@ for `list_projects()` above, but worth knowing before you upgrade:
   which is a scope failing open, and it now also decides who may write a global note. If you
   have hand-edited `grants.yaml` this way, fix it before upgrading: grant parsing runs
   inside every tool call, so a rejected file denies all of them.
+- **Project descriptions written before 0.1.4 are not retroactively masked.** Write-time
+  secret masking now covers `overview`/`conventions`/`open_questions`, which it did not
+  before — but it runs on writes, and migration 005 does not rewrite text you wrote. An old
+  description holding something secret-shaped stays as it is until you rewrite it
+  (`update-project`, or `init --rescrape`). Deliberate: a sweep would edit prose that merely
+  looked like a key, silently, in the one field a human is most likely to have curated.
 - **Upgrading is one-way, and now backs itself up first.** Once migrated, an older evoctx
   refuses to open the store — correct, but irreversible, and this store is built to be
   synced between machines that may not upgrade together. The migration writes

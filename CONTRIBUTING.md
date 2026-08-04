@@ -60,7 +60,11 @@ before tagging:
    it. Every one of those is invisible to a diff and obvious to one execution. Check counts and
    enumerations first ("gains three checks", "5 tables", lists of flags) — they rot fastest and
    are cheapest to verify.
-7. Push `main`, wait for CI green — the tag is what publishes.
+7. Push `main`, wait for CI green — the tag is what publishes, and it does **not** re-run
+   the suite. CI on `main` is the gate (3 OS × 2 Python, plus pyright); re-running a
+   single platform at tag time would be weaker while reading like the real thing. The
+   release workflow checks the one thing CI cannot — that the tagged commit is an
+   ancestor of `origin/main`, i.e. the commit CI actually saw — and refuses otherwise.
 8. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`. `release.yml` builds, publishes to PyPI via
    trusted publishing, and cuts the GitHub release.
 9. Install from PyPI into a clean venv and check `evoctx version`.
