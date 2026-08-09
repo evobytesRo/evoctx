@@ -28,7 +28,15 @@ blobs, no proprietary format, no encryption key you'd need this project's code t
 
 - **Bug reports / feature requests:** open an issue. Include `evoctx doctor` output — it covers
   version, schema version, store size, and client-config detection in one command.
-- **Pull requests:** run `pytest tests/ -v` and `npx --yes pyright@1.1.411` before opening one;
+- **Pull requests:** run `python scripts/preflight.py` before opening one. It derives the file
+  list from git rather than from memory, runs the pinned pyright over exactly those files, runs
+  the tests that import them, checks that `_init()` and `MIGRATIONS` still build the same
+  schema, checks that the three instruction channels moved together, and measures whether the
+  failure paths you added were ever executed. It defaults to diffing against the merge base
+  with `main`, so it works on a committed branch; pass `--base <ref>` for anything else. Paste
+  its report into the PR — a missing report is visible, a forgotten check is not. It runs the
+  full suite whenever a file under `src/evoctx/` changed, but a docs-only change gives it no
+  Python to check, so also run `pytest tests/ -v` and `npx --yes pyright@1.1.411` directly;
   CI gates on both — the tests across ubuntu/macOS/Windows × Python 3.10/3.12, pyright once,
   at that pinned version (settings live in `[tool.pyright]` in `pyproject.toml`; the baseline is
   zero errors). New MCP tools need a CLI mirror in the same PR — see the parity table in
@@ -50,7 +58,11 @@ before tagging:
    existing enumerated grant silently loses the new tool with nothing reporting it.
    `test_prior_tool_sets_covers_the_previous_release` fails until you do, and its literal is
    the thing to update.
-5. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean.
+5. `pytest tests/ -v` and `npx --yes pyright@1.1.411` both clean, **and**
+   `python scripts/preflight.py` clean. Run the first two directly, not only through preflight:
+   a release commit is often a version bump plus a CHANGELOG, which gives preflight no Python
+   to check and no tests to select. What preflight adds on top is the schema-drift and
+   instruction-channel checks that step 6 would otherwise have to catch by reading.
 6. **Run the audience sweep below against the release, don't read it.** Steps 1–5 are all
    mechanical — version strings, tool lists, tests — and none of them can see a sentence that
    became false. 0.1.4's release review found the README still carrying the *previous*

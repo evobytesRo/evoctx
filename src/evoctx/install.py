@@ -693,6 +693,42 @@ def _check_unscoped_notes(checks: list, db) -> None:
                    f"default grant reads them, as does the CLI"))
 
 
+def _check_fts_index(checks: list, db) -> None:
+    """WHICH columns the search index covers, not just that the table opens.
+
+    A store whose FTS5 predates 0.1.5 answers every tag query with silence,
+    and silence is indistinguishable from "nothing was written about that" —
+    the one failure this check exists to make visible.
+
+    A function rather than a block inside `doctor()` so the FAILURE branch can
+    be executed by a test. It is the branch that matters and the one nobody
+    reaches by accident; left inline, it was shipped never having run.
+    """
+    try:
+        db.conn.execute("SELECT count(*) FROM notes_fts")
+        cols = [r[1] for r in db.conn.execute("PRAGMA table_info(notes_fts)")]
+    except Exception:
+        checks.append(("fts5 search", False, "FTS5 missing — search falls back to LIKE"))
+        return
+    if "tags" in cols:
+        checks.append(("fts5 search", True, f"available, indexing {', '.join(cols)}"))
+        return
+    # NOT "run it again". `doctor` opened the store above, which runs every
+    # outstanding migration, so if 006 were going to fix this it already would
+    # have. Reaching here means the store is at v6+ with the wrong index — the
+    # migration ran and did not stick — and the only remedies are a rebuild or
+    # the backup it took on the way in.
+    checks.append(("fts5 search", False,
+                   f"indexes {', '.join(cols)} but not tags — tag words "
+                   f"are unsearchable, and re-opening the store will NOT "
+                   f"fix it (migration 006 has already run). Recover "
+                   f"from store.db.bak-pre-migration-006, or rebuild the "
+                   f"index by hand: DROP the notes_ai/notes_ad/notes_au "
+                   f"triggers and notes_fts, recreate them from "
+                   f"NOTES_FTS_SCHEMA in db.py, then "
+                   f"INSERT INTO notes_fts(notes_fts) VALUES('rebuild')"))
+
+
 def _check_workspace(checks: list, db, cwd: Path) -> None:
     """What the resolution ladder answers for the directory doctor was run in.
 
@@ -1082,11 +1118,7 @@ def doctor(store_dir: Path, home: Path) -> list[tuple[str, bool, str]]:
             checks.append(("database", True,
                            f"schema v{version}/{len(MIGRATIONS)}, "
                            f"{note_count} notes, {_human_size(db_size)}"))
-            try:
-                db.conn.execute("SELECT count(*) FROM notes_fts")
-                checks.append(("fts5 search", True, "available"))
-            except Exception:
-                checks.append(("fts5 search", False, "FTS5 missing — search falls back to LIKE"))
+            _check_fts_index(checks, db)
             try:
                 audit_count = db.conn.execute("SELECT count(*) FROM audit_log").fetchone()[0]
                 checks.append(("audit log", True,

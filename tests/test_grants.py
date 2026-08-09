@@ -190,7 +190,7 @@ def test_search_scoped_to_projects_and_tags(db, tmp_path):
     db.add_note("beta note", "shared keyword", project="beta")
     db.add_note("private alpha", "shared keyword", project="alpha", tags=["#personal"])
 
-    hits = engine.search(grant, "shared", project=None, limit=10)
+    hits = engine.search(grant, "shared", project=None, limit=10)["results"]
     assert [h["title"] for h in hits] == ["alpha note"]
 
 

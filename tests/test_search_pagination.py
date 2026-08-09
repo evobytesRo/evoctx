@@ -27,9 +27,14 @@ def scoped_engine(db, tmp_path):
 
 
 def test_heavy_exclusion_still_fills_requested_limit(db, tmp_path):
-    # 90% of matching notes are excluded — old fixed limit*3 over-fetch
-    # would silently return fewer than `limit` even though enough visible
-    # notes exist further down the result set.
+    # 90% of matching notes are excluded, and the visible ones rank last.
+    #
+    # Two implementations have failed this: a fixed limit*3 over-fetch, and
+    # `_fetch_filtered`'s paging scan. Neither is what search runs today —
+    # `_widen_until_enough` reads up to SEARCH_SCAN_LIMIT rows in one pass and
+    # filters after — so the case is now covered structurally rather than by
+    # careful paging. Kept because it is a property of the RESULT, not of an
+    # implementation: a caller asking for 5 visible notes gets 5.
     for i in range(27):
         db.add_note(f"note {i}", "shared keyword", tags=["#personal"])
     for i in range(5):
@@ -37,7 +42,7 @@ def test_heavy_exclusion_still_fills_requested_limit(db, tmp_path):
 
     engine = scoped_engine(db, tmp_path)
     grant = engine.check("any", "search_context")
-    results = engine.search(grant, "shared", project=None, limit=5)
+    results = engine.search(grant, "shared", project=None, limit=5)["results"]
     assert len(results) == 5
     assert all("#personal" not in r["tags"] for r in results)
 
@@ -50,7 +55,7 @@ def test_exhausted_store_returns_fewer_than_limit_without_hanging(db, tmp_path):
 
     engine = scoped_engine(db, tmp_path)
     grant = engine.check("any", "search_context")
-    results = engine.search(grant, "shared", project=None, limit=20)
+    results = engine.search(grant, "shared", project=None, limit=20)["results"]
     assert len(results) == 3  # only 3 visible notes exist at all
 
 

@@ -1,5 +1,179 @@
 # Changelog
 
+## 0.1.5 — 2026-08-09 — search finds things, and you close the session you opened
+
+Search is the headline. Notes are only worth writing if they come back, and three separate
+things stood between a query and the note that answered it: tags were not indexed, multi-word
+queries were combined with AND and therefore usually matched nothing, and a result list could
+not say how much of the answer it was leaving out. Migration 006 runs on the next open and
+needs nothing from you.
+
+Sessions gain the other half: `end_session` now takes the id `start_session` gave you, so a
+machine running two assistant windows closes the right one.
+
+**Three breaking changes.** `search_context()` returns an object rather than a list (AI clients
+handle that transparently, since the response is described to them; a script reading the result
+as a list needs `["results"]`). `evoctx search-context` now ends with `showing 1-10 of 40
+match(es).` where it used to print `10 result(s).` — anything parsing that line needs updating.
+And `evoctx end-session --id` requires at least eight characters of the id, or the whole one,
+where any unique prefix used to do; a script passing a short one now exits 1 instead of closing
+a session.
+
+### 1. Tags are searchable
+
+`notes_fts` indexed `title` and `content`. Tags were stored, displayed and filterable, but a
+search for the word in a tag did not find the note carrying it — on the store this was
+developed against, 51 notes were tagged `#gotcha` while 39 mentioned the word in their text,
+so a dozen notes were tagged for a topic and unreachable by searching for it.
+
+Migration 006 rebuilds the index as `(title, content, tags)`. Because `tags` is a real column
+on `notes`, `content=notes` populates it during the rebuild with no backfill step, so every
+note already in the store becomes findable by its tags — not only notes written from here on.
+
+Tags are indexed as the stored JSON (`["#session", "#evobytes-api"]`), which is all that is
+needed: unicode61 treats `[`, `"`, `#`, `,` and `-` as separators, so the indexed terms are
+`session`, `evobytes`, `api` — what anyone searching for a tag types. A leading `#` on a query
+is stripped, so `#gotcha` and `gotcha` are the same search.
+
+The FTS triggers are dropped and recreated as part of the migration rather than left in place.
+An external-content FTS5 table stays consistent only if its `'delete'` command replays exactly
+the tuple that was indexed, so a trigger writing two columns against a three-column table
+would corrupt the index for every note edited or deleted afterwards.
+
+### 2. Search widens instead of coming back empty
+
+FTS5 combines two bare words with **AND**. A natural four- or five-word question therefore
+demanded that every term appear in one note, matched nothing, and left the impression that the
+store held nothing on the subject. `ANAF efactura submission status polling` returned 0 notes
+on a store that held four good answers to it.
+
+`Database.search()` now climbs a ladder and stops at the narrowest rung that returns five or
+more matches:
+
+1. **AND**, synonym-expanded, as before.
+2. **OR** across the same terms.
+3. **Prefixes** — `newslet` finds `newsletter`.
+
+Five, rather than one, because a single incidental match is the shape most likely to be the
+wrong one: on a real store the five-word ANAF query above ANDed to exactly one note that
+happened to contain all five words, and stopping there would have hidden the four notes that
+actually answered it. If no rung reaches five, the fullest rung wins, ties going to the
+narrower — not the widest rung with any hits, since rung 3 drops synonym expansion and so is
+not a superset of rung 2.
+
+Widening costs no precision, because it does not reorder anything: rung 2 is rung 1's terms
+joined with OR, so its results are a superset, and bm25 accumulates a contribution per matched
+term — the note carrying every term still comes first. The honest limit is that bm25 is a
+score rather than a guarantee, so a very short note matching one term in its title can in
+principle outrank a long note matching all of them.
+
+**There is still no substring search, in any mode.** FTS5 has no infix operator, so `letter`
+will never find `newsletter`. The LIKE path that *can* match inside a word runs only when FTS5
+refuses to parse a query at all; it is an error path, not a search mode.
+
+The ladder rewrites FTS5 barewords — alphanumerics, `_`, and anything at or above U+0080. That
+covers what actually gets typed at a developer's context store: `mt940`, `0019`, `sha256`,
+`bank_statements`, and words carrying diacritics. A query containing deliberate FTS5 syntax —
+quotes, parens, `OR`, `NOT`, `NEAR`, a prefix `*`, a leading `-` — is passed through untouched
+and gets neither synonym expansion nor widening, so an exact phrase stays exact. Typographic
+quotes (`“ ” ‘ ’ « »`) count as quoting for this purpose even though FTS5 itself does not
+honour them: whoever pasted a quoted phrase meant the phrase, and answering a broader question
+is the wrong way to fail.
+
+### 3. Ranking distinguishes a title from a body from a tag
+
+`ORDER BY rank` weighted every column equally, so a note *about* webhooks tied with one that
+mentions them once in passing. Ordering is now `bm25(title=10, content=1, tags=4)`: a title
+naming the thing is the note you wanted, and a hand-applied tag beats incidental prose without
+outranking a title. Weights only reorder; nothing is included or excluded by them.
+
+### 4. `search_context` reports how many notes matched
+
+It returned a bare list, which cannot express *"there are 40 of these and you are looking at
+10"* — so an assistant had no way to tell a complete answer from the first page of one. The
+response is now:
+
+```json
+{"results": [...], "total": 40, "offset": 0, "limit": 10, "has_more": true,
+ "page_token": "invoice OR reconciliation"}
+```
+
+`offset` pages through a large result, and `page_token` keeps the pages talking about the same
+thing. Each call decides afresh how broadly to interpret the query, so a note written between
+two calls can narrow that decision and make page two a slice of a different set altogether;
+passing the previous token back pins the interpretation for the whole walk.
+
+It is a token, not a snapshot, and paging is positional — writes and deletes between calls
+still move rows across page boundaries, so a paged walk of a store being written to samples
+the matches rather than guaranteeing every one. Where completeness matters, raise `limit` and
+take the answer in a single call. The tool documentation says so at the point of use.
+
+`total` is counted after grant filtering, from the same
+sequence the page is sliced from, so it never advertises notes the caller would then be denied
+— a raw `COUNT` promising 40 and delivering 6 reads as a paging bug rather than as a grant
+doing its job. For the same reason the widening ladder now counts what the caller can see: a
+rung matching six notes in a project the grant cannot read has, for that caller, matched
+nothing, and the search moves on to the next rung instead of reporting zero.
+
+A query matching more than 2000 notes is answered from the first 2000. `total` then arrives as
+`total_is_lower_bound`, so it reads as a floor rather than a count, and `has_more` stays false
+because those extra matches are not reachable by paging — the answer there is to narrow the
+query, which is what the tool documentation says.
+
+Ranking is by relevance and never by date, which the tool docstring, the instruction snippet
+and the README now all state outright: the position of a result says nothing about when it was
+written, so read `created_at` when recency is what matters.
+
+Counting costs one ordered pass over the matches, per rung the ladder tries. On this hardware a
+broad query matching every note takes about 4 ms on a 378-note store and 30 ms on a 3000-note
+one; the same page without a count is a few milliseconds either way, and a narrow query is
+within noise of its old cost.
+
+### 5. `end_session` takes a session id
+
+Two assistant windows sharing one store is ordinary, and the tool closed whatever session
+*this connection* had opened, with no way to name another. The failure that produces is not a
+missing summary but a wrong one — a summary of work the closed session never did.
+
+`start_session` now tells the caller to record the id it returns, and `end_session(summary,
+session_id=…)` closes that one. A prefix of eight characters or more resolves it, so the short
+form printed in listings can be pasted back; shorter prefixes are refused, because closing has
+no confirmation step and no undo. Both the MCP tool and `evoctx end-session` enforce it.
+
+Closing also reports `other_open_sessions` and a `warning` line, and only when something else
+is genuinely open. The wording is an observation rather than an instruction: the caller cannot
+know whether another window's session was abandoned or is being worked in right now, and
+closing a live one is worse than leaving it untidy. Those entries are redacted before the
+warning quotes them, and the count they report is the real number of open sessions rather than
+the length of the list being displayed.
+
+Closing a session that was already closed now says so rather than returning the untouched row
+as though this call had written it, and releases the connection's hold on it — reached by
+closing from the CLI, or from another window, while an MCP connection still has the session
+open.
+
+### 6. Smaller things
+
+- **The Stop hook states what it cannot know.** It runs as a separate process with no view of
+  which window opened which session, so it reports the newest open one, prints the full id and
+  the exact `end_session(summary, session_id="…")` call, and says plainly that it cannot
+  attribute it. Registering a workspace is still what narrows it to the repo you are in.
+- **`evoctx doctor` checks which columns the index covers**, not only that the FTS table
+  opens, and names a real recovery path if they are wrong.
+- **`evoctx search-context` gained `--offset` and `--page-token`** and reports total matches,
+  keeping the CLI a full mirror of the MCP tool. It prints the next page's command, token
+  included, so paging is a copy-paste rather than a reconstruction.
+- **`evoctx end-session --id` now requires at least eight characters** of the id, or the whole
+  one. A unique one-character prefix used to close a session, and unlike `evoctx delete` this
+  path has no confirmation and no undo.
+- **`evoctx demo-seed` detects an existing store again.** Its guard searched for `*`, which
+  FTS5 rejects, so it read "empty" on a full store and re-seeded the demo notes every run.
+- **`scripts/preflight.py`, for contributors.** It derives the changed-file list from git rather
+  than from memory, runs the pinned pyright over exactly those files, runs the tests that import
+  them, checks that `_init()` and the migrations still build the same schema, checks that the
+  three instruction channels moved together, and measures whether newly added failure paths were
+  ever executed. `CONTRIBUTING.md` asks for its report on a pull request.
+
 ## 0.1.4 — 2026-08-04 — projects know where they live, and each client can have its own grant
 
 **1. A project can now record the directories its code is in.** Until now the store had no

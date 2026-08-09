@@ -71,8 +71,13 @@ def test_read_paths_redact(db, tmp_path):
     assert note["title"] == "Client [CLIENT]"
     assert note["content"] == "token [KEY] in body"
 
-    hits = engine.search(grant, "token", project=None, limit=5)
-    assert "[KEY]" in hits[0]["snippet"] or "[KEY]" in hits[0]["title"] or True
+    hits = engine.search(grant, "token", project=None, limit=5)["results"]
+    # The `or True` that used to close this line made it unconditionally green.
+    # The snippet is where the masked value would surface, and the title is
+    # redacted on its own account.
+    assert hits, "the search found nothing, so the assertions below say nothing"
+    assert "[KEY]" in hits[0]["snippet"]
+    assert hits[0]["title"] == "Client [CLIENT]"
     assert "sk-live999" not in str(hits)
 
 

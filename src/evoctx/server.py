@@ -78,8 +78,29 @@ mcp = FastMCP(
         "both take the workspace's own project when you leave it unset. When nothing resolves: "
         "for write_note(), name a project or set is_global; for start_session(), name a project "
         "or register the workspace — it has no is_global, since a session happens somewhere. "
-        "Before ending: call end_session(summary) "
-        "with what was built, decided, and left open. If a call is denied, list_grants() shows "
+        "SEARCHING: two or three content words, never a sentence. Terms combine with AND, so "
+        "every extra word can only shrink the result; the store retries with OR and then with "
+        "prefixes whenever AND turns up fewer than a handful, so type bare words and let it "
+        "widen. Titles, bodies and tags are all indexed, and word forms match (migrating finds "
+        "migration) — substrings never do. Quotes, parens, OR, NOT, NEAR and a trailing * are "
+        "honoured as written and switch the widening off. Results come back BEST-MATCH FIRST, "
+        "not newest first — read created_at when recency is what matters. The response carries "
+        "`total`, the number of notes that matched, which is not the number returned: when "
+        "has_more is true and the topic matters, raise limit or page with offset instead of "
+        "assuming you have seen everything. A total of 0 means nothing matched THAT YOU CAN "
+        "SEE — an active grant can be filtering it, so check list_grants() before telling the "
+        "user the store has nothing on the topic. To see more of a large result, raising limit "
+        "is the reliable way — one call is one consistent set. If you page with offset instead, "
+        "pass the previous response's page_token back so both pages read the query the same "
+        "way; paging is still positional, so on a store another window is writing to it samples "
+        "rather than guarantees completeness. "
+        "SESSIONS: record the id start_session() returns, and close that one — "
+        "end_session(summary, session_id=<that id>). Several assistant windows share one "
+        "store, so the newest open session is not reliably yours. The response may carry "
+        "other_open_sessions and a warning: that is an observation about other windows, not "
+        "a task. Never close a session you did not open unless the user says it was "
+        "abandoned — a summary of work it never did is worse than leaving it open. "
+        "If a call is denied, list_grants() shows "
         "what you are allowed — resolved for you specifically, since a client can have its own "
         "grant. Relay the evoctx command from the error as written rather than a command you "
         "know: it may name the per-client entry, and 'grant activate everything' would leave "
@@ -163,22 +184,85 @@ def get_project(name: str, ctx: Context) -> dict | None:
 
 
 @mcp.tool()
-def search_context(query: str, ctx: Context, project: str | None = None, limit: int = 10) -> list[dict]:
+def search_context(query: str, ctx: Context, project: str | None = None,
+                   limit: int = 10, offset: int = 0,
+                   page_token: str | None = None) -> dict:
     """
     Search notes by keyword across all projects or within one.
-    Returns id, title, snippet, project, tags, author_client, and is_global
-    (true only when the note was deliberately written to span every project).
-    A null project with is_global false is a note from before 0.1.4, when no
-    project had been chosen; such a note can no longer be written.
+
+    Returns `{results, total, offset, limit, has_more, page_token}`.
+    **`total` is how many
+    notes matched, not how many came back** — so a `total` of 40 beside 10
+    results means you are looking at a quarter of the answer. When `has_more`
+    is true and the topic matters, ask for the rest — **raising `limit` is the
+    reliable way**, since one call sees one consistent set. If you do page with
+    `offset`, pass the previous response's `page_token` back so both pages read
+    the query the same way. Both counts are what THIS client is allowed to see,
+    so they never advertise a note that would then be withheld.
+
+    `total_is_lower_bound: true` means the match set was larger than the scan
+    ceiling and `total` is a floor, not a count. Those extra matches cannot be
+    reached by paging, so **narrow the query** — add a term, or scope it to a
+    project — rather than raising `offset`.
+
+    Each result carries id, title, snippet, project, tags, author_client, and
+    is_global (true only when the note was deliberately written to span every
+    project). A null project with is_global false is a note from before 0.1.4,
+    when no project had been chosen; such a note can no longer be written.
     A project-scoped search also returns global notes, since those apply to
     every project. Fetch full content with get_by_id(id).
+
+    **Ordering is by relevance, not by date.** Results come back best-match
+    first (bm25, with a title hit weighted above a body hit and a tag above
+    incidental prose), so the newest note is not necessarily at the top and a
+    result's position says nothing about when it was written. Read
+    `created_at` when recency is what you care about.
+
+    **How to query.** Two or three content words, not a sentence. Terms are
+    combined with AND first, so every extra word can only shrink the result.
+    When AND turns up fewer than a handful, the store retries the same terms
+    with OR, and then as prefixes — so type bare words and let it widen rather
+    than rephrasing the same question. Title, body and tags are all indexed,
+    so a topic you only ever tagged is findable by its tag word, with or
+    without the `#`.
+
+    Word forms are handled (porter stemming): "migrating" finds "migration".
+    Substrings are not — "letter" will not find "newsletter", because no rung
+    of the ladder can match inside a word. (The one exception is a query FTS5
+    refuses to parse at all, which falls back to a literal LIKE; that is an
+    error path, not a mode you can ask for.)
+
+    You keep full control when you want it: quotes, parens, `OR`, `NOT`,
+    `NEAR` and a trailing `*` are passed to FTS5 untouched. A query using any
+    of them is treated as deliberate — it gets neither synonym expansion nor
+    the widening retries, so an exact phrase stays exact.
+
+    A `total` of 0 means nothing matched **that you can see**. If a grant is
+    active it may be filtering the answer, so check list_grants() before
+    telling the user the store has nothing on the topic.
 
     Args:
         query: Search terms (keyword or phrase)
         project: Optional — restrict to one project
-        limit: Max results (default 10)
+        limit: How many results to return (default 10). Raise it when `total`
+               says there is more worth reading.
+        offset: How many matches to skip, for paging through a large `total`.
+        page_token: When paging, pass back the `page_token` from the previous
+                    response, so both pages come from the same interpretation
+                    of the query. Without it each call re-decides how broadly
+                    to read the query, and a note written by another window in
+                    between can narrow that decision, so page two is drawn
+                    from a different set entirely.
+
+                    It is not a snapshot, and paging is positional: writes and
+                    deletes between calls still shift rows across page
+                    boundaries, so a paged walk is not guaranteed to visit
+                    every match on a store being written to. When you need
+                    completeness rather than a sample, raise `limit` and take
+                    the answer in one call.
     """
-    return policy.t_search_context(_client_name(ctx), query, project, limit)
+    return policy.t_search_context(_client_name(ctx), query, project, limit,
+                                   offset, page_token)
 
 
 @mcp.tool()
@@ -257,7 +341,13 @@ def start_session(ctx: Context, project: str | None = None, intent: str | None =
                 e.g. "continuing bank statements phase 1"
 
     Returns:
-        The registered session (id, project, intent, started_at)
+        The registered session (id, project, intent, started_at).
+
+        **Record the `id`.** Pass it back as `end_session(summary,
+        session_id=…)` at the end. It is what makes "close my session" mean
+        this one and not whichever session happens to be newest — several
+        assistant windows share one store, and closing another window's live
+        session strands it with a summary of work it never did.
     """
     global _current_session_id
     session = policy.t_start_session(_client_name(ctx), project, intent)
@@ -266,33 +356,64 @@ def start_session(ctx: Context, project: str | None = None, intent: str | None =
 
 
 @mcp.tool()
-def end_session(summary: str, ctx: Context) -> dict:
+def end_session(summary: str, ctx: Context, session_id: str | None = None) -> dict:
     """
-    Close the current work session with a summary. Call this before the
-    session ends: what was built, what was decided, what's still open.
+    Close a work session with a summary. Call this before the session ends:
+    what was built, what was decided, what's still open.
 
     Args:
         summary: Markdown summary of the session's outcome
+        session_id: The id start_session() returned — pass it, every time.
+                    Omitted, this closes the session THIS connection opened,
+                    which is right until something has replaced it. A prefix
+                    of at least 8 characters works too, so the short form
+                    shown in warnings and listings can be pasted back.
+                    Never pass an id you read from another session's warning
+                    unless you know that session is abandoned: it may be a
+                    window working right now.
 
     Returns:
-        The closed session, or an error hint — if no session was started, or
-        if the active grant no longer covers the one that was. **Do not answer
-        an error by calling start_session()**: the session is still open and
-        still yours to close, and starting another replaces it, stranding the
-        first with no summary
+        The closed session — plus `other_open_sessions` and a `warning` line
+        when other sessions are still open anywhere in the store. That is an
+        observation, not a task: those may belong to other windows, and this
+        release exists so you can close YOURS by id and leave theirs alone.
+
+        Or an error hint — if no session was started, if the id names nothing
+        open for this client, or if the active grant no longer covers the
+        session that was started. **Do not answer an error by calling
+        start_session()**: the session is still open and still yours to close,
+        and starting another replaces it, stranding the first with no summary.
     """
     global _current_session_id
-    if _current_session_id is None:
+    target = session_id or _current_session_id
+    if target is None:
         policy.check(_client_name(ctx), "end_session")
         return {
-            "error": "No session was started. Call start_session() at the "
-                     "beginning of a session; falling back — write a "
-                     "write_note() summary tagged #session instead, naming a "
-                     "project (or is_global), since that call is refused too "
-                     "if this workspace resolves to none."
+            "error": "No session was started on this connection, and no "
+                     "session_id was given. Call recent_sessions() to find the "
+                     "id of the session you mean, then end_session(summary, "
+                     "session_id=…). Falling back — write a write_note() "
+                     "summary tagged #session instead, naming a project (or "
+                     "is_global), since that call is refused too if this "
+                     "workspace resolves to none."
         }
-    session = policy.t_end_session(_client_name(ctx), _current_session_id, summary)
-    if "error" not in session:
+    session = policy.t_end_session(_client_name(ctx), target, summary)
+    # Cleared only when the session just closed is the one this connection
+    # opened. Closing some other session by id must not make a later bare
+    # end_session() report "no session was started" while this connection's
+    # own session is still open — that reads as "already closed" and is how a
+    # session ends up abandoned. Compared against the id the policy layer
+    # actually closed, since `target` may have been a prefix.
+    #
+    # `already_closed` counts as done. It is an error to report — the summary
+    # was NOT saved — but the session is gone, so holding on to it strands the
+    # connection: every later bare end_session() repeats the same error
+    # forever, and every write_note() attaches to a closed session. That is the
+    # state this happens in: the session was closed from the CLI, or by
+    # another window, while this connection still had it.
+    closed_id = session.get("id")
+    finished = "error" not in session or session.get("already_closed") is True
+    if finished and closed_id == _current_session_id:
         _current_session_id = None
     # Kept on a denial, deliberately. Clearing it unconditionally strands the
     # session open and unclosable in the exact window the scope guard exists

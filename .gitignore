@@ -17,3 +17,7 @@ mcp.cmd
 # Design doc — private, never ship
 personal-context-layer.md
 /personal_docs/
+
+# Coverage artifacts from scripts/preflight.py
+.coverage
+.preflight-coverage.json

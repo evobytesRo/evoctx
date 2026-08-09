@@ -16,7 +16,14 @@ import json
 from typing import Callable, TypeVar
 
 from .audit import AuditWriter
-from .db import Database, RootNotADirectory, RootOwnedByAnotherProject
+from .db import (
+    ENOUGH_HITS,
+    SEARCH_SCAN_LIMIT,
+    AmbiguousPrefix,
+    Database,
+    RootNotADirectory,
+    RootOwnedByAnotherProject,
+)
 from .grants import (
     ALL_TOOLS,
     Grant,
@@ -38,6 +45,46 @@ def _tail(text: str) -> str:
     by eye. Terminating it was the first attempt and made `myrepo.` look like
     the name. Putting it last is the fix that has no such edge."""
     return (text or "").strip()
+
+
+def _open_sessions_warning(others: list[dict], total: int) -> str:
+    """The line an assistant reads after closing its own session.
+
+    `others` must ALREADY have been through the redactor. Truncating first
+    and redacting after leaks: a grant rule matching text that straddles
+    character 60 masks the stored intent and not the clipped copy, so the
+    structured field says `[CLIENT]` while this sentence still carries the
+    name. Redact, then clip.
+
+    `total` is passed rather than derived from `len(others)`, which is a
+    capped, filtered list — reporting its length as the number of open
+    sessions states a false fact with the confidence of a count.
+
+    Phrased as an observation, not an instruction. Another window's session
+    being open is the normal case on a machine running two of them, and the
+    caller has no way to know whether that session was abandoned or is being
+    worked in right now — so it must not read as "close this too". Closing
+    someone else's live session strands it with a summary of work it did not
+    do, which is worse than leaving it open, which is merely untidy.
+    """
+    # The client is named because it is the one field that helps the reader
+    # decide whose session this is, which is the whole question the warning
+    # raises and deliberately does not answer for them.
+    shown = "; ".join(
+        f"{s['id'][:8]} [{s.get('project') or 'no project'}] "
+        f"({s.get('client') or 'unknown'}) "
+        f"{(s.get('intent') or '-')[:60]}"
+        for s in others[:3]
+    )
+    more = f" (+{total - 3} more)" if total > 3 else ""
+    plural = "session is" if total == 1 else "sessions are"
+    return (
+        f"Closed. Note that {total} other {plural} still open: {shown}{more}. "
+        f"That may be another window working right now — do not close it on a "
+        f"guess. If it is yours and was interrupted, read its notes first, then "
+        f"end_session(summary, session_id=…) with the full id from "
+        f"other_open_sessions."
+    )
 
 
 class PolicyDenied(Exception):
@@ -245,10 +292,16 @@ class PolicyEngine:
             ]
         return self._out(grant, proj)
 
-    # Hard ceiling on how much of the store a single scoped fetch will page
-    # through looking for `limit` visible results. Real stores are small
-    # (personal, single-user); this exists to bound worst case, not to be hit.
-    _MAX_SCAN = 2000
+    # Hard ceiling on how much of the store one scoped read will look at.
+    #
+    # Two meanings, worth telling apart. For `_fetch_filtered`
+    # (`recent_sessions`) and `_visible_open_sessions` it bounds how far a scan
+    # will chase enough visible results, and it is not expected to be reached.
+    # For `_widen_until_enough` it bounds each ordered pass that produces
+    # `total`, and a broad query on a large store reaches it routinely
+    # — which is what `total_is_lower_bound` exists to report. Real stores are
+    # personal and small, so neither is a practical limit today.
+    _MAX_SCAN = SEARCH_SCAN_LIMIT
 
     def _fetch_filtered(self, fetch_page: Callable[[int, int], list[dict]],
                         is_visible: Callable[[dict], bool], limit: int) -> list[dict]:
@@ -268,15 +321,146 @@ class PolicyEngine:
             offset += page_size
         return collected[:limit]
 
-    def search(self, grant: Grant, query: str, project: str | None, limit: int) -> list[dict]:
+    def search(self, grant: Grant, query: str, project: str | None, limit: int,
+               offset: int = 0, page_token: str | None = None) -> dict:
+        """One page of matches, plus how many there are in total.
+
+        Returns an envelope rather than a bare list because a list cannot say
+        "there are 40 of these and you are looking at 10" — and without that,
+        an assistant has no way to tell a complete answer from a truncated one,
+        and no reason to ask for the rest.
+
+        **One store query per rung, not one per page.** The obvious
+        implementation pages the store with a growing OFFSET until it runs
+        out, and it is wrong in three ways at once, all measured:
+
+        * `ORDER BY bm25(...)` cannot use an index, so SQLite scores and sorts
+          every matching row on *every* page. Twenty pages is twenty sorts of
+          the same set: measured at 1272 ms for a broad query matching every
+          note on a 3000-note store, against 30 ms for the single pass below.
+          Broad queries are exactly what this release's own guidance ("two or
+          three bare words") produces, so that is the common case rather than
+          the tail. What remains over a count-less page (5 ms at that size,
+          1 ms at 378 notes) is the price of `total`, and at those absolute
+          numbers it is one worth paying.
+        * Twenty queries are twenty snapshots. One note written by another
+          window between page 3 and page 4 shifts every later row by one, so a
+          note lands in the response twice and `total` counts it twice. This
+          store's whole premise is several assistant windows.
+        * Exhaustion detected by "a page came back empty" is off by a page at
+          the boundary, which made an exact count report itself as a floor.
+
+        So: one ordered pass, capped, filtered, sliced. `_MAX_SCAN + 1` rows are
+        asked for so that "there were exactly `_MAX_SCAN` matches" and "there
+        were more than I looked at" stay distinguishable.
+
+        The count is taken from the FILTERED rows and never from a store-level
+        `COUNT`: a grant excluding `#personal` would otherwise report 40
+        matches and hand back 6, which reads as a paging bug rather than as a
+        grant doing its job.
+
+        The widening ladder is walked HERE rather than left to
+        `Database.choose_rung`, for the same reason. `choose_rung` counts what
+        the store holds, which is the right answer for the CLI and the wrong
+        one for a scoped client: a rung matching six notes in a project this
+        grant cannot read has, for this caller, matched nothing — and stopping
+        there returned `total: 0` while the next rung held a note the caller
+        was perfectly entitled to. That needs no exotic setup, just a grant
+        scoped to one project on a store that has several.
+        """
+        limit = max(0, limit)
+        offset = max(0, offset)
+        # Same keys as the success path, `page_token` included. Two shapes for
+        # one response is how a caller learns to trust neither, and the tool
+        # docstring names the fields without qualification.
+        empty = {"results": [], "total": 0, "offset": offset, "limit": limit,
+                 "has_more": False, "page_token": None}
         if project is not None and not grant.allows_project(project):
-            return []
-        result = self._fetch_filtered(
-            lambda n, o: self.db.search(query, project=project, limit=n, offset=o),
-            lambda note: self._note_visible(grant, note),
-            limit,
-        )
-        return self._out(grant, result)
+            return empty
+
+        visible, capped, rung = self._widen_until_enough(
+            grant, query, project, page_token)
+        page = visible[offset:offset + limit]
+        result = {
+            "results": self._out(grant, page),
+            "total": len(visible),
+            "offset": offset,
+            "limit": limit,
+            # The rung this answer came from. Handed back so the NEXT page can
+            # be drawn from the same one: each call re-walks the ladder, and a
+            # note written by another window in between can push a narrower
+            # rung over the threshold, which silently changes the result set
+            # under a caller that is only trying to read page two.
+            "page_token": rung,
+            # Strictly "there is more you can reach by paging". It deliberately
+            # does NOT cover matches past the scan ceiling: those cannot be
+            # paged to, so saying so here would send a caller that obeys
+            # "has_more means ask for the rest" round a loop that returns
+            # nothing, for ever. `total_is_lower_bound` is what says the story
+            # does not end here, and the tool docstring answers it with
+            # "narrow the query", not "page".
+            "has_more": limit > 0 and offset + len(page) < len(visible),
+        }
+        if capped:
+            # Named so the assistant reads it as a floor rather than a fact.
+            result["total_is_lower_bound"] = True
+        return result
+
+    def _widen_until_enough(
+        self, grant: Grant, query: str, project: str | None,
+        page_token: str | None = None,
+    ) -> tuple[list[dict], bool, str]:
+        """Walk the widening ladder, counting what this grant can actually see.
+
+        Stops at the narrowest rung that leaves `ENOUGH_HITS` visible
+        notes; otherwise keeps the rung that left the most, ties going to the
+        narrower. Same rule as `Database.choose_rung`, one layer up, where the
+        grant is known — that layer matters, because a rung matching six notes
+        in a project this grant cannot read has, for this caller, matched
+        nothing, and stopping there reported `total: 0` while the next rung
+        held a note the caller was entitled to.
+
+        Hitting the scan ceiling also stops the walk, but only when something
+        visible came back with it. `capped` counts RAW rows, so a rung whose
+        2001 matches are every one of them hidden would otherwise stop the
+        ladder on the strength of rows this caller cannot see — the same
+        pre-grant-count defect, reached through the other branch.
+
+        `page_token` is a rung a previous call already settled on. It is
+        accepted only when it is one this query's own ladder produces, so a
+        token from a different query, or a hand-written one, cannot smuggle an
+        arbitrary MATCH expression in; anything else is ignored and the ladder
+        is walked normally.
+
+        Each rung is fetched at most once, so one response is one snapshot per
+        rung and the duplicate rows that came from paging the store rung by
+        rung are not reachable from here.
+        """
+        ladder = self.db.widening_ladder(query)
+        rungs = [page_token] if page_token in ladder else ladder
+        best: list[dict] = []
+        best_capped = False
+        best_rung = rungs[0]
+        for rung in rungs:
+            rows = self.db.search(query, project=project,
+                                  limit=self._MAX_SCAN + 1, offset=0, rung=rung)
+            capped = len(rows) > self._MAX_SCAN
+            visible = [n for n in rows[:self._MAX_SCAN]
+                       if self._note_visible(grant, n)]
+            if len(visible) >= ENOUGH_HITS or (capped and visible):
+                return visible, capped, rung
+            if len(visible) > len(best):
+                best, best_capped, best_rung = visible, capped, rung
+            elif capped and not best:
+                # Nothing visible anywhere yet, and this rung's scan stopped
+                # short — so "we looked at everything" is false even though
+                # the answer is empty, and the caller has to be told that
+                # rather than concluding the store holds nothing on the
+                # subject. Guarded on `not best` so the flag always describes
+                # the rung actually returned: a later capped rung must not
+                # mark an earlier rung's exact, complete answer as a floor.
+                best_capped = True
+        return best, best_capped, best_rung
 
     def get_note(self, grant: Grant, note_id: str) -> dict | None:
         note = self.db.get_note(note_id)
@@ -600,12 +784,23 @@ class PolicyEngine:
         self._log(client, "get_project", "read", grant, {"name": name}, [name, *ids] if result else [], result)
         return result
 
-    def t_search_context(self, client: str, query: str, project: str | None, limit: int) -> list[dict]:
+    def t_search_context(self, client: str, query: str, project: str | None,
+                         limit: int, offset: int = 0,
+                         page_token: str | None = None) -> dict:
         grant = self._guard(client, "search_context")
-        result = self.search(grant, query, project, limit)
+        result = self.search(grant, query, project, limit, offset, page_token)
+        # `record_ids` stays the ids actually handed over, so the audit line
+        # still answers "what did this client read" — `total` is a count of
+        # what matched, not of what was returned, and putting it here would
+        # make the log claim more was read than was.
+        # `page_token` is logged because it decides which set was served: two
+        # calls with identical query/limit/offset can return disjoint results
+        # if they were interpreted differently, and the record has to be able
+        # to tell them apart.
         self._log(client, "search_context", "read", grant,
-                  {"query": query, "project": project, "limit": limit},
-                  [n["id"] for n in result], result)
+                  {"query": query, "project": project, "limit": limit,
+                   "offset": offset, "page_token": result.get("page_token")},
+                  [n["id"] for n in result["results"]], result["results"])
         return result
 
     def t_get_by_id(self, client: str, note_id: str) -> dict | None:
@@ -669,7 +864,39 @@ class PolicyEngine:
         # this fires when a session opened under a wider grant is still open
         # when a narrower grant is activated — not for a caller naming another
         # project's session, which the tool surface does not allow.
-        existing = self.db.get_session(session_id)
+        # An id prefix resolves like everywhere else in this codebase. The
+        # caller that matters here is an assistant reading an id out of an
+        # earlier `end_session` warning or a `recent_sessions` listing, both of
+        # which display a short prefix beside the full id; refusing the prefix
+        # would make the displayed form a trap.
+        #
+        # A minimum length, though, because closing is not undoable and there
+        # is no confirmation step on this path the way `evoctx delete` has one.
+        # A unique one-character prefix would otherwise close a session, and a
+        # prefix that short is far likelier to be a typo than an intention.
+        # Eight is what the tool docstring promises; promising it and not
+        # enforcing it is the kind of gap that only shows up once.
+        if (len(session_id) < self.MIN_SESSION_PREFIX
+                and self.db.get_session(session_id) is None):
+            self._log(client, "end_session", "denied", grant, None, [], None)
+            return {"error": f"'{session_id}' is too short to identify a session. "
+                             f"Give at least {self.MIN_SESSION_PREFIX} characters of "
+                             f"the id, or the whole id. Closing cannot be undone."}
+        try:
+            existing = (self.db.get_session(session_id)
+                        or self.db.find_session_by_prefix(session_id))
+        except AmbiguousPrefix as e:
+            self._log(client, "end_session", "denied", grant, None, [], None)
+            # The candidate ids are only shown when the caller may read every
+            # one of them. `_id_by_prefix` resolves across the whole table, so
+            # an ambiguity between a session this grant covers and one it does
+            # not would otherwise name the second — and out of scope is
+            # supposed to read as nonexistent everywhere else in this file.
+            if all(self._project_readable(grant, s.get("project"))
+                   for s in (self.db.get_session(i) or {} for i in e.ids)):
+                return {"error": str(e)}
+            return {"error": "No session with that id is open within this "
+                             "grant's scope."}
         if existing is None or not self._project_readable(
                 grant, existing.get("project")):
             # Audited even though it is denied: `t_get_by_id` logs its blocked
@@ -685,13 +912,85 @@ class PolicyEngine:
             # from a successful close in the one record SECURITY.md calls the
             # accountability record.
             self._log(client, "end_session", "denied", grant, None, [], None)
-            return {"error": "No session with that id is open for this client."}
+            # "this grant", not "this client". Closing a session another client
+            # opened is the feature, not an accident — several windows share one
+            # store and the whole point of taking an id is that you can close
+            # the one you mean. What is checked here is project scope, and the
+            # message has to name the check that actually ran.
+            return {"error": "No session with that id is open within this "
+                             "grant's scope."}
+        session_id = existing["id"]
         (summary,), hits = self._redact_inbound(grant, summary)
-        self.db.end_session(session_id, summary)
+        already_closed = not self.db.end_session(session_id, summary)
         result = self._reread_session(session_id)
-        self._log(client, "end_session", "write", grant, None, [session_id], result,
-                  inbound_hits=hits)
-        return self._out(grant, result)
+        if already_closed:
+            # Say so instead of returning a session that looks freshly closed.
+            # `db.end_session` only updates rows with `ended_at IS NULL`, so a
+            # second call leaves the first summary in place — and reporting
+            # that untouched row as this call's result is how an assistant
+            # concludes its summary was saved when another one was.
+            result = dict(result)
+            # A separate flag, not just the message, because the caller has to
+            # act differently here than on any other error: this session is
+            # definitively gone, so a connection holding it must let go of it.
+            # Reading that out of prose would mean matching on a string.
+            result["already_closed"] = True
+            result["error"] = (
+                f"Session {session_id[:8]} was already closed at "
+                f"{result.get('ended_at')}; its existing summary was kept. "
+                f"Nothing was written."
+            )
+        # Redact BEFORE the warning is built, not after. The warning quotes
+        # another session's stored intent, clipped to 60 characters, and a
+        # grant rule matching text that straddles that boundary would mask the
+        # structured copy while this sentence still carried the value.
+        result = self._out(grant, result)
+        others, total = self._visible_open_sessions(grant, exclude_id=session_id)
+        if others:
+            others = self._out(grant, others)
+            result = dict(result)
+            result["other_open_sessions"] = others
+            result["warning"] = _open_sessions_warning(others, total)
+        # A close that changed nothing is a read. `_guard` established that a
+        # refused attempt is "denied" precisely so the log distinguishes it at
+        # a glance from a successful close; a no-op logged as a write is the
+        # same lie in the other direction.
+        self._log(client, "end_session", "read" if already_closed else "write",
+                  grant, None, [session_id], result, inbound_hits=hits)
+        return result
+
+    #: Shortest id prefix `end_session` will act on. Closing is not undoable.
+    MIN_SESSION_PREFIX = 8
+
+    #: How many open sessions `other_open_sessions` carries. The prose warning
+    #: names the first three of them and counts the remainder off the real
+    #: total — see `_open_sessions_warning`, which owns that number.
+    _WARN_SHOW = 5
+
+    def _visible_open_sessions(self, grant: Grant,
+                               exclude_id: str) -> tuple[list[dict], int]:
+        """Other still-open sessions this grant may know about, and how many.
+
+        Filtered through `_project_readable` like every other session read: a
+        warning naming a session the caller cannot list, close, or read is a
+        leak dressed as helpfulness.
+
+        Filtering happens BEFORE the display cap, not after. Fetching five and
+        then filtering is the pattern `_fetch_filtered` exists to eliminate —
+        with five out-of-scope sessions newest, an in-scope one is silently
+        invisible, and the caller is told about none of it. The count returned
+        is the filtered total, so the warning states a number that is true
+        rather than the length of the list it is naming sessions from. It is
+        still bounded by `_MAX_SCAN`, which on a store with two thousand
+        simultaneously open sessions would understate it; that is not a state
+        anyone reaches, and the alternative is an unbounded read on a warning.
+        """
+        visible = [
+            s for s in self.db.open_sessions(exclude_id=exclude_id,
+                                             limit=self._MAX_SCAN)
+            if self._project_readable(grant, s.get("project"))
+        ]
+        return visible[:self._WARN_SHOW], len(visible)
 
     def t_recent_sessions(self, client: str, project: str | None, limit: int) -> list[dict]:
         grant = self._guard(client, "recent_sessions")

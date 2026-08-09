@@ -6,6 +6,7 @@ Mirrors of the MCP tools — everything the AI can do, you can do:
   evoctx list-projects                                        Same as MCP list_projects()
   evoctx get-project NAME                                     Same as MCP get_project()
   evoctx search-context QUERY [--project NAME] [--limit N]    Same as MCP search_context()
+                              [--offset N] [--page-token TOK] Reports total matches, not just the page
   evoctx get-by-id ID                                         Same as MCP get_by_id() (alias: show)
   evoctx write-note "Title" --project NAME --tags "#decision" Same as MCP write_note() (alias: add)
                             [--global]                        Note spans every project (not the same as no project)
@@ -102,6 +103,7 @@ from .db import (
     NoteTooLarge,
     RootNotADirectory,
     RootOwnedByAnotherProject,
+    SEARCH_SCAN_LIMIT,
     normalize_root,
     this_machine,
 )
@@ -233,17 +235,81 @@ def cmd_get_project(args):
 
 
 def cmd_search_context(args):
-    results = db.search(args.query, project=args.project, limit=args.limit)
-    if not results:
-        print("No matches.")
+    # The MCP tool reports how many notes matched, not just how many came back,
+    # so this has to as well: a human reading "10 result(s)" cannot tell a
+    # complete answer from the first tenth of one either. Same ceiling, same
+    # `+` convention, one scan.
+    scan = SEARCH_SCAN_LIMIT
+    offset = max(0, args.offset)
+    limit = max(0, args.limit)
+    # Paging here means re-running the command, so without a pinned rung the
+    # second invocation re-chooses one — and a note written in between can
+    # narrow it, making "showing 4-6 of 6" describe a different six. The token
+    # is printed beside the offset hint so the next command carries it.
+    ladder = db.widening_ladder(args.query)
+    # Chosen ONCE, before the search, and passed in. Letting `db.search` choose
+    # internally and then choosing again for the hint is two independent picks:
+    # a note written between them makes the printed token name a rung the
+    # printed rows did not come from, which is precisely the confusion the
+    # token exists to remove. It also saves a duplicate COUNT pass.
+    rung = (args.page_token if args.page_token in ladder
+            else db.choose_rung(args.query, args.project))
+    rows = db.search(args.query, project=args.project, limit=scan + 1, offset=0,
+                     rung=rung)
+    capped = len(rows) > scan
+    rows = rows[:scan]
+    page = rows[offset:offset + limit]
+
+    if not page:
+        if not rows:
+            print("No matches.")
+        elif limit == 0:
+            # Blaming the offset for a limit the user chose sends them to fix
+            # the wrong argument.
+            print(f"--limit 0 requested; {len(rows)} match(es) found.")
+        elif capped:
+            # NOT "only N match(es)" — the previous page printed `N+` and there
+            # genuinely are more. They are simply past where the scan stopped,
+            # so no offset reaches them. Saying "only" here contradicts the `+`
+            # one command earlier.
+            print(f"No results at offset {offset} — the scan stopped at "
+                  f"{len(rows)} match(es). Narrow the query to see the rest.")
+        else:
+            print(f"No results at offset {offset} — only {len(rows)} match(es).")
         return
-    for r in results:
+    for r in page:
         tags = " ".join(r["tags"])
         # _scope already brackets the global marker — don't wrap it again
         print(f"  {r['id'][:8]}  {_scope(r):<12}  {r['title']}  {tags}")
         print(f"           {r['snippet']}")
         print()
-    print(f"{len(results)} result(s). Full note: evoctx get-by-id <ID>")
+    total = f"{len(rows)}+" if capped else str(len(rows))
+    shown = f"{offset + 1}-{offset + len(page)}"
+    seen = offset + len(page)
+    if seen < len(rows):
+        # The token is only offered for a query with a ladder to pin. A
+        # deliberate-syntax query has exactly one rung — nothing can be
+        # re-chosen, so the token buys nothing — and its rung is the raw query,
+        # so a quoted phrase would print as `--page-token ""bank statement""`,
+        # which argparse rejects when pasted back.
+        token = f' --page-token "{rung}"' if len(ladder) > 1 else ""
+        # `--project` and `--limit` are echoed when they were given. Printing
+        # only the new flags looks pasteable and is not: dropping `--project`
+        # silently pages a different, larger result set while the line above
+        # still reads like a continuation.
+        scope = f" --project {args.project}" if args.project else ""
+        size = f" --limit {args.limit}" if args.limit != 10 else ""
+        tail = f"  (more: --offset {seen}{token}{scope}{size})"
+    elif capped:
+        # The `+` promised more and there is more, but paging cannot reach it:
+        # everything past the scan ceiling is unaddressable by offset. Offering
+        # `--offset {seen}` here dead-ends on "No results at offset N" one
+        # command later, contradicting the `+` that had just been printed.
+        tail = "  (more matches exist past the scan limit — narrow the query)"
+    else:
+        tail = ""
+    print(f"showing {shown} of {total} match(es).{tail} "
+          f"Full note: evoctx get-by-id <ID>")
 
 
 def _print_session(s: dict):
@@ -277,6 +343,13 @@ def cmd_start_session(args):
 
 def cmd_end_session(args):
     if args.id:
+        # Same minimum the MCP tool enforces, and this is the surface that
+        # needs it more: `--id a` on a unique one-character prefix used to
+        # close a session outright, with no confirmation and no undo.
+        if len(args.id) < PolicyEngine.MIN_SESSION_PREFIX and not db.get_session(args.id):
+            print(f"'{args.id}' is too short to identify a session — give at least "
+                  f"{PolicyEngine.MIN_SESSION_PREFIX} characters. Closing cannot be undone.")
+            sys.exit(1)
         # scans the whole table, unlike the previous 50-session window: a
         # unique prefix for an older session used to report "not found", and
         # a prefix ambiguous only outside the window resolved silently
@@ -293,6 +366,13 @@ def cmd_end_session(args):
         print(f"Session {session['id'][:8]} is already closed.")
         sys.exit(1)
     print(f"Closed session {session['id'][:8]}.")
+    # Same warning the MCP tool returns, for the same reason: on a machine
+    # running two assistant windows the interesting fact is the session this
+    # command did NOT close. Not an exit code — nothing failed.
+    for other in db.open_sessions(exclude_id=session["id"]):
+        print(f"  still open: {other['id'][:8]} "
+              f"[{other.get('project') or 'no project'}] "
+              f"{other.get('intent') or '-'}")
 
 
 def cmd_recent_sessions(args):
@@ -792,8 +872,15 @@ def cmd_hook(args):
             "evoctx: call list_projects() first — it names the project this "
             "directory belongs to, or says nothing matched, in which case offer "
             "to register it with register_project(). Then start_session(project, "
-            "intent), then recent_sessions() before starting work — open entries "
-            "there were likely interrupted."
+            "intent) and KEEP THE ID IT RETURNS — close with "
+            "end_session(summary, session_id=<that id>), because other windows "
+            "share this store and the newest open session may not be yours. "
+            "Then recent_sessions() before starting work — open entries there "
+            "were likely interrupted. When searching, use two or three bare "
+            "words: terms combine with AND, and the store widens to OR and then "
+            "to prefixes on its own when AND turns up too little. Results are "
+            "ranked by relevance, not by date, and the response carries `total` "
+            "— the number of notes that matched, not the number returned."
         )
         return
 
@@ -851,12 +938,23 @@ def cmd_hook(args):
             # workspace, and a workspace is several repos. Without it a correct
             # nag about the repo next door is indistinguishable from a bug, and
             # there is nothing in the line to act on.
+            # The id, in the form end_session() accepts, and the caveat that
+            # this process cannot check: a hook is launched from settings.json
+            # and knows nothing about which window opened which session, so it
+            # reports the newest open one and says so. An assistant that closed
+            # its own session by id and sees this is looking at somebody
+            # else's, and writing a summary for that one is the failure this
+            # wording exists to prevent.
             print(
-                f"Open session {session['id'][:8]} "
+                f"Open session {session['id']} "
                 f"[{session.get('project') or 'no project'}] "
                 f"(intent: {session.get('intent') or '-'}) "
-                f"has no end_session() call yet. Call end_session(summary) to close it, "
-                f"or ignore this message to stop anyway.",
+                f"has no end_session() call yet. If it is yours, close it: "
+                f"end_session(summary, session_id=\"{session['id']}\"). "
+                f"This hook cannot tell which window opened it — if you already "
+                f"closed your own session, this one belongs to another window, "
+                f"so leave it and say so rather than summarising work you did "
+                f"not do. Ignore this message to stop anyway.",
                 file=sys.stderr,
             )
             sys.exit(2)
@@ -1653,7 +1751,10 @@ def cmd_demo_seed(args):
         db.upsert_project(name, **data)
         print(f"  upsert project: {name}")
 
-    if not args.force and db.search("*", limit=1):
+    # NOT `db.search("*")`. FTS5 refuses `*`, so that fell into the LIKE error
+    # path looking for notes whose text literally contains an asterisk — the
+    # guard read "empty" on a full store and reseeded every time.
+    if not args.force and db.conn.execute("SELECT 1 FROM notes LIMIT 1").fetchone():
         print("Store already has notes — skipping note seed (use --force to append anyway)")
     else:
         for note in DEMO_NOTES:
@@ -1738,6 +1839,11 @@ def main():
     sc.add_argument("query")
     sc.add_argument("--project", "-p", default=None)
     sc.add_argument("--limit", "-n", type=int, default=10)
+    sc.add_argument("--offset", type=int, default=0,
+                    help="skip this many matches, for paging a large result")
+    sc.add_argument("--page-token", default=None,
+                    help="from the previous page's output; keeps both pages "
+                         "reading the same interpretation of the query")
 
     # write-note / add
     a = sub.add_parser("write-note", aliases=["add"], help="Add a new note (MCP: write_note)")

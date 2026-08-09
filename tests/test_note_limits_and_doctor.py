@@ -41,6 +41,59 @@ def test_human_size_formatting():
 # Called directly rather than through doctor(), which resolves against the test
 # runner's own cwd — the repo — and would answer a different question.
 
+def test_doctor_reports_which_columns_the_index_covers(tmp_path):
+    from evoctx.install import _check_fts_index
+
+    db = Database(tmp_path / "store")
+    checks: list = []
+    _check_fts_index(checks, db)
+    name, ok, detail = checks[0]
+    assert (name, ok) == ("fts5 search", True)
+    assert "title, content, tags" in detail
+
+
+def test_doctor_fails_when_the_index_does_not_cover_tags(tmp_path):
+    """The branch that matters, planted rather than reasoned about.
+
+    A store at v6 whose index lacks `tags` answers every tag query with
+    silence — and silence reads as "nothing was written about that". Left
+    inline in `doctor()`, this branch shipped never having been executed.
+    """
+    db = Database(tmp_path / "store")
+    db.conn.executescript(
+        "DROP TRIGGER notes_ai; DROP TRIGGER notes_ad; DROP TRIGGER notes_au;"
+        "DROP TABLE notes_fts;"
+        "CREATE VIRTUAL TABLE notes_fts USING fts5("
+        "  title, content, content=notes, content_rowid=rowid,"
+        "  tokenize='porter unicode61');"
+    )
+
+    from evoctx.install import _check_fts_index
+    checks: list = []
+    _check_fts_index(checks, db)
+    name, ok, detail = checks[0]
+    assert (name, ok) == ("fts5 search", False)
+    assert "but not tags" in detail
+    # the remedy must be one that can actually work — `doctor` has already run
+    # every migration by the time it gets here
+    assert "re-opening the store will NOT fix it" in detail
+    assert "store.db.bak-pre-migration-006" in detail
+
+
+def test_doctor_fails_when_the_index_is_gone_entirely(tmp_path):
+    db = Database(tmp_path / "store")
+    db.conn.executescript(
+        "DROP TRIGGER notes_ai; DROP TRIGGER notes_ad; DROP TRIGGER notes_au;"
+        "DROP TABLE notes_fts;"
+    )
+
+    from evoctx.install import _check_fts_index
+    checks: list = []
+    _check_fts_index(checks, db)
+    assert checks[0][:2] == ("fts5 search", False)
+    assert "FTS5 missing" in checks[0][2]
+
+
 def test_doctor_workspace_reports_the_resolved_project(tmp_path):
     from evoctx.install import _check_workspace
 

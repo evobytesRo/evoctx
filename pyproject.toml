@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "evoctx"
-version = "0.1.4"
+version = "0.1.5"
 description = "Local personal context store for AI coding assistants, exposed over MCP — by Evo Bytes"
 readme = "README.md"
 license = "MIT"
@@ -29,7 +29,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# pytest-cov is not needed to run the suite. `scripts/preflight.py` uses it to
+# answer "was the failure path I just added ever executed", and degrades to a
+# REVIEW line naming this install command when it is absent — so it stays a
+# dev extra rather than a hard dependency.
+dev = ["pytest>=8", "pytest-cov>=5"]
 
 [project.urls]
 Homepage = "https://evobytes.ro"
@@ -50,7 +54,7 @@ packages = ["src/evoctx"]
 # pythonVersion is the floor from requires-python: type-checking against 3.10
 # is what stops 3.11+-only syntax reaching a supported runtime.
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 venvPath = "."
 venv = ".venv"
 pythonVersion = "3.10"

@@ -12,7 +12,33 @@ from typing import Callable
 
 from .audit import AUDIT_SCHEMA, migration_002_audit_log
 from .secrets import redact_secrets
-from .synonyms import expand_query
+from .synonyms import expand_query, expanded_tokens, plain_tokens
+
+
+#: How many matching rows one search will look at. Lives here, beside the
+#: query it bounds, because both layers that need it read the store: the
+#: policy engine bounds its scoped scan by it, and the CLI pages by it. It
+#: was briefly a private attribute of the policy engine, which meant the CLI
+#: reaching up a layer for a constant about the database.
+SEARCH_SCAN_LIMIT = 2000
+
+#: How many matches make a rung of the widening ladder worth stopping at. Not
+#: 1, and that is the whole point: measured against a real store, `ANAF
+#: efactura submission status polling` ANDed to exactly one note — a meta-note
+#: that happened to contain all five words — and that one hit was enough to
+#: hide the four notes that actually answered the question. "It matched
+#: something" is not "it answered the question", and a lone incidental hit is
+#: the shape most likely to be the wrong one.
+#:
+#: Module level because two layers apply the same rule to different inputs:
+#: `Database.choose_rung` to raw store counts, `PolicyEngine` to what a grant
+#: lets the caller see.
+ENOUGH_HITS = 5
+
+#: A query FTS5 will always accept, used to ask whether the index still works.
+#: Deliberately trivial: it has to fail for one reason only, the store being
+#: unreadable.
+_HEALTH_PROBE = "evoctxhealthprobe"
 
 
 def _now() -> str:
@@ -393,6 +419,66 @@ def _migration_005_project_roots(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "notes", "is_global", "INTEGER NOT NULL DEFAULT 0")
 
 
+# One source for the search index and the triggers that feed it, so `_init()`
+# (fresh stores) and migration 006 (existing stores) cannot drift. Migration
+# 004 got away without this because it changed only the tokenizer and left the
+# triggers' column lists alone; 006 changes the columns, so the two halves
+# stop being independently correct.
+#
+# `tags` is a real column on `notes`, which is what lets `content=notes` read
+# it during a rebuild without any backfill. It is indexed as the raw JSON
+# (`["#session", "#evobytes-api"]`) and that is fine: unicode61 treats `[`,
+# `"`, `#`, `,` and `-` as separators, so the terms that land in the index are
+# `session`, `evobytes`, `api` — which is what someone searching for a tag
+# types anyway, with or without the `#`.
+NOTES_FTS_SCHEMA = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+        title, content, tags,
+        content=notes, content_rowid=rowid,
+        tokenize='porter unicode61'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+        INSERT INTO notes_fts(rowid, title, content, tags)
+        VALUES (new.rowid, new.title, new.content, new.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, title, content, tags)
+        VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+        INSERT INTO notes_fts(notes_fts, rowid, title, content, tags)
+        VALUES ('delete', old.rowid, old.title, old.content, old.tags);
+        INSERT INTO notes_fts(rowid, title, content, tags)
+        VALUES (new.rowid, new.title, new.content, new.tags);
+    END;
+"""
+
+
+def _migration_006_index_tags(conn: sqlite3.Connection) -> None:
+    """Put `tags` in the search index. Until now it held title and content
+    only, so a tag was write-only as far as search was concerned: on this
+    author's store 51 notes carried `#gotcha` in tags and 39 in their text,
+    which means 12 notes were tagged for a topic and unreachable by searching
+    for it. Tagging is the one act of curation this store asks for, and it did
+    nothing.
+
+    The triggers are dropped, not left standing. An external-content FTS table
+    is only consistent if the 'delete' command replays exactly the values that
+    were indexed, so a trigger writing the old two-column tuple against a
+    three-column table is not a cosmetic mismatch — it corrupts the index for
+    every note edited or deleted afterwards.
+    """
+    conn.executescript("""
+        DROP TRIGGER IF EXISTS notes_ai;
+        DROP TRIGGER IF EXISTS notes_ad;
+        DROP TRIGGER IF EXISTS notes_au;
+        DROP TABLE IF EXISTS notes_fts;
+    """ + NOTES_FTS_SCHEMA + """
+        INSERT INTO notes_fts(notes_fts) VALUES ('rebuild');
+    """)
+
+
 # Ordered schema migrations. Each entry runs once, in order, tracked via
 # PRAGMA user_version. _init() creates the CURRENT schema for fresh stores
 # (which then skip straight to the latest version); migrations only ever
@@ -404,6 +490,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_003_author_provenance,
     _migration_004_porter_stemming,
     _migration_005_project_roots,
+    _migration_006_index_tags,
 ]
 
 
@@ -535,28 +622,7 @@ class Database:
                 -- tidiness, not a contract.
                 is_global INTEGER NOT NULL DEFAULT 0
             );
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-                title, content,
-                content=notes, content_rowid=rowid,
-                tokenize='porter unicode61'
-            );
-
-            CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
-                INSERT INTO notes_fts(rowid, title, content)
-                VALUES (new.rowid, new.title, new.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
-                INSERT INTO notes_fts(notes_fts, rowid, title, content)
-                VALUES ('delete', old.rowid, old.title, old.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
-                INSERT INTO notes_fts(notes_fts, rowid, title, content)
-                VALUES ('delete', old.rowid, old.title, old.content);
-                INSERT INTO notes_fts(rowid, title, content)
-                VALUES (new.rowid, new.title, new.content);
-            END;
-
+        """ + NOTES_FTS_SCHEMA + """
             CREATE TABLE IF NOT EXISTS projects (
                 name           TEXT PRIMARY KEY,
                 overview       TEXT NOT NULL DEFAULT '',
@@ -654,24 +720,267 @@ class Database:
 
     # ── search ────────────────────────────────────────────────────────────────
 
-    def search(self, query: str, project: str | None = None, limit: int = 10, offset: int = 0) -> list[dict]:
-        # Synonym expansion only applies to the FTS5 MATCH path — an
-        # OR-group like "(auth OR login)" is valid MATCH syntax but would
-        # search for that literal parenthesized text under the LIKE
+    # Relative weights for bm25(title, content, tags). A note whose TITLE names
+    # the thing is the note you wanted; tags are curated by hand and so beat
+    # incidental prose, but they are labels rather than statements and lose to
+    # a title. Weights only reorder matches — nothing is included or excluded
+    # by them — so the risk of getting the numbers slightly wrong is bounded.
+    _BM25_WEIGHTS = (10.0, 1.0, 4.0)
+
+    @staticmethod
+    def widening_ladder(query: str) -> list[str]:
+        """Progressively wider MATCH queries: try each until one hits.
+
+        FTS5's operator between two bare words is **AND**, which is the single
+        biggest reason a search comes back empty. A natural four-word question
+        demands all four terms in one note, so it finds nothing and the caller
+        concludes the store is empty rather than that the query was narrow.
+
+        Rung 1 keeps AND — a note carrying every term is genuinely the best
+        answer and must not be diluted while it exists. Rung 2 drops to OR,
+        which cannot bury that note either: bm25 scores a document matching
+        every term above one matching a single term, so widening changes what
+        is *reachable*, not what ranks first. Rung 3 makes each term a prefix,
+        for the half-remembered word ("newslet" -> "newsletter"). FTS5 has no
+        infix operator, so `*term` remains impossible and the LIKE fallback is
+        not a substitute — it is an error path, not a search mode.
+
+        A query with deliberate syntax in it gets no ladder at all: someone
+        who wrote quotes, parens or an operator asked a precise question, and
+        widening it silently would answer a different one.
+        """
+        tokens = plain_tokens(query)
+        if tokens is None:
+            return [query]
+        # Rung 1 goes through expand_query rather than joining the tokens here,
+        # so the AND rung stays the one shipped, tested query builder and the
+        # ladder cannot quietly disagree with it.
+        rungs = [expand_query(query)]
+        if len(tokens) > 1:
+            rungs.append(" OR ".join(expanded_tokens(tokens)))
+        # No synonym expansion on the prefix rung. `(token OR synonym)*` is not
+        # what it looks like — the `*` binds to the closing paren, not to every
+        # alternative — and expanding first would need parens per alternative
+        # for a rung that is already the loosest thing this store will do.
+        prefixed = " OR ".join(f"{t}*" for t in tokens)
+        if prefixed not in rungs:
+            rungs.append(prefixed)
+        return rungs
+
+    #: Alias of the module constant, read by `choose_rung`. The policy engine
+    #: imports `ENOUGH_HITS` rather than reaching in here, the same way it and
+    #: the CLI import `SEARCH_SCAN_LIMIT`.
+    _ENOUGH_HITS = ENOUGH_HITS
+
+    @staticmethod
+    def _rejected_the_query(exc: sqlite3.OperationalError) -> bool:
+        """Did SQLite refuse the QUERY, as opposed to failing to read?
+
+        `sqlite_errorcode` is the discriminator the stdlib already exposes, and
+        it does in one comparison what two rounds of error-string matching
+        could not: every FTS5 rejection is `SQLITE_ERROR` (1) — "fts5: syntax
+        error", "unterminated string", "unknown special query", "no such
+        column", "expected integer", "parser stack overflow" alike — while
+        `SQLITE_BUSY` is 5 and `SQLITE_IOERR` is 10. Neither can then reach the
+        LIKE path however the store happens to behave a moment later.
+
+        `getattr` with a default because the attribute is 3.11+, and this
+        package supports 3.10. There it degrades to the retry-and-probe below,
+        which is what shipped before this check existed — never worse.
+        """
+        return getattr(exc, "sqlite_errorcode", 1) == 1
+
+    def _index_is_readable(self) -> bool:
+        """Can the FTS index answer a query it is guaranteed to accept?
+
+        Asked only after the real statement has failed TWICE, to separate "the
+        store is unwell" from "FTS5 rejected that query". Only the second may
+        fall through to the LIKE substring path.
+
+        Deliberately not a list of error strings. Two review rounds went into
+        discovering that SQLite words a rejected query at least six ways —
+        "fts5: syntax error", "unterminated string", "unknown special query",
+        "no such column", "expected integer, got …", "fts5: parser stack
+        overflow" — and the set is open-ended, so any list is one that will be
+        incomplete again. Whether the store answers is a question with one
+        answer, and asking it directly cannot go stale.
+
+        It is not sufficient on its own, which is why the retry above exists:
+        a probe is a LATER observation, and a fault that has cleared by the
+        time it runs reads as a healthy store and blames the query.
+        """
+        try:
+            self.conn.execute(
+                "SELECT 1 FROM notes_fts WHERE notes_fts MATCH ? LIMIT 1",
+                (_HEALTH_PROBE,),
+            ).fetchall()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _rung_count(self, rung: str, project: str | None) -> int:
+        """How many notes one rung matches, under the same project predicate
+        the real query uses. Split out so the retry runs the identical
+        statement rather than something that stands in for it."""
+        if project:
+            return self.conn.execute("""
+                SELECT COUNT(*) FROM notes_fts
+                JOIN notes n ON n.rowid = notes_fts.rowid
+                WHERE notes_fts MATCH ? AND (n.project = ? OR n.is_global = 1)
+            """, (rung, project)).fetchone()[0]
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH ?",
+            (rung,),
+        ).fetchone()[0]
+
+    def _match_page(self, fts_query: str, project: str | None,
+                    limit: int, offset: int) -> list:
+        """One ranked page from the index. Split out so the retry above runs
+        the identical statement rather than something that stands in for it."""
+        wt, wc, wtag = self._BM25_WEIGHTS
+        if project:
+            return self.conn.execute(f"""
+                SELECT n.id, n.title,
+                       snippet(notes_fts, 1, '', '', '...', 32) AS snippet,
+                       n.project, n.tags, n.created_at, n.author_client, n.is_global
+                FROM notes_fts
+                JOIN notes n ON n.rowid = notes_fts.rowid
+                WHERE notes_fts MATCH ? AND (n.project = ? OR n.is_global = 1)
+                ORDER BY bm25(notes_fts, {wt}, {wc}, {wtag}), n.rowid DESC
+                LIMIT ? OFFSET ?
+            """, (fts_query, project, limit, offset)).fetchall()
+        return self.conn.execute(f"""
+            SELECT n.id, n.title,
+                   snippet(notes_fts, 1, '', '', '...', 32) AS snippet,
+                   n.project, n.tags, n.created_at, n.author_client, n.is_global
+            FROM notes_fts
+            JOIN notes n ON n.rowid = notes_fts.rowid
+            WHERE notes_fts MATCH ?
+            ORDER BY bm25(notes_fts, {wt}, {wc}, {wtag}), n.rowid DESC
+            LIMIT ? OFFSET ?
+        """, (fts_query, limit, offset)).fetchall()
+
+    def _like_page(self, query: str, project: str | None,
+                   limit: int, offset: int) -> list:
+        """The error path: a literal substring scan, for a query FTS5 will not
+        parse at all. `tags` is included to match what the index now covers.
+
+        Reached only from `search`'s double-failure branch. It is not a search
+        mode, and a caller wanting substring matching should not go looking for
+        a query that gets it here — that is a query FTS5 refuses, and what it
+        does next is not a contract."""
+        like = f"%{query}%"
+        if project:
+            return self.conn.execute("""
+                SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client, is_global
+                FROM notes WHERE (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+                  AND (project = ? OR is_global = 1)
+                ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
+            """, (like, like, like, project, limit, offset)).fetchall()
+        return self.conn.execute("""
+            SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client, is_global
+            FROM notes WHERE title LIKE ? OR content LIKE ? OR tags LIKE ?
+            ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
+        """, (like, like, like, limit, offset)).fetchall()
+
+    def choose_rung(self, query: str, project: str | None = None) -> str:
+        """The narrowest rung that returns enough, else the fullest one.
+
+        **Choose a rung ONCE per result set and pass it to every page of it.**
+        Choosing again per page is unsound: another window writing a note
+        between two pages can change the counts, so the second page comes from
+        a different rung and therefore a different result set — a note that
+        was on page 1 vanishes and `total` moves under the caller. A store
+        explicitly built for several assistant windows cannot treat concurrent
+        writes as a corner case.
+
+        This is the store-level chooser, used by `db.search` when no rung is
+        supplied — the CLI's path, and every direct call in the tests. The
+        policy engine does NOT use it: it has to count what the grant lets the
+        caller see, so it walks the same ladder itself in
+        `PolicyEngine._widen_until_enough` and hands the chosen rung back to
+        the caller as a page token. The rule is the same in both; the inputs
+        are raw store counts here and grant-filtered ones there.
+
+        The count carries the same project predicate as the real query,
+        because a rung that matches five notes in projects the caller did not
+        ask about has, for this caller, matched nothing.
+
+        Widening does not cost precision, because it does not reorder anything
+        by itself: rung 2 is rung 1's terms joined with OR, so its result set
+        is a superset, and bm25 accumulates a contribution per matched term —
+        the note carrying every term still comes first. What widening changes
+        is what is *reachable*. The honest limit: bm25 is a score, not a
+        guarantee, so a very short note matching one term with a title hit can
+        in principle outrank a long note matching all of them. That is a
+        ranking nit; the failure this release exists to fix is recall.
+
+        Grant-level filtering (excluded tags, project scope) sits above this
+        layer and is not counted here, so a rung whose every hit is later
+        redacted away still satisfies the threshold. Accepted: pushing the
+        grant down into the store would invert the layering the whole policy
+        engine is built on, and the case needs a grant that hides exactly the
+        notes one rung found and nothing the next would.
+        """
+        rungs = self.widening_ladder(query)
+        counts = []
+        for rung in rungs:
+            try:
+                n = self._rung_count(rung, project)
+            except sqlite3.OperationalError:
+                # Same classification as `search`, same order and same reasons:
+                # retry the identical statement first, because a rejected query
+                # is deterministic and a transient fault is not; only then ask
+                # whether the store answers at all.
+                try:
+                    n = self._rung_count(rung, project)
+                except sqlite3.OperationalError as e:
+                    if not self._rejected_the_query(e) or not self._index_is_readable():
+                        raise
+                    # FTS5 refused this rung. Hand back the narrowest one so
+                    # `search()` meets the same refusal and takes its LIKE
+                    # fallback on its own terms; deciding that here would make
+                    # the fallback depend on which of two callers ran. If the
+                    # rung that failed was NOT the narrowest, `search()` simply
+                    # runs rung 1 successfully and no fallback happens, which
+                    # is right — one unparseable rung is not a reason to
+                    # abandon a rung that works.
+                    return rungs[0]
+            if n >= self._ENOUGH_HITS:
+                # Narrowest rung that fills a page wins immediately — no
+                # reason to count the wider ones, and no reason to run them.
+                return rung
+            counts.append(n)
+        # Nothing reached the threshold. Take the rung that found the most,
+        # ties going to the narrower one, since `max` keeps the first maximum
+        # and the rungs are already ordered narrow to wide. Widest-with-any-
+        # hits would be wrong: rung 3 drops synonym expansion, so it is not a
+        # superset of rung 2 and regularly finds fewer.
+        best = max(range(len(rungs)), key=lambda i: counts[i])
+        return rungs[best]
+
+    def search(self, query: str, project: str | None = None, limit: int = 10,
+               offset: int = 0, rung: str | None = None) -> list[dict]:
+        # Synonym expansion and the widening ladder apply to the FTS5 MATCH
+        # path only — an OR-group like "(auth OR login)" is valid MATCH syntax
+        # but would search for that literal parenthesized text under the LIKE
         # fallback, so the fallback below deliberately re-derives `like`
         # from the original, unexpanded `query`.
-        # Every ordering below is total, and deliberately so: _fetch_filtered
-        # in policy.py pages this with LIMIT/OFFSET, and a non-total order
-        # under paging can repeat or skip a row between one page and the next.
-        # bm25 ties are not hypothetical — same-shape notes score identically.
+        # Every ordering below is total, and deliberately so. bm25 ties are not
+        # hypothetical — same-shape notes score identically — and an order that
+        # is not total makes the same query return its results in a different
+        # sequence from one call to the next. `PolicyEngine.search` slices a
+        # page out of one ordered pass, so a caller asking for offset 10 after
+        # offset 0 is making a SECOND call: without a total order those two
+        # calls can disagree about which note was tenth, and a note is repeated
+        # or skipped between them.
         #
         # Don't "optimise" the tiebreaker back out when you see the plan: the
         # rowid term does cost FTS5's rank pushdown. EXPLAIN QUERY PLAN goes
-        # from `INDEX 32:M2` (internal rank sort, early exit at LIMIT+OFFSET)
-        # to `INDEX 0:M2` + `USE TEMP B-TREE FOR ORDER BY` (sort all matches,
-        # re-run per page). That is a real cost and an accepted one — these
-        # are personal stores, and a correct page beats a fast one that can
-        # drop a note.
+        # from `INDEX 32:M2` (internal rank sort, early exit at LIMIT) to
+        # `INDEX 0:M2` + `USE TEMP B-TREE FOR ORDER BY` (sort all matches).
+        # That is a real cost and an accepted one — these are personal stores,
+        # and a correct page beats a fast one that can drop a note.
         # A project-scoped search includes global notes. "Deliberately spans
         # every project" is a claim about scope, so a global note that never
         # appears under any project would mean nothing — and the server tells
@@ -684,43 +993,40 @@ class Database:
         # `get_project`'s recent_notes is the opposite case — it answers
         # "what is in this project", so there the two sets are bounded
         # separately and globals cannot displace the project's own.
-        fts_query = expand_query(query)
+        # OUTSIDE the try, deliberately. `choose_rung` re-raises a store
+        # failure, and inside the try that re-raise was caught two lines later
+        # and turned into the LIKE fallback — a silent substring search over a
+        # locked or broken store, returning plausible rows while three shipped
+        # documents promise there is no substring search in any mode.
+        #
+        # `rung` is supplied by a caller that already chose one for this query;
+        # `PolicyEngine.search` does that when the caller is paging, so every
+        # page of one result set reads the same rung.
+        fts_query = rung if rung is not None else self.choose_rung(query, project)
         try:
-            if project:
-                rows = self.conn.execute("""
-                    SELECT n.id, n.title,
-                           snippet(notes_fts, 1, '', '', '...', 32) AS snippet,
-                           n.project, n.tags, n.created_at, n.author_client, n.is_global
-                    FROM notes_fts
-                    JOIN notes n ON n.rowid = notes_fts.rowid
-                    WHERE notes_fts MATCH ? AND (n.project = ? OR n.is_global = 1)
-                    ORDER BY rank, n.rowid DESC LIMIT ? OFFSET ?
-                """, (fts_query, project, limit, offset)).fetchall()
-            else:
-                rows = self.conn.execute("""
-                    SELECT n.id, n.title,
-                           snippet(notes_fts, 1, '', '', '...', 32) AS snippet,
-                           n.project, n.tags, n.created_at, n.author_client, n.is_global
-                    FROM notes_fts
-                    JOIN notes n ON n.rowid = notes_fts.rowid
-                    WHERE notes_fts MATCH ?
-                    ORDER BY rank, n.rowid DESC LIMIT ? OFFSET ?
-                """, (fts_query, limit, offset)).fetchall()
+            rows = self._match_page(fts_query, project, limit, offset)
         except sqlite3.OperationalError:
-            like = f"%{query}%"
-            if project:
-                rows = self.conn.execute("""
-                    SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client, is_global
-                    FROM notes WHERE (title LIKE ? OR content LIKE ?)
-                      AND (project = ? OR is_global = 1)
-                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
-                """, (like, like, project, limit, offset)).fetchall()
-            else:
-                rows = self.conn.execute("""
-                    SELECT id, title, substr(content, 1, 200), project, tags, created_at, author_client, is_global
-                    FROM notes WHERE title LIKE ? OR content LIKE ?
-                    ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
-                """, (like, like, limit, offset)).fetchall()
+            # Try the SAME statement once more before concluding anything. A
+            # rejected query is deterministic and fails identically; a
+            # transient fault is not. `SQLITE_BUSY` under WAL surfaces only
+            # after `busy_timeout` has already elapsed, and `SQLITE_IOERR` on
+            # Windows is routinely an antivirus or a syncing folder — both are
+            # typically gone a moment later, and judging them on a LATER
+            # observation classified them as bad queries and answered with a
+            # substring search. Retrying also means a cleared hiccup returns
+            # the real results rather than an error.
+            try:
+                rows = self._match_page(fts_query, project, limit, offset)
+            except sqlite3.OperationalError as e:
+                # Failed twice. Two independent conditions have to hold before
+                # an ordinary search is allowed to become a substring search:
+                # SQLite must have called it a query error, and the index must
+                # still read. Either alone has been wrong — the error code is
+                # unavailable on 3.10, and the probe is a later observation
+                # that a cleared fault fools.
+                if not self._rejected_the_query(e) or not self._index_is_readable():
+                    raise
+                rows = self._like_page(query, project, limit, offset)
 
         return [
             {
@@ -980,6 +1286,34 @@ class Database:
         q += " ORDER BY started_at DESC, rowid DESC LIMIT 1"
         row = self.conn.execute(q, params).fetchone()
         return self.get_session(row[0]) if row else None
+
+    def open_sessions(self, exclude_id: str | None = None, limit: int = 5) -> list[dict]:
+        """Sessions nobody closed, newest first — what `end_session` warns about.
+
+        Deliberately machine-wide rather than scoped to a project: the point of
+        the warning is that a session you are NOT working in is still open, and
+        the one most worth hearing about is the one in the repo next door.
+        Grant scope still applies, but it is applied above this layer, where
+        every other session read is filtered.
+
+        `exclude_id` is the session just closed. Excluded by id and not by
+        "ended_at IS NULL", because the caller closes and then asks, and a
+        transaction that has already committed would otherwise have to be
+        reasoned about to know why the row is absent.
+        """
+        rows = self.conn.execute(
+            "SELECT id, project, client, intent, started_at FROM sessions "
+            "WHERE ended_at IS NULL AND id IS NOT ? "
+            # Same tiebreaker, same reason as latest_open_session: coarse
+            # clock resolution makes started_at ties ordinary, not rare.
+            "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            (exclude_id, limit),
+        ).fetchall()
+        return [
+            {"id": r[0], "project": r[1], "client": r[2],
+             "intent": r[3], "started_at": r[4]}
+            for r in rows
+        ]
 
     def get_session(self, session_id: str) -> dict | None:
         row = self.conn.execute(

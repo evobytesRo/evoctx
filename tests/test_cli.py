@@ -81,17 +81,34 @@ def test_delete_force_refuses_an_ambiguous_prefix(cli, monkeypatch, capsys):
 def test_end_session_refuses_an_ambiguous_prefix(cli, monkeypatch, capsys):
     run(cli, monkeypatch, "start-session", "--project", "p1", "--intent", "one")
     run(cli, monkeypatch, "start-session", "--project", "p2", "--intent", "two")
-    cli.db.conn.execute("UPDATE sessions SET id = 'dupe-' || id")
+    # Long enough to clear the minimum-prefix guard, so this exercises the
+    # ambiguity path and not the length one.
+    cli.db.conn.execute("UPDATE sessions SET id = 'duplicated-' || id")
     cli.db.conn.commit()
     capsys.readouterr()
 
     with pytest.raises(SystemExit) as exc:
-        run(cli, monkeypatch, "end-session", "summary", "--id", "dupe-")
+        run(cli, monkeypatch, "end-session", "summary", "--id", "duplicated-")
     assert exc.value.code == 1
     sessions = cli.db.recent_sessions()
     assert "Ambiguous id" in capsys.readouterr().out
     assert len(sessions) == 2  # or the all() below is vacuously true
     assert all(s["open"] for s in sessions), "neither may be closed"
+
+
+def test_end_session_refuses_a_prefix_shorter_than_the_minimum(cli, monkeypatch, capsys):
+    """The CLI is the surface where this matters most: `--id a` on a unique
+    one-character prefix closed a session outright, with no confirmation and
+    no undo."""
+    run(cli, monkeypatch, "start-session", "--project", "p1", "--intent", "one")
+    sid = cli.db.latest_open_session()["id"]
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        run(cli, monkeypatch, "end-session", "summary", "--id", sid[:3])
+    assert exc.value.code == 1
+    assert "too short" in capsys.readouterr().out
+    assert cli.db.get_session(sid)["open"] is True
 
 
 # ── grants ────────────────────────────────────────────────────────────────────

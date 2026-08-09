@@ -13,6 +13,7 @@ import pytest
 from conftest import found, run
 
 from evoctx.db import (
+    MIGRATIONS,
     Database,
     DuplicateRootBinding,
     NoSuchProject,
@@ -21,6 +22,14 @@ from evoctx.db import (
     normalize_root,
     this_machine,
 )
+
+# The backup a migration takes is named for the version it is migrating TO, so
+# every one of these assertions is really about "the latest schema" and not
+# about 005 in particular. Derived, because hardcoding it made three tests fail
+# on the release that added 006 — a false alarm about untouched code, which is
+# the kind of test that gets its assertion loosened rather than read.
+LATEST = len(MIGRATIONS)
+BACKUP_NAME = f"store.db.bak-pre-migration-{LATEST:03d}"
 
 
 # ── normalisation ─────────────────────────────────────────────────────────────
@@ -418,26 +427,30 @@ def test_migration_005_upgrades_a_0_1_3_store(tmp_path):
             conventions TEXT NOT NULL DEFAULT '', open_questions TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL
         );
-        INSERT INTO notes VALUES ('n1','kept','searchable body',NULL,'[]',NULL,NULL,'t','t');
+        INSERT INTO notes VALUES ('n1','kept','searchable body',NULL,'["#legacytag"]',NULL,NULL,'t','t');
         INSERT INTO projects VALUES ('p1','curated overview','conv','questions','t');
     """)
     conn.execute("PRAGMA user_version = 4")
     conn.commit()
     conn.close()
 
-    db = Database(tmp_path)  # runs 005
+    db = Database(tmp_path)  # runs 005, then 006
     proj = found(db.get_project("p1"))
     assert proj["overview"] == "curated overview"   # untouched by the migration
     assert proj["open_questions"] == "questions"
     assert proj["description_author"] is None       # unknown, not fabricated
     assert proj["roots"] == []                      # nothing invented
     assert found(db.get_note("n1"))["is_global"] is False
-    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert db.conn.execute("PRAGMA user_version").fetchone()[0] == LATEST
 
     # the migration must not have disturbed the FTS index
     hits = db.search("searchable")
     assert [h["id"] for h in hits] == ["n1"]
     assert hits[0]["is_global"] is False
+
+    # 006 rebuilt the index this fixture created two columns wide, and the
+    # rebuild reached a note written long before tags were indexed
+    assert [h["id"] for h in db.search("legacytag")] == ["n1"]
 
 
 def test_migrating_backs_the_store_up_first(tmp_path, capsys):
@@ -462,7 +475,7 @@ def test_migrating_backs_the_store_up_first(tmp_path, capsys):
     conn.close()
 
     Database(tmp_path)
-    backup = tmp_path / "store.db.bak-pre-migration-005"
+    backup = tmp_path / BACKUP_NAME
     assert backup.exists(), "the pre-migration copy must exist"
 
     old = sqlite3.connect(backup)
@@ -493,7 +506,7 @@ def test_the_backup_predates_the_schema_creation(tmp_path):
 
     Database(tmp_path)
 
-    old = sqlite3.connect(tmp_path / "store.db.bak-pre-migration-005")
+    old = sqlite3.connect(tmp_path / BACKUP_NAME)
     tables = {r[0] for r in old.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     old.close()
@@ -518,7 +531,7 @@ def test_an_unusable_existing_backup_is_not_trusted(tmp_path, capsys):
     conn.commit()
     conn.close()
 
-    stale = tmp_path / "store.db.bak-pre-migration-005"
+    stale = tmp_path / BACKUP_NAME
     stale.write_bytes(b"")  # the interrupted-attempt shape
 
     Database(tmp_path)
@@ -528,7 +541,7 @@ def test_an_unusable_existing_backup_is_not_trusted(tmp_path, capsys):
     assert old.execute("PRAGMA user_version").fetchone()[0] == 4
     assert old.execute("SELECT title FROM notes").fetchone()[0] == "kept"
     old.close()
-    assert not (tmp_path / "store.db.bak-pre-migration-005.tmp").exists()
+    assert not (tmp_path / f"{BACKUP_NAME}.tmp").exists()
 
 
 def test_a_fresh_store_is_not_backed_up(tmp_path):

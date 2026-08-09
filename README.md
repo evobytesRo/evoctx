@@ -212,18 +212,39 @@ MUST DO, every session:
   name is the launching folder's — pass a name explicitly when the work targets one of the
   repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and
-  interrupted sessions stay visible. It follows the same project rule as `write_note()`: an
+  interrupted sessions stay visible. **Keep the `id` it returns**; you need it to close this
+  session and not somebody else's. It follows the same project rule as `write_note()`: an
   unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
   you must name a project or register the workspace — `start_session` has **no `is_global`**,
   since a session happens somewhere. Then `recent_sessions(project)` — open entries were
   likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
 - **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
-  an approach that contradicts a stored decision without surfacing the conflict.
+  an approach that contradicts a stored decision without surfacing the conflict. **Query with
+  two or three bare content words, never a sentence:** terms combine with AND, so each extra
+  word can only shrink the result. When AND turns up fewer than a handful the store retries
+  with OR and then with prefixes, so let it widen rather than rephrasing by hand. Titles,
+  bodies **and tags** are indexed and word forms match (`migrating` finds `migration`);
+  substrings never do. Quotes, parens, `OR`, `NOT`, `NEAR` and a trailing `*` are honoured as
+  written and turn the widening off. **Results are ranked by relevance, not by date** — read
+  `created_at` when recency is what matters. The response carries `total`, the number of notes
+  that matched, which is **not** the number returned: when `has_more` is true and the topic
+  matters, raise `limit` or page with `offset` rather than assuming you have seen everything.
+  **Raising `limit` is the reliable way to see more** — one call is one consistent set. If you
+  page with `offset` instead, pass the previous response's `page_token` back so both pages read
+  the query the same way; paging is positional, so on a store another window is writing to it
+  samples rather than guarantees completeness. A `total` of 0 means nothing matched *that you
+  can see* — an active grant can be filtering it, so check `list_grants()` before telling the
+  user the store has nothing on the topic.
 - **As you go:** `write_note()` for non-obvious decisions/gotchas immediately, don't batch to
   the end (notes are auto-linked to the session). A project name that doesn't exist is
   **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
   if nothing resolves, name one, register the workspace, or set `is_global`.
-- **End:** call `end_session(summary)` — what was built, decided, and left open.
+- **End:** call `end_session(summary, session_id=<the id from start_session>)` — what was
+  built, decided, and left open. **Pass the id.** Several assistant windows share one store, so
+  the newest open session is not reliably yours. If the response carries `other_open_sessions`,
+  that is an observation about other windows, not a task: never close a session you did not
+  open unless the user says it was abandoned, because a summary of work it never did is worse
+  than leaving it open.
 - If a call is denied, call `list_grants()` and relay the `evoctx` command from the error **as
   written** — it may name a grant that applies to you specifically, and a generic
   `grant activate everything` would leave you denied. Anything in `<angle brackets>` is a
@@ -239,10 +260,10 @@ MUST DO, every session:
 | `recent_sessions(project?, limit?)` | Right after — see what recent sessions did; open ones were likely interrupted, their notes are the only record |
 | `list_projects()` | Discover registered projects, and which one this workspace is — returns `projects` plus a `workspace` block that resolves the working directory to a project, or says plainly that nothing matched |
 | `get_project(name)` | Load overview, conventions, open questions, recent notes |
-| `search_context(query, project?, limit?)` | Find relevant notes mid-work |
+| `search_context(query, project?, limit?, offset?, page_token?)` | Find relevant notes mid-work. Two or three bare words: terms combine with AND, and the store widens to OR and then to prefixes on its own when AND turns up too little. Title, body and tags are all indexed. Returns `{results, total, offset, limit, has_more, page_token}` — `total` is how many matched, not how many came back, so the assistant can tell a complete answer from a page of one and ask for the rest; `page_token` passed back keeps both pages reading the query the same way. Ranked by relevance, **not** by date |
 | `get_by_id(id)` | Full content after a search hit |
 | `write_note(title, content, project?, tags?, is_global?)` | Record decisions and observations as you go. An unknown project name is refused and nothing is saved; an unset one takes the workspace's own. `is_global` marks a note as spanning every project — deliberately not the same as leaving `project` unset |
-| `end_session(summary)` | Last call — closes the session with what was built/decided/open |
+| `end_session(summary, session_id?)` | Last call — closes the session with what was built/decided/open. Pass the id `start_session` returned; several windows share one store, so the newest open session is not reliably yours. Returns `other_open_sessions` when any remain, as an observation about other windows rather than a task |
 | `register_project(name, overview, ...)` | Register this workspace as a project. No path argument — the server binds its own working directory; the assistant supplies only the description |
 | `list_grants()` | What *this client* is allowed — resolved per client, since one may have its own grant — so "do you have access to X?" gets an honest answer |
 
@@ -260,11 +281,11 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 | `register_project(...)` | `evoctx init [--name NAME]` |
 | *(none — human-only)* | `evoctx project-merge WRONG RIGHT` — move notes **and** sessions off an invented project name |
 | `get_project(name)` | `evoctx get-project NAME` |
-| `search_context(...)` | `evoctx search-context QUERY [--project NAME] [--limit N]` (alias: `search`) |
+| `search_context(...)` | `evoctx search-context QUERY [--project NAME] [--limit N] [--offset N] [--page-token TOK]` (alias: `search`) — reports total matches, not just the page, and prints the next page's command |
 | `get_by_id(id)` | `evoctx get-by-id ID` — ID prefix is enough (alias: `show`) |
 | `write_note(...)` | `evoctx write-note "Title" --project NAME --tags "#decision" --text "..."` (alias: `add`); `--global` marks a note as spanning every project |
 | `start_session(...)` | `evoctx start-session [--project NAME] [--intent "..."]` |
-| `end_session(summary)` | `evoctx end-session "summary" [--id ID]` — default: latest open |
+| `end_session(summary, session_id?)` | `evoctx end-session "summary" [--id ID]` — default: latest open; an ID prefix needs at least 8 characters, since closing has no undo |
 | `recent_sessions(...)` | `evoctx recent-sessions [--project NAME] [--limit N]` |
 
 Plus store management commands with no MCP equivalent (deliberately — deletion and bulk ops are human-only):
@@ -456,15 +477,20 @@ client's own permission system), in **[SECURITY.md](SECURITY.md)**.
 ## Roadmap — known gaps, not hidden ones
 
 - **Search is keyword-based (SQLite FTS5), not semantic.** It knows word *forms* (porter
-  stemming — "configuring" matches "configuration") and a hand-curated dictionary of common
+  stemming — "configuring" matches "configuration"), a hand-curated dictionary of common
   dev-term synonyms ("auth bug" also matches a note about "login failure" — `auth`/`login`/
   `authentication`, `bug`/`error`/`issue`/`failure`, and similar groups in
-  [synonyms.py](src/evoctx/synonyms.py)). It does not know *meaning* — a synonym pair that isn't
+  [synonyms.py](src/evoctx/synonyms.py)), and it widens AND → OR → prefixes when a query
+  turns up fewer than a handful of matches. It does not know *meaning* — a synonym pair that isn't
   in the dictionary, or two notes that are conceptually related without sharing any recognized
   term, won't connect. Real embedding-based semantic search is the top post-beta priority; it's
   a real dependency (a local embedding model or a vector index) rather than a quick addition,
   which is why the deeper version didn't make beta — the synonym dictionary is the cheap 80% of
   the gain without the dependency weight.
+- **No substring search, in any mode.** FTS5 matches whole terms and prefixes only, so
+  `letter` will never find `newsletter`. This is a property of the index, not a setting;
+  the LIKE path that *can* match inside a word runs only when FTS5 refuses to parse a query,
+  and is an error path rather than a search mode.
 - **Encryption at rest** — not implemented; see [SECURITY.md §4](SECURITY.md).
 - **Redaction is one-way.** Grant-based read-time redaction masks values in responses but has no
   client-side re-hydration step to reverse it — once masked, the AI only ever sees the

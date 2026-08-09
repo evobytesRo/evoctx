@@ -303,9 +303,9 @@ def test_deleting_a_project_does_not_expose_its_notes_to_a_scoped_grant(db, tmp_
     db.upsert_project("doomed")
     db.add_note("secret", "confidential doomed material", project="doomed")
 
-    assert engine.search(grant, "confidential", project=None, limit=10) == []
+    assert engine.search(grant, "confidential", project=None, limit=10)["results"] == []
     db.delete_project("doomed")
-    assert engine.search(grant, "confidential", project=None, limit=10) == [], \
+    assert engine.search(grant, "confidential", project=None, limit=10)["results"] == [], \
         "unlinking must not move a note across a scope boundary"
 
 
@@ -331,7 +331,7 @@ def test_a_global_note_stays_visible_to_a_scoped_grant(db, tmp_path):
     db.upsert_project("keeper")
     db.add_note("spans all", "findable everywhere", is_global=True)
 
-    hits = engine.search(grant, "findable", project=None, limit=10)
+    hits = engine.search(grant, "findable", project=None, limit=10)["results"]
     assert [h["title"] for h in hits] == ["spans all"]
 
 
@@ -345,7 +345,7 @@ def test_a_wide_grant_still_reads_project_less_notes(db, tmp_path):
     grant = engine.check("c", "search_context")
     db.add_note("legacy", "written before 0.1.4", project=None)
 
-    hits = engine.search(grant, "legacy", project=None, limit=10)
+    hits = engine.search(grant, "legacy", project=None, limit=10)["results"]
     assert [h["title"] for h in hits] == ["legacy"]
 
 

@@ -96,18 +96,39 @@ MUST DO, every session:
   name is the launching folder's — pass a name explicitly when the work targets one of the
   repos in `workspace.nearby`. Then
   `start_session(project, intent)` — registers the work session so notes get linked and
-  interrupted sessions stay visible. It follows the same project rule as `write_note()`: an
+  interrupted sessions stay visible. **Keep the `id` it returns**; you need it to close this
+  session and not somebody else's. It follows the same project rule as `write_note()`: an
   unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
   you must name a project or register the workspace — `start_session` has **no `is_global`**,
   since a session happens somewhere. Then `recent_sessions(project)` — open entries were
   likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
 - **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
-  an approach that contradicts a stored decision without surfacing the conflict.
+  an approach that contradicts a stored decision without surfacing the conflict. **Query with
+  two or three bare content words, never a sentence:** terms combine with AND, so each extra
+  word can only shrink the result. When AND turns up fewer than a handful the store retries
+  with OR and then with prefixes, so let it widen rather than rephrasing by hand. Titles,
+  bodies **and tags** are indexed and word forms match (`migrating` finds `migration`);
+  substrings never do. Quotes, parens, `OR`, `NOT`, `NEAR` and a trailing `*` are honoured as
+  written and turn the widening off. **Results are ranked by relevance, not by date** — read
+  `created_at` when recency is what matters. The response carries `total`, the number of notes
+  that matched, which is **not** the number returned: when `has_more` is true and the topic
+  matters, raise `limit` or page with `offset` rather than assuming you have seen everything.
+  **Raising `limit` is the reliable way to see more** — one call is one consistent set. If you
+  page with `offset` instead, pass the previous response's `page_token` back so both pages read
+  the query the same way; paging is positional, so on a store another window is writing to it
+  samples rather than guarantees completeness. A `total` of 0 means nothing matched *that you
+  can see* — an active grant can be filtering it, so check `list_grants()` before telling the
+  user the store has nothing on the topic.
 - **As you go:** `write_note()` for non-obvious decisions/gotchas immediately, don't batch to
   the end (notes are auto-linked to the session). A project name that doesn't exist is
   **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
   if nothing resolves, name one, register the workspace, or set `is_global`.
-- **End:** call `end_session(summary)` — what was built, decided, and left open.
+- **End:** call `end_session(summary, session_id=<the id from start_session>)` — what was
+  built, decided, and left open. **Pass the id.** Several assistant windows share one store, so
+  the newest open session is not reliably yours. If the response carries `other_open_sessions`,
+  that is an observation about other windows, not a task: never close a session you did not
+  open unless the user says it was abandoned, because a summary of work it never did is worse
+  than leaving it open.
 - If a call is denied, call `list_grants()` and relay the `evoctx` command from the error **as
   written** — it may name a grant that applies to you specifically, and a generic
   `grant activate everything` would leave you denied. Anything in `<angle brackets>` is a

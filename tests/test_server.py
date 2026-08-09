@@ -130,7 +130,7 @@ def test_every_registered_tool_is_grantable(server):
 def test_write_then_search_then_get(server):
     server.db.upsert_project("p1")
     note_id = server.write_note("Test note", "searchable body", ctx=None, project="p1", tags=["#t"])
-    hits = server.search_context("searchable", ctx=None)
+    hits = server.search_context("searchable", ctx=None)["results"]
     assert hits[0]["id"] == note_id
     full = server.get_by_id(note_id, ctx=None)
     assert full["content"] == "searchable body"
