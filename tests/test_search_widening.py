@@ -8,6 +8,7 @@ tags against 39 notes' text — twelve notes tagged for a topic and unreachable
 by searching for it. Both are covered here.
 """
 import sqlite3
+import sys
 
 import pytest
 
@@ -494,6 +495,12 @@ def test_a_transient_failure_is_retried_rather_than_read_as_a_bad_query(db):
         db.conn = real_conn
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 11),
+    reason="sqlite3 errors carry sqlite_errorcode from 3.11. On 3.10 _rejected_the_query "
+           "has no code to read, so a fault that persists through the retry and clears "
+           "before the probe reaches the LIKE path - the 3.10 limit its docstring states. "
+           "The retry itself is covered by the test above.")
 def test_a_real_busy_error_never_reaches_the_substring_path(db):
     """The guard that survived a mutation: `_rejected_the_query`.
 

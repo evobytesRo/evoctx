@@ -71,7 +71,8 @@ principle outrank a long note matching all of them.
 
 **There is still no substring search, in any mode.** FTS5 has no infix operator, so `letter`
 will never find `newsletter`. The LIKE path that *can* match inside a word runs only when FTS5
-refuses to parse a query at all; it is an error path, not a search mode.
+refuses to parse a query at all; it is an error path, not a search mode. On Python 3.10, which
+has no SQLite error codes, a store fault that clears before the health probe can still reach it.
 
 The ladder rewrites FTS5 barewords — alphanumerics, `_`, and anything at or above U+0080. That
 covers what actually gets typed at a developer's context store: `mt940`, `0019`, `sha256`,
