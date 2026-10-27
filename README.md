@@ -4,7 +4,7 @@ A local, personal context store for AI coding assistants, exposed over [MCP](htt
 
 Your assistant reads project context at session start, searches past decisions mid-work, and writes notes back before ending — so the next session (in any MCP-capable client) starts oriented instead of from zero. One SQLite store on your machine, shared across every workspace and every client that connects. No cloud component.
 
-> **Status: v0.1.4.** Projects are bound to the directories their code lives in, so the assistant resolves the workspace instead of guessing a name; each client can have its own grant; grants, redaction, audit logging and sessions all work today. On PyPI — `pip install evoctx`. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+> **Status: v0.1.5.** Projects are bound to the directories their code lives in, so the assistant resolves the workspace instead of guessing a name; search covers tags and widens on its own when every word together finds too little; a session is closed by the id it was started with; each client can have its own grant; grants, redaction, audit logging and sessions all work today. On PyPI — `pip install evoctx`. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 ---
 

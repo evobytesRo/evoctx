@@ -1,12 +1,14 @@
 # Changelog
 
-## 0.1.5 — 2026-08-09 — search finds things, and you close the session you opened
+## 0.1.5 — 2026-10-27 — search finds things, and you close the session you opened
 
 Search is the headline. Notes are only worth writing if they come back, and three separate
 things stood between a query and the note that answered it: tags were not indexed, multi-word
 queries were combined with AND and therefore usually matched nothing, and a result list could
 not say how much of the answer it was leaving out. Migration 006 runs on the next open and
-needs nothing from you.
+needs nothing from you. It is one-way, like every migration: 0.1.4 refuses the upgraded store,
+so machines sharing a store upgrade together; `store.db.bak-pre-migration-006` is written first
+and is the rollback.
 
 Sessions gain the other half: `end_session` now takes the id `start_session` gave you, so a
 machine running two assistant windows closes the right one.
