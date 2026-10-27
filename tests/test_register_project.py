@@ -129,7 +129,7 @@ def test_upgrade_adds_only_the_missing_tools(tmp_path):
     store = GrantStore(tmp_path)
 
     report = store.upgrade_tools()
-    assert report["updated"] == {"everything": ["register_project"]}
+    assert report["updated"] == {"everything": ["register_project", "hold_session"]}
     assert store.grants()["everything"].allows_tool("register_project")
 
 
@@ -240,13 +240,26 @@ def test_upgrade_refuses_to_rewrite_a_block_sequence(tmp_path):
     assert (tmp_path / "grants.yaml").read_text(encoding="utf-8") == before
 
 
+def test_upgrade_from_the_0_1_4_set_adds_only_hold_session(tmp_path):
+    """A grant written against 0.1.4 or 0.1.5 lists ten tools. It is a stale
+    everything-grant too, and gets exactly the one tool it lacks."""
+    write_grants(tmp_path, OLD_GRANT.replace(
+        "recent_sessions, list_grants]",
+        "recent_sessions, list_grants,\n            register_project]"))
+    store = GrantStore(tmp_path)
+
+    report = store.upgrade_tools()
+    assert report["updated"] == {"everything": ["hold_session"]}
+    assert store.grants()["everything"].allows_tool("hold_session")
+
+
 def test_upgrade_dry_run_writes_nothing(tmp_path):
     write_grants(tmp_path, OLD_GRANT)
     store = GrantStore(tmp_path)
     before = (tmp_path / "grants.yaml").read_text(encoding="utf-8")
 
     report = store.upgrade_tools(dry_run=True)
-    assert report["updated"] == {"everything": ["register_project"]}
+    assert report["updated"] == {"everything": ["register_project", "hold_session"]}
     assert (tmp_path / "grants.yaml").read_text(encoding="utf-8") == before
     assert report["backup"] is None
 
@@ -363,7 +376,7 @@ def test_missing_tools_reports_the_gap_without_writing(tmp_path):
     store = store_with(tmp_path, OLD_GRANT)
     before = (tmp_path / "grants.yaml").read_text(encoding="utf-8")
 
-    assert store.missing_tools() == {"everything": ["register_project"]}
+    assert store.missing_tools() == {"everything": ["register_project", "hold_session"]}
     assert (tmp_path / "grants.yaml").read_text(encoding="utf-8") == before
 
 
@@ -685,7 +698,7 @@ def test_prior_tool_sets_covers_the_previous_release():
     way to make it pass again is to append the outgoing set and update the
     literal — i.e. to touch the list.
     """
-    assert set(ALL_TOOLS) - set(PRIOR_TOOL_SETS[0]) == {"register_project"}, (
+    assert set(ALL_TOOLS) - set(PRIOR_TOOL_SETS[0]) == {"hold_session"}, (
         "ALL_TOOLS grew: append the outgoing complete set to PRIOR_TOOL_SETS "
         "and update this literal to the tools THIS release adds. Skipping it "
         "does not fail safe — the stale grant matches no prior set, so it is "
@@ -731,7 +744,7 @@ grants:
 """)
     report = store.upgrade_tools()
 
-    assert report["updated"] == {"beta": ["register_project"]}
+    assert report["updated"] == {"beta": ["register_project", "hold_session"]}
     assert "alpha" in report["manual"]
     grants = store.grants()
     assert grants["beta"].allows_tool("register_project")
@@ -760,7 +773,7 @@ grants:
 """)
     report = store.upgrade_tools()          # must not raise
 
-    assert report["updated"] == {"stale": ["register_project"]}
+    assert report["updated"] == {"stale": ["register_project", "hold_session"]}
     assert store.grants()["stale"].allows_tool("register_project")
 
 

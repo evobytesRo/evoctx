@@ -32,7 +32,7 @@ import yaml
 ALL_TOOLS = [
     "list_projects", "get_project", "search_context", "get_by_id",
     "write_note", "start_session", "end_session", "recent_sessions",
-    "list_grants", "register_project",
+    "list_grants", "register_project", "hold_session",
 ]
 
 # A grant may list "*" instead of enumerating tools, so it never goes stale as
@@ -87,6 +87,10 @@ TOOLS_WILDCARD = "*"
 # the append; this comment cannot. Growing ALL_TOOLS without adding the
 # outgoing set fails in CI instead of on someone's machine.
 PRIOR_TOOL_SETS = [
+    # 0.1.4 - 0.1.5
+    ["list_projects", "get_project", "search_context", "get_by_id",
+     "write_note", "start_session", "end_session", "recent_sessions",
+     "list_grants", "register_project"],
     # 0.1.0 - 0.1.3
     ["list_projects", "get_project", "search_context", "get_by_id",
      "write_note", "start_session", "end_session", "recent_sessions",

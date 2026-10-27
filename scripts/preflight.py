@@ -520,6 +520,10 @@ def check_schema_drift() -> Tuple[str, List[str]]:
     descriptions of one thing. Every release that touches the schema is a chance for them to
     diverge, and the divergence is invisible until somebody's store behaves differently from
     everybody else's.
+
+    Not every table has a migration: one no older release reads is created by `_init()` alone,
+    with IF NOT EXISTS (see MIGRATIONS in db.py). Both paths run `_init()`, so such a table is
+    compared here like any other object.
     """
     src = REPO_ROOT / "src"
     if str(src) not in sys.path:

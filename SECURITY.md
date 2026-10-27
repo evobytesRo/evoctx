@@ -180,6 +180,14 @@ current row count so growth stays visible instead of silent.
   connection, notes from one could get linked to the other's session. Realistic MCP usage is
   one conversation per connection, so this is a latent edge case, not an observed problem —
   documented so it's not a surprise later.
+- **Holding a session by id.** A connection that started a session can hold only that one. A
+  connection with no session of its own — before its first `start_session`, after it closed its
+  own session, or after the server restarted or the conversation was resumed — can hold any open
+  session its grant can see, by id, and that would keep another window's
+  reminder quiet. Each hold lasts at most 24 hours of idleness and ends in a reminder, but a
+  connection that renews it at every lapse keeps it quiet indefinitely. The response warns that
+  notes written from that connection do not renew it, and says to hold only a session you
+  started.
 - **No multi-user concept.** evoctx is built for one person, one machine (or one person's set
   of machines via manual sync/backup of `store.db`). There's no per-user access control because
   there's no concept of multiple users.

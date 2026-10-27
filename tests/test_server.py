@@ -20,7 +20,7 @@ def server(tmp_path, monkeypatch):
 EXPECTED_TOOLS = {
     "list_projects", "get_project", "search_context", "get_by_id",
     "write_note", "start_session", "end_session", "recent_sessions",
-    "list_grants", "register_project",
+    "list_grants", "register_project", "hold_session",
 }
 
 

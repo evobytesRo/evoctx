@@ -16,6 +16,7 @@ Mirrors of the MCP tools — everything the AI can do, you can do:
   exist; these write what you tell them. Grants and that refusal govern what a
   connected AI may do, not what you may do with your own store.)
   evoctx end-session "summary" [--id ID]                      Same as MCP end_session() (default: latest open)
+  evoctx hold-session ID [--hours H]                          Same as MCP hold_session() (default 2h idle)
   evoctx recent-sessions [--project NAME] [--limit N]         Same as MCP recent_sessions()
   evoctx list-grants [--client NAME]                          Same as MCP list_grants()
 
@@ -108,6 +109,14 @@ from .db import (
     this_machine,
 )
 from .grants import TOOLS_WILDCARD, GrantError, GrantStore, client_key_is_concrete
+from .holds import (
+    DUE_LAPSED,
+    DUE_UNHELD,
+    HOLD_DEFAULT_HOURS,
+    Reminder,
+    format_hours,
+    reminder_state,
+)
 from .paths import store_dir
 from .policy import PolicyEngine
 from .resolve import DEFAULT, resolve_workspace
@@ -320,6 +329,19 @@ def _print_session(s: dict):
         print(f"           intent:  {s['intent']}")
     if s["summary"]:
         print(f"           summary: {s['summary'][:120]}")
+    hold = s.get("hold")
+    if hold:
+        if not s["open"]:
+            status = "closed"
+        elif hold["hours"] is None:
+            status = "unusable, judged as unheld"
+        elif hold["active"]:
+            status = f"active until {hold['expires_at']}"
+        else:
+            status = "lapsed"
+        hours = format_hours(hold["hours"]) if hold["hours"] is not None else "?"
+        print(f"           hold:    {hours} idle, last activity "
+              f"{hold['last_activity_at'] or '?'}, {status}")
     if s["notes"]:
         for n in s["notes"]:
             print(f"             note {n['id'][:8]}  {n['title']}")
@@ -373,6 +395,29 @@ def cmd_end_session(args):
         print(f"  still open: {other['id'][:8]} "
               f"[{other.get('project') or 'no project'}] "
               f"{other.get('intent') or '-'}")
+
+
+def cmd_hold_session(args):
+    if len(args.id) < PolicyEngine.MIN_SESSION_PREFIX and not db.get_session(args.id):
+        print(f"'{args.id}' is too short to identify a session — give at least "
+              f"{PolicyEngine.MIN_SESSION_PREFIX} characters.")
+        sys.exit(1)
+    session = _resolve(
+        lambda: db.get_session(args.id) or db.find_session_by_prefix(args.id),
+        "evoctx recent-sessions",
+    )
+    if not session:
+        print("No matching session found. See: evoctx recent-sessions")
+        sys.exit(1)
+    try:
+        held = db.hold_session(session["id"], args.hours)
+    except ValueError as e:
+        print(e)
+        sys.exit(1)
+    if not held:
+        print(f"Session {session['id'][:8]} is closed; nothing to hold.")
+        sys.exit(1)
+    _print_session(db.get_session(session["id"]) or session)
 
 
 def cmd_recent_sessions(args):
@@ -819,7 +864,8 @@ def cmd_install(args):
         print(json.dumps(hooks, indent=2))
         print()
         print("SessionStart nudges start_session/recent_sessions; Stop blocks once (never twice)")
-        print("if a session opened in the last 12h was never closed with end_session.")
+        print("if a session opened in the last 12h was never closed with end_session, or a")
+        print("session held with hold_session has gone idle past its hold.")
 
         deny = install_claude_code_permissions_deny(home, STORE_DIR)
         print()
@@ -876,7 +922,12 @@ def cmd_hook(args):
             "end_session(summary, session_id=<that id>), because other windows "
             "share this store and the newest open session may not be yours. "
             "Then recent_sessions() before starting work — open entries there "
-            "were likely interrupted. When searching, use two or three bare "
+            "were likely interrupted, unless their hold.active is true: that is "
+            "usually another window working, unless the id is yours. If your "
+            "work will span many turns, call hold_session() with your session's "
+            "id right after start_session, so the Stop reminder stays quiet "
+            "while you work; notes you write keep it held. When searching, use "
+            "two or three bare "
             "words: terms combine with AND, and the store widens to OR and then "
             "to prefixes on its own when AND turns up too little. Results are "
             "ranked by relevance, not by date, and the response carries `total` "
@@ -926,38 +977,92 @@ def cmd_hook(args):
             [resolved, *(n["project"] for n in workspace["nearby"])]
             if resolved else []
         )
-        session = db.latest_open_session(candidates, include_unassigned=True)
-        if not session:
+        # Every due session, not the newest. Skipped are only the sessions the
+        # rule calls quiet (held and active, or past their reminder window)
+        # and rows it cannot judge. Stopping at the first due one would let
+        # any live session — another window's, or one from a client with no
+        # Stop hook that was never told to hold — hide an older forgotten one
+        # until its reminder window ran out, after which it would be silent
+        # for good.
+        now = datetime.now(timezone.utc)
+        due: list[tuple[dict, Reminder]] = []
+        for s in db.stop_candidates(candidates, now):
+            r = reminder_state(started_at=s["started_at"], held_at=s["held_at"],
+                               hold_hours=s["hold_hours"],
+                               note_stamps=[s["last_note_at"]], now=now)
+            if r.state in (DUE_LAPSED, DUE_UNHELD):
+                due.append((s, r))
+        if not due:
             return
-        started = datetime.fromisoformat(session["started_at"])
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        age_hours = (datetime.now(timezone.utc) - started).total_seconds() / 3600
-        if age_hours <= 12:
-            # The project is named because the reminder deliberately spans the
-            # workspace, and a workspace is several repos. Without it a correct
-            # nag about the repo next door is indistinguishable from a bug, and
-            # there is nothing in the line to act on.
-            # The id, in the form end_session() accepts, and the caveat that
-            # this process cannot check: a hook is launched from settings.json
-            # and knows nothing about which window opened which session, so it
-            # reports the newest open one and says so. An assistant that closed
-            # its own session by id and sees this is looking at somebody
-            # else's, and writing a summary for that one is the failure this
-            # wording exists to prevent.
-            print(
-                f"Open session {session['id']} "
-                f"[{session.get('project') or 'no project'}] "
-                f"(intent: {session.get('intent') or '-'}) "
-                f"has no end_session() call yet. If it is yours, close it: "
-                f"end_session(summary, session_id=\"{session['id']}\"). "
-                f"This hook cannot tell which window opened it — if you already "
-                f"closed your own session, this one belongs to another window, "
-                f"so leave it and say so rather than summarising work you did "
-                f"not do. Ignore this message to stop anyway.",
-                file=sys.stderr,
+        # Lapsed holds first: someone said they were working in it and then
+        # stopped, which makes it the one most likely forgotten, so it must
+        # not be the one pushed past the detail cap. Stable, so each group
+        # stays newest first.
+        due.sort(key=lambda d: d[1].state != DUE_LAPSED)
+        print(_stop_reminder(due), file=sys.stderr)
+        sys.exit(2)
+
+
+#: Due sessions the Stop reminder describes in full; the rest are named by id.
+_STOP_DETAIL = 5
+
+
+def _stop_reminder(due: list[tuple[dict, Reminder]]) -> str:
+    """The Stop hook's message for every due session, one line each.
+
+    The project is named because the reminder deliberately spans the
+    workspace, and a workspace is several repos. Without it a correct nag
+    about the repo next door is indistinguishable from a bug, and there is
+    nothing in the line to act on.
+
+    Each line carries the full id in the form end_session() and
+    hold_session() accept, and the caveat this process cannot check: a hook
+    is launched from settings.json and knows nothing about which window opened
+    which session. So the message tells the reader to compare ids: a line is
+    theirs only if its id is the one start_session() returned to them. Any
+    state-based rule ("if your session is closed or held") is wrong for a
+    lapsed hold, which is held and may well be the reader's own. Writing a
+    summary for somebody else's session is the failure this wording exists to
+    prevent. Sessions past the detail cap are still named by full id, so none
+    is ever hidden behind a count.
+    """
+    lines = []
+    for s, r in due[:_STOP_DETAIL]:
+        sid = s["id"]
+        label = (f"[{s.get('project') or 'no project'}] "
+                 f"(intent: {s.get('intent') or '-'})")
+        if r.state == DUE_LAPSED:
+            idle = format_hours(r.idle_hours or 0.0)
+            hold = format_hours(r.hours or 0.0)
+            last = r.last_activity.isoformat() if r.last_activity else "?"
+            lines.append(
+                f"Held session {sid} {label} has had no activity for {idle}, "
+                f"past its {hold} hold (last activity {last}). If it is yours "
+                f"and finished, close it: end_session(summary, "
+                f"session_id=\"{sid}\"). If it is yours and the work is still "
+                f"going, renew it: hold_session(session_id=\"{sid}\") — a note "
+                f"written from the window that started it renews it too."
             )
-            sys.exit(2)
+        else:
+            lines.append(
+                f"Open session {sid} {label} has no end_session() call yet. If "
+                f"it is yours and finished, close it: end_session(summary, "
+                f"session_id=\"{sid}\"). If it is yours and the work goes on "
+                f"over more turns, hold it instead: hold_session(session_id="
+                f"\"{sid}\") — this session's reminder then stays quiet until "
+                f"it has been idle for {format_hours(HOLD_DEFAULT_HOURS)}."
+            )
+    rest = [s["id"] for s, _ in due[_STOP_DETAIL:]]
+    if rest:
+        lines.append(f"Also due: {', '.join(rest)}.")
+    lines.append(
+        "This hook cannot tell which window opened it. A session listed here is "
+        "yours only if its id is the one start_session() returned to you in "
+        "this conversation; any other id belongs to another window, so leave "
+        "it and say so rather than summarising work you did not do. Ignore "
+        "this message to stop anyway."
+    )
+    return "\n".join(lines)
 
 
 # ── commands ──────────────────────────────────────────────────────────────────
@@ -1950,6 +2055,13 @@ def main():
     es.add_argument("--id", default=None, help="Session ID (prefix ok); default: latest open")
     es.add_argument("--project", "-p", default=None, help="With no --id: latest open in this project")
 
+    hs = sub.add_parser("hold-session",
+                        help="Keep the Stop-hook reminder quiet for an open session "
+                             "while it is active (MCP: hold_session)")
+    hs.add_argument("id", help="Session ID (prefix of at least 8 characters ok)")
+    hs.add_argument("--hours", type=float, default=HOLD_DEFAULT_HOURS,
+                    help="Idle window, greater than 0 and at most 24 (default: 2)")
+
     rs = sub.add_parser("recent-sessions", help="List recent work sessions (MCP: recent_sessions)")
     rs.add_argument("--project", "-p", default=None)
     rs.add_argument("--limit", "-n", type=int, default=10)
@@ -2042,6 +2154,7 @@ def main():
         "project-merge": cmd_project_merge,
         "start-session": cmd_start_session,
         "end-session": cmd_end_session,
+        "hold-session": cmd_hold_session,
         "recent-sessions": cmd_recent_sessions,
         "list-grants": cmd_list_grants,
         "grant": cmd_grant,

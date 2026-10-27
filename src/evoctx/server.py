@@ -71,7 +71,8 @@ mcp = FastMCP(
         "one of those. "
         "Then call start_session(project, intent) to register the work session, "
         "then recent_sessions() to see what recent sessions did (open ones were likely "
-        "interrupted — their notes are the only record), then get_project(name) for relevant "
+        "interrupted — their notes are the only record — unless hold.active is true), then "
+        "get_project(name) for relevant "
         "projects. Use search_context() during work to find decisions and notes; write_note() "
         "to record decisions and observations as you go. Both write_note() and start_session() "
         "refuse a project name that does not exist rather than filing anything under it, and "
@@ -100,6 +101,12 @@ mcp = FastMCP(
         "other_open_sessions and a warning: that is an observation about other windows, not "
         "a task. Never close a session you did not open unless the user says it was "
         "abandoned — a summary of work it never did is worse than leaving it open. "
+        "When you deliberately keep your session open across many turns, call "
+        "hold_session() with the id start_session() returned, so the Stop-hook reminder "
+        "stays quiet while you work; a note written from this connection, or another "
+        "hold_session, keeps it held, and after 2h with neither it is flagged again. Hold "
+        "only your own session. An open session whose hold.active is true is usually "
+        "another window's live work, not an interrupted one — unless its id is yours. "
         "If a call is denied, list_grants() shows "
         "what you are allowed — resolved for you specifically, since a client can have its own "
         "grant. Relay the evoctx command from the error as written rather than a command you "
@@ -426,12 +433,80 @@ def end_session(summary: str, ctx: Context, session_id: str | None = None) -> di
 
 
 @mcp.tool()
+def hold_session(ctx: Context, session_id: str | None = None,
+                 hours: float | None = None) -> dict:
+    """
+    Keep the Stop-hook reminder quiet for YOUR session while you work in it
+    across many turns. The hook runs at the end of every turn and reminds
+    about every open session; a held session is skipped while it is active.
+
+    Active means: the hold, or a note linked to the session, is no older than
+    `hours`. Each write_note() from this connection links to the session it
+    started, so writing notes keeps the hold alive; calling hold_session()
+    again renews it. Once idle for longer than `hours` the reminder comes back
+    for this session, saying the hold lapsed. There is no release: close the
+    session with end_session() when the work is done, or let the hold lapse.
+
+    Args:
+        session_id: The id start_session() returned. Omitted, this holds the
+                    session THIS connection started. A connection that
+                    started a session can hold only that one — any other id
+                    is refused. A prefix of at least 8 characters works.
+        hours: Idle window, greater than 0 and at most 24. Default 2.
+
+    Returns:
+        The session, with its `hold` block: held_at, hours, last_activity_at,
+        expires_at and active.
+
+        When this connection started no session (the server restarted, or the
+        conversation was resumed) a hold by id is allowed and carries a
+        `warning`: notes written from here are not linked to it, so only
+        another hold_session() renews it, and it must be a session you
+        started.
+
+        Or an error — no session started and no id, an id that names nothing
+        open within the grant's scope, another window's session, `hours` out
+        of range, or a session already closed (`already_closed: true`).
+    """
+    global _current_session_id
+    own = _current_session_id
+    if own is not None:
+        mine = db.get_session(own)
+        if mine is None or not mine["open"]:
+            # Closed out of band — from the CLI or another window. Kept, the
+            # slot would make every other id read as "not yours" while naming
+            # a session that no longer exists to be yours, and every later
+            # write_note() would attach to it.
+            _current_session_id = own = None
+    result = policy.t_hold_session(_client_name(ctx), session_id, hours, own)
+    if result.get("already_closed") is True and result.get("id") == own:
+        # Closed between the check above and the write. Same reason
+        # end_session lets go of a session it finds already closed.
+        _current_session_id = None
+    if own is None and "error" not in result:
+        result = dict(result)
+        result["warning"] = (
+            f"This connection has no open session of its own, so notes written from here "
+            f"are not linked to {result['id'][:8]} and do not renew its hold — "
+            f"renew it with hold_session(session_id=\"{result['id']}\"). Hold "
+            f"only a session you started."
+        )
+    return result
+
+
+@mcp.tool()
 def recent_sessions(ctx: Context, project: str | None = None, limit: int = 10) -> list[dict]:
     """
     List recent work sessions, newest first — how a new session gets
     continuity. Each entry has intent, summary, and the notes it produced.
     Entries with open=true and no summary were likely interrupted: their
     notes are the only record of what happened, so check them.
+
+    The exception is an entry whose `hold.active` is true: someone called
+    hold_session() on it and it has had activity within its hold, so it is
+    most likely another window working right now. Leave it open. `hold` is
+    null for a session never held; for a closed one it records the last hold,
+    with `active` false.
 
     Args:
         project: Optional — restrict to one project

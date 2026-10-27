@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.1.6 — unreleased — sessions you keep open on purpose
+
+The Claude Code `Stop` hook runs at the end of every turn and reminds about an open session.
+A session kept open deliberately across a multi-turn piece of work was therefore flagged at
+every stop. `hold_session` lets the assistant say the session is still being worked in.
+
+### `hold_session` (new MCP tool) and `evoctx hold-session`
+
+- `hold_session(session_id?, hours?)` holds a session for `hours` of idleness (default 2,
+  greater than 0 and at most 24; anything else is refused, never clamped). Calling it again
+  renews the hold. Activity is the hold itself or a note linked to the session, so writing
+  notes keeps it held. There is no release: close the session, or let the hold lapse.
+- A connection that started a session can hold **only that one**; any other id is refused and
+  audited as `denied`. A connection with no session of its own — before its first
+  `start_session`, after it closed its session, or after a server restart — can hold a session
+  by id, and the response warns that notes written from it do not renew the hold.
+- `evoctx hold-session ID [--hours H]` is the CLI mirror.
+- Session responses (`end_session`, `recent_sessions`, `evoctx export` as JSON) carry a `hold`
+  block — `held_at`, `hours`, `last_activity_at`, `expires_at`, `active` — or `null` for a
+  session never held. `evoctx recent-sessions` prints it as a `hold:` line.
+
+### The `Stop` hook
+
+- A held session is skipped while active. Once idle past its hold it is flagged with a
+  "hold lapsed" message for 12 hours, then goes quiet. The 12-hour limit on a session's age
+  does not apply to a held session, so every hold ends in a reminder window.
+- The message lists **every** due session in the workspace, each with its full id, not only the
+  newest. With two windows on one workspace, a window whose own session is held now sees the
+  other window's unheld session at each stop — the newest-only check used to hide it.
+- The `SessionStart` text and every instruction channel say when to hold, and that an open
+  session whose `hold.active` is true is usually another window's live work, not an
+  interrupted one.
+
+### Store
+
+Holds live in a new `session_holds` table, created on open. **No migration and no schema
+version change**: 0.1.5 still opens a 0.1.6 store, ignores the table, and keeps reminding about
+held sessions.
+
+### Grants
+
+The default grant lists `"*"` and covers the new tool. `evoctx grant upgrade` adds
+`hold_session` to a grant listing exactly the 0.1.4–0.1.5 tool set, and `register_project` plus
+`hold_session` to one listing the 0.1.0–0.1.3 set. A grant you composed yourself is not touched:
+add `hold_session` to its `tools` by hand if it should have it. Without it the reminder simply
+keeps firing.
+
 ## 0.1.5 — 2026-10-27 — search finds things, and you close the session you opened
 
 Search is the headline. Notes are only worth writing if they come back, and three separate

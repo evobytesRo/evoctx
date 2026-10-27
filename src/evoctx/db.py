@@ -6,10 +6,11 @@ import sys
 import uuid
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from . import holds
 from .audit import AUDIT_SCHEMA, migration_002_audit_log
 from .secrets import redact_secrets
 from .synonyms import expand_query, expanded_tokens, plain_tokens
@@ -39,6 +40,30 @@ ENOUGH_HITS = 5
 #: Deliberately trivial: it has to fail for one reason only, the store being
 #: unreadable.
 _HEALTH_PROBE = "evoctxhealthprobe"
+
+
+#: What `_session_dict` reads, by position: a session row joined to its hold
+#: (`sessions s LEFT JOIN session_holds h`).
+_SESSION_COLUMNS = ("s.id, s.project, s.client, s.intent, s.started_at, "
+                    "s.ended_at, s.summary, h.held_at, h.hold_hours")
+
+
+def _session_scope(project: str | Sequence[str] | None,
+                   include_unassigned: bool) -> tuple[str, list]:
+    """The project clause of an open-sessions query on `sessions s`.
+
+    Shared by `latest_open_session` and `stop_candidates` so the two cannot
+    drift. No names — empty sequence or None — means every project; see
+    `latest_open_session` for why both of those choices are what they are.
+    """
+    names = [project] if isinstance(project, str) else list(project or [])
+    names = [n for n in names if n]
+    if not names:
+        return "", []
+    placeholders = ", ".join("?" * len(names))
+    clause = (f" AND (s.project IN ({placeholders}) OR s.project IS NULL)"
+              if include_unassigned else f" AND s.project IN ({placeholders})")
+    return clause, names
 
 
 def _now() -> str:
@@ -484,6 +509,11 @@ def _migration_006_index_tags(conn: sqlite3.Connection) -> None:
 # (which then skip straight to the latest version); migrations only ever
 # run on stores created by an older release. Append, never reorder or edit
 # shipped entries.
+#
+# A table an older release never reads needs no migration: _init() runs on
+# every open and creates it with IF NOT EXISTS, and user_version stays put, so
+# that older release still opens the store. `session_holds` is one. Anything
+# that changes a table an older release reads still goes here.
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _migration_001_sessions_reshape,
     migration_002_audit_log,
@@ -642,6 +672,15 @@ class Database:
                 started_at TEXT NOT NULL,
                 ended_at   TEXT,
                 summary    TEXT
+            );
+
+            -- No user_version bump and no migration (see MIGRATIONS): 0.1.5
+            -- never reads this table, so it keeps opening a store that has
+            -- one, and simply goes on reminding about held sessions.
+            CREATE TABLE IF NOT EXISTS session_holds (
+                session_id TEXT PRIMARY KEY,
+                held_at    TEXT NOT NULL,
+                hold_hours REAL NOT NULL
             );
         """)
         _create_project_roots(self.conn)
@@ -1259,15 +1298,8 @@ class Database:
         resolves to nothing. Filtering to nothing instead would silence the
         reminder precisely where the store knows least.
         """
-        names = [project] if isinstance(project, str) else list(project or [])
-        names = [n for n in names if n]
-        q = "SELECT id FROM sessions WHERE ended_at IS NULL"
-        params: list = []
-        if names:
-            placeholders = ", ".join("?" * len(names))
-            q += (f" AND (project IN ({placeholders}) OR project IS NULL)"
-                  if include_unassigned else f" AND project IN ({placeholders})")
-            params.extend(names)
+        scope, params = _session_scope(project, include_unassigned)
+        q = "SELECT s.id FROM sessions s WHERE s.ended_at IS NULL" + scope
         # Every tiebreaker in this file assumes rowid ascends with insertion
         # time. That survives deletes (a reused max rowid still exceeds every
         # live row) and is planner-independent. `VACUUM` is what breaks it:
@@ -1283,9 +1315,78 @@ class Database:
         # LIMIT 1 hands back the OLDER session — measured wrong on 62 of 62
         # ties. `evoctx end-session` defaults to this session, so the summary
         # would land on the wrong one and leave the intended one open.
-        q += " ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        q += " ORDER BY s.started_at DESC, s.rowid DESC LIMIT 1"
         row = self.conn.execute(q, params).fetchone()
         return self.get_session(row[0]) if row else None
+
+    def stop_candidates(self, project: str | Sequence[str] | None, now: datetime,
+                        include_unassigned: bool = True) -> list[dict]:
+        """Open sessions in scope that the Stop hook's rule could call due.
+
+        A superset, newest first: every held session, plus every unheld one
+        started within the reminder window (one second wider, so a naive
+        legacy stamp sorting just under an aware cutoff string is kept). The
+        rule in `holds.reminder_state` re-decides every row, so this filter
+        only bounds the cost — abandoned open sessions accumulate forever, and
+        an unheld one older than the window can never be due. Held rows are
+        never time-bounded here: a note written yesterday in a session held a
+        week ago is activity, and only the rule can see it.
+
+        Same scope semantics as `latest_open_session`, through the same helper.
+        Each row carries `last_note_at`, from one grouped query over the
+        candidates rather than one per session.
+        """
+        scope, params = _session_scope(project, include_unassigned)
+        cutoff = (now - timedelta(hours=holds.REMINDER_WINDOW_HOURS, seconds=1)).isoformat()
+        rows = self.conn.execute(
+            "SELECT s.id, s.project, s.intent, s.started_at, h.held_at, h.hold_hours "
+            "FROM sessions s LEFT JOIN session_holds h ON h.session_id = s.id "
+            "WHERE s.ended_at IS NULL AND (h.session_id IS NOT NULL OR s.started_at >= ?)"
+            + scope + " ORDER BY s.started_at DESC, s.rowid DESC",
+            [cutoff, *params],
+        ).fetchall()
+        last_notes = self._last_note_times([r[0] for r in rows], now)
+        return [
+            {"id": r[0], "project": r[1], "intent": r[2], "started_at": r[3],
+             "held_at": r[4], "hold_hours": r[5], "last_note_at": last_notes.get(r[0])}
+            for r in rows
+        ]
+
+    def _last_note_times(self, session_ids: list[str], now: datetime) -> dict[str, str]:
+        """Newest note stamp per session, leaving out stamps further ahead
+        than the rule counts — a MAX that included one would hide every older
+        note behind a stamp the rule then discards. Compared as strings, which
+        orders correctly because every note is stamped by `_now()` in UTC."""
+        if not session_ids:
+            return {}
+        placeholders = ", ".join("?" * len(session_ids))
+        limit = (now + holds.FUTURE_TOLERANCE).isoformat()
+        return dict(self.conn.execute(
+            f"SELECT session_id, MAX(created_at) FROM notes "
+            f"WHERE session_id IN ({placeholders}) AND created_at <= ? "
+            f"GROUP BY session_id",
+            [*session_ids, limit],
+        ).fetchall())
+
+    def hold_session(self, session_id: str, hours: float) -> bool:
+        """Hold an open session for `hours` of idleness, or renew its hold.
+
+        False when the session is closed or does not exist, and nothing is
+        written: the insert selects from `sessions` gated on `ended_at IS
+        NULL`, so a hold can never be recorded against a closed or unknown id.
+        Validated here because this is the one place every hold is written
+        through, CLI and MCP alike.
+        """
+        hours = holds.validate_hold_hours(hours)
+        cur = self.conn.execute(
+            "INSERT INTO session_holds (session_id, held_at, hold_hours) "
+            "SELECT id, ?, ? FROM sessions WHERE id = ? AND ended_at IS NULL "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "held_at = excluded.held_at, hold_hours = excluded.hold_hours",
+            (_now(), hours, session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def open_sessions(self, exclude_id: str | None = None, limit: int = 5) -> list[dict]:
         """Sessions nobody closed, newest first — what `end_session` warns about.
@@ -1317,15 +1418,16 @@ class Database:
 
     def get_session(self, session_id: str) -> dict | None:
         row = self.conn.execute(
-            "SELECT id, project, client, intent, started_at, ended_at, summary FROM sessions WHERE id = ?",
+            f"SELECT {_SESSION_COLUMNS} FROM sessions s "
+            f"LEFT JOIN session_holds h ON h.session_id = s.id WHERE s.id = ?",
             (session_id,),
         ).fetchone()
         return self._session_dict(row) if row else None
 
     def recent_sessions(self, project: str | None = None, limit: int = 10, offset: int = 0) -> list[dict]:
-        q = """
-            SELECT s.id, s.project, s.client, s.intent, s.started_at, s.ended_at, s.summary
-            FROM sessions s
+        q = f"""
+            SELECT {_SESSION_COLUMNS}
+            FROM sessions s LEFT JOIN session_holds h ON h.session_id = s.id
         """
         params: list = []
         if project:
@@ -1341,17 +1443,24 @@ class Database:
 
     def _session_dict(self, row) -> dict:
         note_rows = self.conn.execute(
-            "SELECT id, title FROM notes WHERE session_id = ? ORDER BY created_at, rowid",
+            "SELECT id, title, created_at FROM notes WHERE session_id = ? ORDER BY created_at, rowid",
             (row[0],),
         ).fetchall()
         return {
             "id": row[0], "project": row[1], "client": row[2], "intent": row[3],
             "started_at": row[4], "ended_at": row[5], "summary": row[6],
             # open = never closed with end_session. If it isn't the currently
-            # running session, it likely crashed or was abandoned — its notes
-            # are the only record of what happened
+            # running session and its hold is not active, it likely crashed or
+            # was abandoned — its notes are the only record of what happened
             "open": row[5] is None,
             "notes": [{"id": n[0], "title": n[1]} for n in note_rows],
+            # computed at read time, like every response here is a
+            # point-in-time read
+            "hold": holds.hold_view(
+                open_=row[5] is None, started_at=row[4], held_at=row[7],
+                hold_hours=row[8], note_stamps=[n[2] for n in note_rows],
+                now=datetime.now(timezone.utc),
+            ),
         }
 
     # ── writes ────────────────────────────────────────────────────────────────

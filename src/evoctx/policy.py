@@ -31,6 +31,7 @@ from .grants import (
     match_client_key,
     predates_current_tools,
 )
+from .holds import HOLD_DEFAULT_HOURS, validate_hold_hours
 from .redact import Redactor
 from .resolve import NONE, current_directory, resolve_workspace
 
@@ -89,6 +90,17 @@ def _open_sessions_warning(others: list[dict], total: int) -> str:
 
 class PolicyDenied(Exception):
     """Tool call not covered by the active grant. Message is user-actionable."""
+
+
+def _names_session(arg: str, session_id: str) -> bool:
+    """Does `arg` identify `session_id` the way the id resolver would?
+
+    Case-insensitive because `_id_by_prefix` matches with LIKE, which folds
+    ASCII case; a prefix counts only at the length the resolver requires.
+    """
+    a, full = arg.lower(), session_id.lower()
+    return a == full or (len(a) >= PolicyEngine.MIN_SESSION_PREFIX
+                         and full.startswith(a))
 
 
 class PolicyEngine:
@@ -686,7 +698,7 @@ class PolicyEngine:
     def _reread_session(self, session_id: str) -> dict:
         """Re-read a session that was just written on this same connection.
 
-        Both callers declare `-> dict` and the MCP layer hands the result
+        Every caller declares `-> dict` and the MCP layer hands the result
         straight to the client, so a None here has nowhere sensible to go.
         Short of the row being deleted mid-call it cannot happen — raise
         rather than let a None travel outward as if it were a session.
@@ -850,43 +862,48 @@ class PolicyEngine:
                   inbound_hits=hits)
         return self._out(grant, result)
 
-    def t_end_session(self, client: str, session_id: str, summary: str) -> dict:
-        grant = self._guard(client, "end_session")
-        # Scope the session before touching it. This path had no check at
-        # all, while `recent_sessions` refused to list the same session —
-        # `get_note` closes exactly that asymmetry for notes, and denies by
-        # returning nothing rather than explaining, so a caller cannot tell
-        # "out of scope" from "no such id".
-        #
-        # Reachable window, stated precisely because the obvious reading
-        # overstates it: the MCP tool takes no session id, it uses the one
-        # `start_session` recorded, and that call is already scope-checked. So
-        # this fires when a session opened under a wider grant is still open
-        # when a narrower grant is activated — not for a caller naming another
-        # project's session, which the tool surface does not allow.
+    def _resolve_session_target(self, client: str, grant: Grant, tool: str,
+                                session_id: str,
+                                too_short_tail: str) -> dict:
+        """The session an id or prefix names, scope-checked — or an `error`
+        dict, the refusal already audited as `denied`. A session dict never
+        carries an `error` key, so `"error" in` tells the two apart.
+
+        Shared by `end_session` and `hold_session`, which must refuse
+        identically. Scoped before anything is touched: `recent_sessions`
+        refuses to list an out-of-scope session, and `get_note` denies by
+        returning nothing rather than explaining, so a caller cannot tell
+        "out of scope" from "no such id".
+
+        Both tools take an id, so a caller can name another project's session
+        here, and this check is what stops it. It also fires when a session
+        opened under a wider grant is still open after a narrower grant is
+        activated.
+        """
         # An id prefix resolves like everywhere else in this codebase. The
         # caller that matters here is an assistant reading an id out of an
         # earlier `end_session` warning or a `recent_sessions` listing, both of
         # which display a short prefix beside the full id; refusing the prefix
         # would make the displayed form a trap.
         #
-        # A minimum length, though, because closing is not undoable and there
-        # is no confirmation step on this path the way `evoctx delete` has one.
-        # A unique one-character prefix would otherwise close a session, and a
-        # prefix that short is far likelier to be a typo than an intention.
-        # Eight is what the tool docstring promises; promising it and not
-        # enforcing it is the kind of gap that only shows up once.
+        # A minimum length, though: closing is not undoable, and a hold keeps a
+        # session's reminder quiet, and neither path has a confirmation step the
+        # way `evoctx delete` has one. A unique one-character prefix would
+        # otherwise act on a session, and a prefix that short is far likelier
+        # to be a typo than an intention. Eight is what the tool docstrings
+        # promise; promising it and not enforcing it is the kind of gap that
+        # only shows up once.
         if (len(session_id) < self.MIN_SESSION_PREFIX
                 and self.db.get_session(session_id) is None):
-            self._log(client, "end_session", "denied", grant, None, [], None)
+            self._log(client, tool, "denied", grant, None, [], None)
             return {"error": f"'{session_id}' is too short to identify a session. "
-                             f"Give at least {self.MIN_SESSION_PREFIX} characters of "
-                             f"the id, or the whole id. Closing cannot be undone."}
+                                   f"Give at least {self.MIN_SESSION_PREFIX} characters of "
+                                   f"the id, or the whole id.{too_short_tail}"}
         try:
             existing = (self.db.get_session(session_id)
                         or self.db.find_session_by_prefix(session_id))
         except AmbiguousPrefix as e:
-            self._log(client, "end_session", "denied", grant, None, [], None)
+            self._log(client, tool, "denied", grant, None, [], None)
             # The candidate ids are only shown when the caller may read every
             # one of them. `_id_by_prefix` resolves across the whole table, so
             # an ambiguity between a session this grant covers and one it does
@@ -896,12 +913,12 @@ class PolicyEngine:
                    for s in (self.db.get_session(i) or {} for i in e.ids)):
                 return {"error": str(e)}
             return {"error": "No session with that id is open within this "
-                             "grant's scope."}
+                                   "grant's scope."}
         if existing is None or not self._project_readable(
                 grant, existing.get("project")):
             # Audited even though it is denied: `t_get_by_id` logs its blocked
             # reads for the same reason, and SECURITY.md calls the audit log
-            # the accountability record. An attempt to close and read a
+            # the accountability record. An attempt to act on and read a
             # session outside scope is exactly what it should hold. No ids in
             # the record — that would put in the log what the denial withholds
             # from the caller.
@@ -909,16 +926,25 @@ class PolicyEngine:
             # a refused attempt, and `evoctx audit --action denied` is the
             # query a user runs to ask what a client tried and could not do.
             # Logging it as a write makes it indistinguishable at a glance
-            # from a successful close in the one record SECURITY.md calls the
+            # from a successful one in the one record SECURITY.md calls the
             # accountability record.
-            self._log(client, "end_session", "denied", grant, None, [], None)
+            self._log(client, tool, "denied", grant, None, [], None)
             # "this grant", not "this client". Closing a session another client
             # opened is the feature, not an accident — several windows share one
             # store and the whole point of taking an id is that you can close
             # the one you mean. What is checked here is project scope, and the
             # message has to name the check that actually ran.
             return {"error": "No session with that id is open within this "
-                             "grant's scope."}
+                                   "grant's scope."}
+        return existing
+
+    def t_end_session(self, client: str, session_id: str, summary: str) -> dict:
+        grant = self._guard(client, "end_session")
+        existing = self._resolve_session_target(
+            client, grant, "end_session", session_id,
+            " Closing cannot be undone.")
+        if "error" in existing:
+            return existing
         session_id = existing["id"]
         (summary,), hits = self._redact_inbound(grant, summary)
         already_closed = not self.db.end_session(session_id, summary)
@@ -959,7 +985,76 @@ class PolicyEngine:
                   grant, None, [session_id], result, inbound_hits=hits)
         return result
 
-    #: Shortest id prefix `end_session` will act on. Closing is not undoable.
+    def t_hold_session(self, client: str, session_id: str | None,
+                       hours: float | None, own_session_id: str | None) -> dict:
+        """Hold an open session so the Stop hook stays quiet while it is active.
+
+        `own_session_id` is the session the calling connection started, or
+        None. When there is one, it is the only session this call may hold:
+        a hold keeps a reminder quiet, and on another window's session it
+        would do that while nobody is working in it — renewed at each lapse,
+        for ever. The argument is matched the way the resolver matches ids
+        (case-insensitive, at least MIN_SESSION_PREFIX characters), and the
+        full own id is what gets resolved, so the own-session path can never
+        hit a prefix ambiguity. A caller with no session of its own can hold
+        any session in scope by id; the server says what that costs.
+        """
+        grant = self._guard(client, "hold_session")
+        try:
+            hours = validate_hold_hours(HOLD_DEFAULT_HOURS if hours is None else hours)
+        except ValueError as e:
+            self._log(client, "hold_session", "denied", grant, None, [], None)
+            return {"error": str(e)}
+        # Not stripped: `end_session` takes the argument as given, and the two
+        # must refuse identically. Blank means omitted.
+        arg = session_id or ""
+        if not arg.strip():
+            arg = ""
+        if not arg and own_session_id is None:
+            self._log(client, "hold_session", "denied", grant, None, [], None)
+            return {"error": "No session was started on this connection, and no "
+                             "session_id was given. Call start_session() first. "
+                             "If this conversation started a session before the "
+                             "server restarted, hold that id: "
+                             "hold_session(session_id=…)."}
+        if own_session_id is not None and (not arg or _names_session(arg, own_session_id)):
+            target = own_session_id
+        elif own_session_id is not None and (
+                len(arg) >= self.MIN_SESSION_PREFIX
+                or self.db.get_session(arg) is not None):
+            # A whole id shorter than the minimum is still an id: the resolver
+            # accepts it, so it has to be refused here too.
+            self._log(client, "hold_session", "denied", grant, None, [], None)
+            return {"error": f"This connection's session is {own_session_id[:8]}; "
+                             f"hold only your own. A hold keeps a session's "
+                             f"reminder quiet, and on another window's session it "
+                             f"would do that while nobody is working in it."}
+        else:
+            # too short is refused by the resolver, with its usual wording
+            target = arg
+        existing = self._resolve_session_target(
+            client, grant, "hold_session", target, "")
+        if "error" in existing:
+            return existing
+        sid: str = existing["id"]
+        held = self.db.hold_session(sid, hours)
+        result = self._reread_session(sid)
+        if not held:
+            # The only way the gated write changes nothing once the id has
+            # resolved: the session is closed. Same flag `end_session` uses,
+            # for the same reason — the caller has to let go of this session.
+            result = dict(result)
+            result["already_closed"] = True
+            result["error"] = (f"Session {sid[:8]} was closed at "
+                               f"{result.get('ended_at')}; nothing to hold.")
+        result = self._out(grant, result)
+        # A hold that wrote nothing is a read, as a no-op close is.
+        self._log(client, "hold_session", "write" if held else "read", grant,
+                  {"hours": hours}, [sid], result)
+        return result
+
+    #: Shortest id prefix `end_session` and `hold_session` will act on.
+    #: Closing is not undoable, and a hold silences a reminder.
     MIN_SESSION_PREFIX = 8
 
     #: How many open sessions `other_open_sessions` carries. The prose warning

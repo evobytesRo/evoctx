@@ -101,7 +101,10 @@ MUST DO, every session:
   unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
   you must name a project or register the workspace — `start_session` has **no `is_global`**,
   since a session happens somewhere. Then `recent_sessions(project)` — open entries were
-  likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
+  likely interrupted, check their notes; the exception is an entry whose `hold.active` is
+  true, which is usually another window working right now — unless its id is yours. Then
+  `get_project(name)` for anything the
+  task touches.
 - **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
   an approach that contradicts a stored decision without surfacing the conflict. **Query with
   two or three bare content words, never a sentence:** terms combine with AND, so each extra
@@ -123,6 +126,10 @@ MUST DO, every session:
   the end (notes are auto-linked to the session). A project name that doesn't exist is
   **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
   if nothing resolves, name one, register the workspace, or set `is_global`.
+- **Work that spans many turns:** call `hold_session` with the id `start_session` returned,
+  so the Stop-hook reminder stays quiet while you work. Notes you write keep it held; after 2h
+  with neither a note nor another `hold_session` it is flagged again. **Hold only your own
+  session** — a hold on another window's would silence its reminder while nobody works in it.
 - **End:** call `end_session(summary, session_id=<the id from start_session>)` — what was
   built, decided, and left open. **Pass the id.** Several assistant windows share one store, so
   the newest open session is not reliably yours. If the response carries `other_open_sessions`,

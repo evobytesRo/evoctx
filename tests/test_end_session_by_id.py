@@ -477,3 +477,50 @@ def test_open_sessions_returns_exactly_the_fields_the_warning_formats(db):
     db.start_session(project="p", intent="x", client="c")
     other = Database.open_sessions(db)[0]
     assert set(other) == {"id", "project", "client", "intent", "started_at"}
+
+
+# ── what every refusal says, and what it leaves in the audit log ─────────────
+
+def _audited_engine(db, tmp_path):
+    from evoctx.audit import AuditWriter
+    db.upsert_project("p1")
+    return PolicyEngine(db, GrantStore(tmp_path),
+                        audit=AuditWriter(db.conn, "test-connection"))
+
+
+def _audit(db):
+    return [(r[0], r[1], r[2]) for r in db.conn.execute(
+        "SELECT tool, action, record_ids FROM audit_log ORDER BY rowid")]
+
+
+def test_a_too_short_prefix_gets_the_exact_refusal_and_a_denied_row(db, tmp_path):
+    """The wording is pinned whole: its last sentence is the reason the
+    minimum exists on this path, and the row is what `evoctx audit --action
+    denied` shows a user asking what a client tried."""
+    e = _audited_engine(db, tmp_path)
+    sid = e.t_start_session("pytest", "p1", "mine")["id"]
+
+    out = e.t_end_session("pytest", sid[:4], "summary")
+    assert out == {"error": f"'{sid[:4]}' is too short to identify a session. "
+                            f"Give at least 8 characters of the id, or the whole "
+                            f"id. Closing cannot be undone."}
+    assert _audit(db)[-1] == ("end_session", "denied", "[]")
+
+
+def test_an_ambiguous_prefix_leaves_a_denied_row_naming_no_session(db, tmp_path):
+    e = _audited_engine(db, tmp_path)
+    db.conn.executescript(
+        "INSERT INTO sessions (id, project, client, intent, started_at) VALUES "
+        "('twinpfx1-one', 'p1', 'pytest', 'a', '2027-01-01T00:00:00+00:00'),"
+        "('twinpfx1-two', 'p1', 'pytest', 'b', '2027-01-01T00:00:00+00:00');"
+    )
+    db.conn.commit()
+
+    e.t_end_session("pytest", "twinpfx1-", "summary")
+    assert _audit(db)[-1] == ("end_session", "denied", "[]")
+
+
+def test_an_unknown_id_leaves_a_denied_row_naming_no_session(db, tmp_path):
+    e = _audited_engine(db, tmp_path)
+    e.t_end_session("pytest", "no-such-session-id", "summary")
+    assert _audit(db)[-1] == ("end_session", "denied", "[]")

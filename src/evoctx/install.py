@@ -64,7 +64,8 @@ def install_claude_code_permissions_deny(home: Path, store_dir: Path) -> list[st
 def install_claude_code_hooks(home: Path) -> dict:
     """SessionStart nudges the assistant to call start_session/recent_sessions;
     Stop blocks once (never twice — see stop_hook_active in cli.py's cmd_hook)
-    if a session was opened recently and never closed. This is the one
+    if a session was opened recently and never closed, or a held session has
+    gone idle past its hold (holds.py). This is the one
     mechanism that goes beyond convention, and the one place a malformed hook
     could visibly misbehave — kept as an opt-in flag (--hooks), never the
     install default, and every write here is backed up first like every

@@ -180,6 +180,19 @@ both writes happen together, without a prompt.
 in the last 12 hours was never closed with `end_session`. It's a nudge, not a lock: ignoring the
 message and asking Claude to stop again always succeeds.
 
+`Stop` runs at the end of every turn, so a session kept open on purpose across many turns
+would be flagged at each one. `hold_session` stops that: a **held** session is skipped while it
+is active — its hold, or a note linked to it, no older than the hold's window (2 hours unless
+the call names another, at most 24). Once it has been idle longer, it is flagged again, with a
+message saying the hold lapsed, for 12 hours from the lapse; then it goes quiet like any
+abandoned session. The 12-hour limit on a session's age does not apply to a held one. There is
+no release: close the session, or let the hold lapse.
+
+The message lists **every** due session in scope, each with its full id, not just the newest:
+a held session never hides an older forgotten one, and neither does a live one. With two
+windows open on one workspace, a window whose own session is held is therefore shown the other
+window's unheld session at each stop, which the newest-only check used to hide.
+
 `Stop` asks only about **this workspace's** sessions — the project the directory resolves to,
 plus the other registered repos in the same workspace. **Sibling directories count as one
 workspace**, so repos sharing a parent still nag across each other; what stops is a window in
@@ -217,7 +230,10 @@ MUST DO, every session:
   unknown name is **refused**, an unset one takes the workspace's own, and if nothing resolves
   you must name a project or register the workspace — `start_session` has **no `is_global`**,
   since a session happens somewhere. Then `recent_sessions(project)` — open entries were
-  likely interrupted, check their notes. Then `get_project(name)` for anything the task touches.
+  likely interrupted, check their notes; the exception is an entry whose `hold.active` is
+  true, which is usually another window working right now — unless its id is yours. Then
+  `get_project(name)` for anything the
+  task touches.
 - **Before any non-trivial decision:** `search_context()` for the topic first — don't propose
   an approach that contradicts a stored decision without surfacing the conflict. **Query with
   two or three bare content words, never a sentence:** terms combine with AND, so each extra
@@ -239,6 +255,10 @@ MUST DO, every session:
   the end (notes are auto-linked to the session). A project name that doesn't exist is
   **refused and nothing is saved** — leave `project` unset to use the workspace's own, and
   if nothing resolves, name one, register the workspace, or set `is_global`.
+- **Work that spans many turns:** call `hold_session` with the id `start_session` returned,
+  so the Stop-hook reminder stays quiet while you work. Notes you write keep it held; after 2h
+  with neither a note nor another `hold_session` it is flagged again. **Hold only your own
+  session** — a hold on another window's would silence its reminder while nobody works in it.
 - **End:** call `end_session(summary, session_id=<the id from start_session>)` — what was
   built, decided, and left open. **Pass the id.** Several assistant windows share one store, so
   the newest open session is not reliably yours. If the response carries `other_open_sessions`,
@@ -257,7 +277,7 @@ MUST DO, every session:
 | Tool | When the assistant uses it |
 |---|---|
 | `start_session(project?, intent?)` | First call of a session — registers the work session; every `write_note` after is linked to it. Same project rule as `write_note` |
-| `recent_sessions(project?, limit?)` | Right after — see what recent sessions did; open ones were likely interrupted, their notes are the only record |
+| `recent_sessions(project?, limit?)` | Right after — see what recent sessions did; open ones were likely interrupted, their notes are the only record — unless `hold.active` is true, which is usually another window's live work |
 | `list_projects()` | Discover registered projects, and which one this workspace is — returns `projects` plus a `workspace` block that resolves the working directory to a project, or says plainly that nothing matched |
 | `get_project(name)` | Load overview, conventions, open questions, recent notes |
 | `search_context(query, project?, limit?, offset?, page_token?)` | Find relevant notes mid-work. Two or three bare words: terms combine with AND, and the store widens to OR and then to prefixes on its own when AND turns up too little. Title, body and tags are all indexed. Returns `{results, total, offset, limit, has_more, page_token}` — `total` is how many matched, not how many came back, so the assistant can tell a complete answer from a page of one and ask for the rest; `page_token` passed back keeps both pages reading the query the same way. Ranked by relevance, **not** by date |
@@ -265,6 +285,7 @@ MUST DO, every session:
 | `write_note(title, content, project?, tags?, is_global?)` | Record decisions and observations as you go. An unknown project name is refused and nothing is saved; an unset one takes the workspace's own. `is_global` marks a note as spanning every project — deliberately not the same as leaving `project` unset |
 | `end_session(summary, session_id?)` | Last call — closes the session with what was built/decided/open. Pass the id `start_session` returned; several windows share one store, so the newest open session is not reliably yours. Returns `other_open_sessions` when any remain, as an observation about other windows rather than a task |
 | `register_project(name, overview, ...)` | Register this workspace as a project. No path argument — the server binds its own working directory; the assistant supplies only the description |
+| `hold_session(session_id?, hours?)` | Keep the Stop-hook reminder quiet for the caller's own session while it works across many turns. Active while the hold or a linked note is newer than `hours` (default 2, at most 24); flagged again once idle longer. A connection that started a session can hold only that one |
 | `list_grants()` | What *this client* is allowed — resolved per client, since one may have its own grant — so "do you have access to X?" gets an honest answer |
 
 Writes are append-only by design: the assistant can add notes but never edit or delete. Deletion is a human-only operation. Note content over 256KB is rejected — split it into multiple notes. Every note also carries `author_client` (`cli` for a human, the client name for an assistant) so past notes read as informational context, not as instructions from the current session.
@@ -286,6 +307,7 @@ Every MCP tool has a CLI mirror — the store is fully human-operable, not just 
 | `write_note(...)` | `evoctx write-note "Title" --project NAME --tags "#decision" --text "..."` (alias: `add`); `--global` marks a note as spanning every project |
 | `start_session(...)` | `evoctx start-session [--project NAME] [--intent "..."]` |
 | `end_session(summary, session_id?)` | `evoctx end-session "summary" [--id ID]` — default: latest open; an ID prefix needs at least 8 characters, since closing has no undo |
+| `hold_session(...)` | `evoctx hold-session ID [--hours H]` — ID prefix of at least 8 characters |
 | `recent_sessions(...)` | `evoctx recent-sessions [--project NAME] [--limit N]` |
 
 Plus store management commands with no MCP equivalent (deliberately — deletion and bulk ops are human-only):
@@ -336,7 +358,7 @@ To tighten from there, add a scoped grant to `grants.yaml`
     client: "*"
     tools: [list_projects, get_project, search_context, get_by_id,
             write_note, start_session, end_session, recent_sessions,
-            list_grants, register_project]
+            list_grants, register_project, hold_session]
     scope:
       projects: ["*"]
       exclude_tags: ["#personal", "#finance"]   # these notes become invisible
