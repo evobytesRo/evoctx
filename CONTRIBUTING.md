@@ -6,7 +6,7 @@ rather than catastrophic if it happens.
 
 ## Your data outlives the project
 
-The store is 5 plain SQLite tables. If this project goes quiet, your data isn't locked in —
+The store is 6 plain SQLite tables. If this project goes quiet, your data isn't locked in —
 it's queryable with any SQLite client on day one, and `evoctx export` (or `sqlite3 store.db`
 directly) gets it all out in JSON or Markdown.
 
@@ -17,6 +17,7 @@ projects(name, overview, conventions, open_questions, updated_at,
          description_author, description_reviewed_at, attention_dismissed_at)
 project_roots(project, root_path, machine, added_at)
 sessions(id, project, client, intent, started_at, ended_at, summary)
+session_holds(session_id, held_at, hold_hours)
 audit_log(id, ts, connection_id, client, grant_name, tool, action, query,
           record_ids, result_count, response_bytes, redactions_applied)
 ```
@@ -52,9 +53,17 @@ before tagging:
 1. `pyproject.toml` version matches the tag.
 2. `CHANGELOG.md` top heading is that version with today's date, and its summary covers the
    whole release.
-3. `README.md` status line names that version.
+3. `README.md` status line names that version. `tests/test_release_docs.py` checks on every
+   run that each `## ` heading in the CHANGELOG is in `## X.Y.Z — <date or WIP marker>
+   [— <title>]` form, and, once `pyproject.toml` names the CHANGELOG's newest version, that
+   each heading carries a YYYY-MM-DD date, that the README status line names the version, and
+   that no document it scans matches its `PENDING` pattern (three fixed wordings, not every
+   way of saying "pending") — so a release commit that skips them fails CI on `main` before it
+   can be tagged. Whether the date is today's and the summary covers the whole release stay
+   manual checks.
 4. **If this release adds an MCP tool:** it is in `ALL_TOOLS`, registered in `server.py`, and
-   the *outgoing* complete tool set is appended to `PRIOR_TOOL_SETS` — otherwise every
+   the *outgoing* complete tool set is inserted at the top of `PRIOR_TOOL_SETS` (newest
+   first; the test reads `[0]`) — otherwise every
    existing enumerated grant silently loses the new tool with nothing reporting it.
    `test_prior_tool_sets_covers_the_previous_release` fails until you do, and its literal is
    the thing to update.
@@ -65,11 +74,12 @@ before tagging:
    instruction-channel checks that step 6 would otherwise have to catch by reading.
 6. **Run the audience sweep below against the release, don't read it.** Steps 1–5 are all
    mechanical — version strings, tool lists, tests — and none of them can see a sentence that
-   became false. 0.1.4's release review found the README still carrying the *previous*
-   release's instructions snippet byte-for-byte, telling assistants to pass a project name
-   that this release turned into a hard refusal; a shipped example contradicting the shipped
-   default; and a security document promising write-time redaction on a path that did not have
-   it. Every one of those is invisible to a diff and obvious to one execution. Check counts and
+   became false. Before the 0.1.4 tag (2026-08-04) the release tree held three: the
+   README carrying the *previous* release's instructions snippet byte-for-byte, telling
+   assistants to pass a project name that 0.1.4 turned into a hard refusal; a shipped example
+   contradicting the shipped default; and a security document promising write-time redaction
+   on a path that did not have it. Every one of those is invisible to a diff and obvious to
+   one execution. Check counts and
    enumerations first ("gains three checks", "5 tables", lists of flags) — they rot fastest and
    are cheapest to verify.
 7. Push `main`, wait for CI green — the tag is what publishes, and it does **not** re-run
@@ -85,9 +95,7 @@ before tagging:
 
 Every behaviour change lands with its documentation, in one commit. Not as a follow-up, not
 "once it settles". A claim and the thing it describes living in different places, with only one
-edited, is the single most common defect this project produces — 0.1.4's phase 3 took ten review
-rounds, and **every behavioural bug was found in the first three; the other seven were sentences
-describing behaviour the code no longer had.**
+edited, is the single most common defect this project produces.
 
 Sweep by **audience**, not by file. One file often serves several, and marking it "done" after
 the first is how the rest survive:

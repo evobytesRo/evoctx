@@ -84,8 +84,9 @@ TOOLS_WILDCARD = "*"
 # removes, reintroduced by an omission.
 #
 # `test_prior_tool_sets_covers_the_previous_release` is what actually enforces
-# the append; this comment cannot. Growing ALL_TOOLS without adding the
-# outgoing set fails in CI instead of on someone's machine.
+# the new entry; this comment cannot. Growing ALL_TOOLS without adding the
+# outgoing set fails in CI instead of on someone's machine. Newest set first:
+# the test reads PRIOR_TOOL_SETS[0].
 PRIOR_TOOL_SETS = [
     # 0.1.4 - 0.1.5
     ["list_projects", "get_project", "search_context", "get_by_id",

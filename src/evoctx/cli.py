@@ -1041,7 +1041,7 @@ def _stop_reminder(due: list[tuple[dict, Reminder]]) -> str:
                 f"and finished, close it: end_session(summary, "
                 f"session_id=\"{sid}\"). If it is yours and the work is still "
                 f"going, renew it: hold_session(session_id=\"{sid}\") — a note "
-                f"written from the window that started it renews it too."
+                f"written from the connection that started it renews it too."
             )
         else:
             lines.append(

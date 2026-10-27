@@ -679,7 +679,7 @@ def test_a_refused_context_project_still_points_at_the_cli(db, tmp_path, monkeyp
 
 
 def test_prior_tool_sets_covers_the_previous_release():
-    """The append to `PRIOR_TOOL_SETS` has to be enforced, not documented.
+    """The new entry in `PRIOR_TOOL_SETS` has to be enforced, not documented.
 
     A release that adds a tool to `ALL_TOOLS` and forgets the outgoing set does
     NOT degrade to the manual channel — the stale grant matches no prior set,
@@ -695,11 +695,11 @@ def test_prior_tool_sets_covers_the_previous_release():
     the adjacent property and does NOT guard: a stale prior set stays a strict
     subset forever and the gap only widens, so a release that forgets sails
     through. Pinning the gap to exactly what THIS release adds means the only
-    way to make it pass again is to append the outgoing set and update the
+    way to make it pass again is to insert the outgoing set at index 0 and update the
     literal — i.e. to touch the list.
     """
     assert set(ALL_TOOLS) - set(PRIOR_TOOL_SETS[0]) == {"hold_session"}, (
-        "ALL_TOOLS grew: append the outgoing complete set to PRIOR_TOOL_SETS "
+        "ALL_TOOLS grew: insert the outgoing complete set at the top of PRIOR_TOOL_SETS "
         "and update this literal to the tools THIS release adds. Skipping it "
         "does not fail safe — the stale grant matches no prior set, so it is "
         "never considered, and doctor/upgrade/denial all report the opposite "

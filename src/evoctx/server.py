@@ -458,10 +458,11 @@ def hold_session(ctx: Context, session_id: str | None = None,
         The session, with its `hold` block: held_at, hours, last_activity_at,
         expires_at and active.
 
-        When this connection started no session (the server restarted, or the
-        conversation was resumed) a hold by id is allowed and carries a
-        `warning`: notes written from here are not linked to it, so only
-        another hold_session() renews it, and it must be a session you
+        When this connection has no open session of its own (before its first
+        start_session, after it closed its session, or after the server
+        restarted or the conversation was resumed) a hold by id is allowed and
+        carries a `warning`: notes written from here are not linked to it, so
+        only another hold_session() renews it, and it must be a session you
         started.
 
         Or an error — no session started and no id, an id that names nothing
@@ -504,7 +505,8 @@ def recent_sessions(ctx: Context, project: str | None = None, limit: int = 10) -
 
     The exception is an entry whose `hold.active` is true: someone called
     hold_session() on it and it has had activity within its hold, so it is
-    most likely another window working right now. Leave it open. `hold` is
+    most likely another window working right now. Leave it open unless its id
+    is the one start_session() returned to you. `hold` is
     null for a session never held; for a closed one it records the last hold,
     with `active` false.
 

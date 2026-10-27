@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.6 — unreleased — sessions you keep open on purpose
+## 0.1.6 — 2026-10-27 — sessions you keep open on purpose
 
 The Claude Code `Stop` hook runs at the end of every turn and reminds about an open session.
 A session kept open deliberately across a multi-turn piece of work was therefore flagged at
@@ -31,7 +31,9 @@ every stop. `hold_session` lets the assistant say the session is still being wor
   other window's unheld session at each stop — the newest-only check used to hide it.
 - The `SessionStart` text and every instruction channel say when to hold, and that an open
   session whose `hold.active` is true is usually another window's live work, not an
-  interrupted one.
+  interrupted one. A rules file that carries the instructions snippet keeps the text it was
+  copied with: replace the block with the one in `docs/instructions-snippet.md` to get the
+  hold guidance (and 0.1.5's close-by-id guidance, if it was copied before 0.1.5).
 
 ### Store
 
